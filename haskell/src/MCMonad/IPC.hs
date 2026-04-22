@@ -49,6 +49,7 @@ data Command
     | QueryScreens
     | RegisterHotkeys [HotkeySpec]
     | CloseWindow !Word32 !Int32
+    | SetWorkspaceIndicator !String
     deriving (Show, Generic)
 
 -- | A frame assignment: position a specific window at a specific rectangle.
@@ -111,6 +112,10 @@ instance Aeson.ToJSON Command where
         [ "cmd"      .= ("close-window" :: Text)
         , "windowId" .= wid
         , "pid"      .= pid
+        ]
+    toJSON (SetWorkspaceIndicator tag) = Aeson.object
+        [ "cmd" .= ("set-workspace-indicator" :: Text)
+        , "tag" .= tag
         ]
 
 -- ---------------------------------------------------------------------------

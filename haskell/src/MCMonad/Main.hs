@@ -8,6 +8,8 @@ import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32)
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
 import qualified XMonad.StackSet as W
 
 import MCMonad.Config
@@ -54,7 +56,11 @@ launch cfg = do
     sendCommand conn QueryWindows
     existingWindows <- waitForWindows conn
 
-    -- 7. Run the M monad
+    -- 7. Check debug mode
+    debug <- maybe False (const True) <$> lookupEnv "MCMONAD_DEBUG"
+    when debug $ hPutStrLn stderr "mcmonad: debug logging enabled (MCMONAD_DEBUG)"
+
+    -- 8. Run the M monad
     let mconf = MConf { connection = conn }
         mst0  = MState { windowset = ws0, mapped = Set.empty }
 
@@ -67,7 +73,7 @@ launch cfg = do
         userCodeDef () (startupHook cfg)
 
         -- Enter the event loop
-        eventLoop cfg hotkeyIdMap
+        eventLoop debug cfg hotkeyIdMap
 
     return ()
 
@@ -136,52 +142,58 @@ buildInitialWindowSet cfg screens =
 -- Event loop
 
 -- | The main event loop: read events from the Swift daemon and dispatch.
-eventLoop :: MConfig Layout -> Map.Map Int (M ()) -> M ()
-eventLoop cfg hotkeyIdMap = forever $ do
+eventLoop :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> M ()
+eventLoop debug cfg hotkeyIdMap = forever $ do
     evt <- withConnection $ \conn -> io $ readEvent conn
-    userCodeDef () $ handleEvent cfg hotkeyIdMap evt
+    userCodeDef () $ handleEvent debug cfg hotkeyIdMap evt
 
 -- | Dispatch a single event from the Swift daemon.
-handleEvent :: MConfig Layout -> Map.Map Int (M ()) -> Event -> M ()
-handleEvent cfg hotkeyIdMap evt = case evt of
+handleEvent :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> Event -> M ()
+handleEvent debug cfg hotkeyIdMap evt = do
+    when debug $ io $ hPutStrLn stderr $ "EVENT: " ++ show evt
+    case evt of
+        WindowCreated winfo ->
+            manage winfo (manageHook cfg)
 
-    WindowCreated winfo ->
-        manage winfo (manageHook cfg)
-
-    WindowDestroyed wid -> do
-        ws <- gets windowset
-        let mref = findByWindowId wid (W.allWindows ws)
-        whenJust mref $ \wref -> unmanage wref
-
-    WindowFrameChanged _wid _rect ->
-        -- A window was moved/resized externally (e.g. by the user dragging).
-        -- For now we ignore this; a future version could update floating state.
-        return ()
-
-    FrontAppChanged _pid ->
-        return ()
-
-    MouseEnteredWindow wid _pid ->
-        when (focusFollowsMouse cfg) $ do
+        WindowDestroyed wid -> do
             ws <- gets windowset
             let mref = findByWindowId wid (W.allWindows ws)
-            whenJust mref $ \wref ->
-                -- Only change focus, don't relayout (avoid feedback loop)
-                when (W.peek ws /= Just wref) $
+            whenJust mref $ \wref -> unmanage wref
+
+        WindowFrameChanged _wid _rect ->
+            -- A window was moved/resized externally (e.g. by the user dragging).
+            -- For now we ignore this; a future version could update floating state.
+            return ()
+
+        FrontAppChanged pid -> do
+            ws <- gets windowset
+            let mref = find (\w -> wrPid w == pid) (W.allWindows ws)
+            case mref of
+                Just wref | W.peek ws /= Just wref ->
                     windows (W.focusWindow wref)
+                _ -> return ()
 
-    ScreensChanged scs ->
-        rescreen scs
+        MouseEnteredWindow wid _pid ->
+            when (focusFollowsMouse cfg) $ do
+                ws <- gets windowset
+                let mref = findByWindowId wid (W.allWindows ws)
+                whenJust mref $ \wref ->
+                    -- Only change focus, don't relayout (avoid feedback loop)
+                    when (W.peek ws /= Just wref) $
+                        windows (W.focusWindow wref)
 
-    HotkeyPressed hid ->
-        case Map.lookup hid hotkeyIdMap of
-            Just action -> action
-            Nothing     -> return ()
+        ScreensChanged scs ->
+            rescreen scs
 
-    -- Events that arrive during init or are not actionable
-    Ready                   -> return ()
-    QueryWindowsResponse _  -> return ()
-    QueryScreensResponse _  -> return ()
+        HotkeyPressed hid ->
+            case Map.lookup hid hotkeyIdMap of
+                Just action -> action
+                Nothing     -> return ()
+
+        -- Events that arrive during init or are not actionable
+        Ready                   -> return ()
+        QueryWindowsResponse _  -> return ()
+        QueryScreensResponse _  -> return ()
 
 -- ---------------------------------------------------------------------------
 -- Helpers

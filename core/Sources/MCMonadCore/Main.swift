@@ -115,7 +115,8 @@ struct MCMonadCoreApp {
         let executor = CommandExecutor(
             hotkeyManager: hotkeyManager,
             displayManager: displayManager,
-            socketServer: socketServer
+            socketServer: socketServer,
+            statusBarController: statusBar
         )
 
         // Route commands from socket to executor

@@ -116,13 +116,20 @@ windows f = do
     unless (null frames) $
         io $ sendCommand conn (SetFrames frames)
 
-    -- 7. Focus the top window
+    -- 7. Focus the top window (only if focus actually changed)
     currentWS' <- gets windowset
-    case W.peek currentWS' of
-        Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
-        Nothing -> return ()
+    let oldFocus = W.peek old
+        newFocus = W.peek currentWS'
+    when (newFocus /= oldFocus) $
+        case newFocus of
+            Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
+            Nothing -> return ()
 
-    -- 8. Update mapped set
+    -- 8. Send workspace indicator update
+    let currentTag = W.tag . W.workspace . W.current $ currentWS'
+    io $ sendCommand conn (SetWorkspaceIndicator currentTag)
+
+    -- 9. Update mapped set
     modify $ \s -> s { mapped = S.fromList newVisible }
 
 -- | All windows visible on any screen (current + visible), including

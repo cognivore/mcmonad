@@ -198,6 +198,7 @@ enum IPCCommand: Decodable, Sendable {
     case queryScreens
     case registerHotkeys(hotkeys: [HotkeySpec])
     case closeWindow(windowId: UInt32, pid: Int32)
+    case setWorkspaceIndicator(tag: String)
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -208,6 +209,7 @@ enum IPCCommand: Decodable, Sendable {
         case queryScreens = "query-screens"
         case registerHotkeys = "register-hotkeys"
         case closeWindow = "close-window"
+        case setWorkspaceIndicator = "set-workspace-indicator"
     }
 
     init(from decoder: Decoder) throws {
@@ -238,6 +240,9 @@ enum IPCCommand: Decodable, Sendable {
             let windowId = try container.decode(UInt32.self, forKey: .windowId)
             let pid = try container.decode(Int32.self, forKey: .pid)
             self = .closeWindow(windowId: windowId, pid: pid)
+        case .setWorkspaceIndicator:
+            let tag = try container.decode(String.self, forKey: .tag)
+            self = .setWorkspaceIndicator(tag: tag)
         }
     }
 }
@@ -281,4 +286,5 @@ private struct DynamicCodingKey: CodingKey {
     static let screens = DynamicCodingKey(stringValue: "screens")!
     static let hotkeyId = DynamicCodingKey(stringValue: "hotkeyId")!
     static let hotkeys = DynamicCodingKey(stringValue: "hotkeys")!
+    static let tag = DynamicCodingKey(stringValue: "tag")!
 }

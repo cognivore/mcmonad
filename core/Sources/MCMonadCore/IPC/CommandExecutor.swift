@@ -8,17 +8,20 @@ final class CommandExecutor {
     let hotkeyManager: HotkeyManager
     let displayManager: DisplayManager
     let socketServer: SocketServer
+    let statusBarController: StatusBarController
 
     private let encoder = JSONEncoder()
 
     init(
         hotkeyManager: HotkeyManager,
         displayManager: DisplayManager,
-        socketServer: SocketServer
+        socketServer: SocketServer,
+        statusBarController: StatusBarController
     ) {
         self.hotkeyManager = hotkeyManager
         self.displayManager = displayManager
         self.socketServer = socketServer
+        self.statusBarController = statusBarController
     }
 
     func execute(_ command: IPCCommand) {
@@ -39,6 +42,8 @@ final class CommandExecutor {
             executeHideWindows(windowIds)
         case .showWindows(let windowIds):
             executeShowWindows(windowIds)
+        case .setWorkspaceIndicator(let tag):
+            statusBarController.updateWorkspace(tag)
         }
     }
 

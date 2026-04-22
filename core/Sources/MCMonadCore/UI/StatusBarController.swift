@@ -7,7 +7,7 @@ final class StatusBarController {
     private var statusItem: NSStatusItem?
 
     func setup() {
-        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
             // Load template image from Resources directory
@@ -43,5 +43,9 @@ final class StatusBarController {
 
         statusItem.menu = menu
         self.statusItem = statusItem
+    }
+
+    func updateWorkspace(_ tag: String) {
+        statusItem?.button?.title = tag
     }
 }

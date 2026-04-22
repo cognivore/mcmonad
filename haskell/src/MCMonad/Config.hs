@@ -15,6 +15,8 @@ import System.Exit (exitSuccess)
 
 import qualified XMonad.StackSet as W
 
+import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayout(..))
+
 import MCMonad.Core
 import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
@@ -132,11 +134,11 @@ defaultKeys conf = Map.fromList $
     , ((m .|. shiftMask, kK), windows W.swapUp)
 
     -- Layout
-    , ((m, kH),      sendMessage Shrink)
-    , ((m, kL),      sendMessage Expand)
-    , ((m, kSpace),  sendMessage NextLayout)
-    , ((m, kComma),  sendMessage (IncMasterN 1))
-    , ((m, kPeriod), sendMessage (IncMasterN (-1)))
+    , ((m, kH),      sendMessage XMonad.Shrink)
+    , ((m, kL),      sendMessage XMonad.Expand)
+    , ((m, kSpace),  sendMessage XMonad.NextLayout)
+    , ((m, kComma),  sendMessage (XMonad.IncMasterN 1))
+    , ((m, kPeriod), sendMessage (XMonad.IncMasterN (-1)))
 
     -- Window management
     , ((m .|. shiftMask, kC),      kill)

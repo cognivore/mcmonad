@@ -17,9 +17,12 @@ library
     MCMonad.Main
     MCMonad.IPC
     MCMonad.Config
+    MCMonad.Compat.XMonadContrib
   build-depends:
     base >= 4.16 && < 5,
     xmonad >= 0.18,
+    xmonad-contrib >= 0.18,
+    X11,
     aeson >= 2.0,
     bytestring,
     containers,

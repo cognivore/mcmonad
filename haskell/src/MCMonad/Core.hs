@@ -18,8 +18,10 @@ module MCMonad.Core
       -- * Layout system
     , Layout(..)
     , LayoutClass(..)
-    , SomeMessage(..), Message, fromMessage
-    , LayoutMessages(..)
+    , SomeMessage, Message, fromMessage, someMessage
+      -- * Layout messages (re-exported from xmonad)
+    , Resize(..), IncMasterN(..)
+    , ChangeLayout(..)
       -- * Geometry
     , Rectangle(..)
       -- * IPC connection (opaque)
@@ -38,6 +40,8 @@ import Data.Typeable (Typeable, cast)
 import Data.Word (Word32)
 import GHC.Generics (Generic)
 import System.IO (Handle)
+import qualified XMonad.Core as XMonad
+import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayout(..))
 import qualified XMonad.StackSet as W
 
 -- ---------------------------------------------------------------------------
@@ -93,26 +97,18 @@ instance ToJSON Rectangle where
 -- ---------------------------------------------------------------------------
 -- Message system
 
--- | Typeclass for layout messages.
-class Typeable a => Message a
+-- | Message system: reuse xmonad's directly so xmonad-contrib layouts work.
+type Message = XMonad.Message
+type SomeMessage = XMonad.SomeMessage
+type Resize = XMonad.Resize
+type IncMasterN = XMonad.IncMasterN
+type ChangeLayout = XMonad.ChangeLayout
 
--- | Existential wrapper for messages.
-data SomeMessage = forall a. Message a => SomeMessage a
+fromMessage :: XMonad.Message a => SomeMessage -> Maybe a
+fromMessage = XMonad.fromMessage
 
--- | Attempt to extract a message of a specific type.
-fromMessage :: Message a => SomeMessage -> Maybe a
-fromMessage (SomeMessage m) = cast m
-
--- | Standard layout messages.
-data LayoutMessages
-    = Shrink
-    | Expand
-    | IncMasterN !Int
-    | NextLayout
-    | SetLayout String
-    deriving (Show, Typeable)
-
-instance Message LayoutMessages
+someMessage :: XMonad.Message a => a -> SomeMessage
+someMessage = XMonad.SomeMessage
 
 -- ---------------------------------------------------------------------------
 -- Layout system

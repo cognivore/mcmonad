@@ -21,6 +21,7 @@ module MCMonad.Layout
 
 import qualified XMonad.StackSet as W
 
+import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayout(..))
 import MCMonad.Core
 
 -- ---------------------------------------------------------------------------
@@ -46,10 +47,11 @@ instance LayoutClass Tall WindowRef where
 
     pureMessage (Tall nm delta frac) msg =
         case fromMessage msg of
-            Just Shrink         -> Just $ Tall nm delta (max 0.0 (frac - delta))
-            Just Expand         -> Just $ Tall nm delta (min 1.0 (frac + delta))
-            Just (IncMasterN d) -> Just $ Tall (max 0 (nm + d)) delta frac
-            _                   -> Nothing
+            Just XMonad.Shrink         -> Just $ Tall nm delta (max 0.0 (frac - delta))
+            Just XMonad.Expand         -> Just $ Tall nm delta (min 1.0 (frac + delta))
+            _ -> case fromMessage msg of
+                Just (XMonad.IncMasterN d) -> Just $ Tall (max 0 (nm + d)) delta frac
+                _ -> Nothing
 
     description _ = "Tall"
 
@@ -175,22 +177,15 @@ instance (LayoutClass l WindowRef, LayoutClass r WindowRef)
                 (arranged, mr') <- runLayout (W.Workspace tag r s) rect
                 return (arranged, (\r' -> Choose CR l r') <$> mr')
 
-    handleMessage (Choose side l r) msg =
-        case fromMessage msg of
-            Just NextLayout ->
-                case side of
-                    CL -> return $ Just $ Choose CR l r
-                    CR -> return $ Just $ Choose CL l r
-            Just (SetLayout d) ->
-                if d == description l
-                    then return $ Just $ Choose CL l r
-                    else if d == description r
-                        then return $ Just $ Choose CR l r
-                        else return Nothing
-            _ ->
-                case side of
-                    CL -> fmap (fmap (\l' -> Choose CL l' r)) (handleMessage l msg)
-                    CR -> fmap (fmap (\r' -> Choose CR l r')) (handleMessage r msg)
+    handleMessage (Choose side l r) msg
+        | Just XMonad.NextLayout <- fromMessage msg =
+            case side of
+                CL -> return $ Just $ Choose CR l r
+                CR -> return $ Just $ Choose CL l r
+        | otherwise =
+            case side of
+                CL -> fmap (fmap (\l' -> Choose CL l' r)) (handleMessage l msg)
+                CR -> fmap (fmap (\r' -> Choose CR l r')) (handleMessage r msg)
 
     description (Choose CL l _) = description l
     description (Choose CR _ r) = description r

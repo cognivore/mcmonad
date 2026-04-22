@@ -49,6 +49,8 @@
           packages = [
             (hsPkgs.ghcWithPackages (hp: [
               hp.xmonad
+              hp.xmonad-contrib
+              hp.X11
               hp.aeson
               hp.network
               hp.QuickCheck

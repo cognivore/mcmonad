@@ -230,7 +230,7 @@ sendMessage m = do
     ws <- gets windowset
     let wsp = W.workspace (W.current ws)
         lay = W.layout wsp
-    ml' <- userCodeDef Nothing $ handleMessage lay (SomeMessage m)
+    ml' <- userCodeDef Nothing $ handleMessage lay (someMessage m)
     whenJust ml' $ \l' -> do
         let wsp' = wsp { W.layout = l' }
             cur' = (W.current ws) { W.workspace = wsp' }
@@ -244,7 +244,7 @@ sendMessageWithNoRefresh m = do
     ws <- gets windowset
     let wsp = W.workspace (W.current ws)
         lay = W.layout wsp
-    ml' <- userCodeDef Nothing $ handleMessage lay (SomeMessage m)
+    ml' <- userCodeDef Nothing $ handleMessage lay (someMessage m)
     whenJust ml' $ \l' -> do
         let wsp' = wsp { W.layout = l' }
             cur' = (W.current ws) { W.workspace = wsp' }

@@ -1,8 +1,9 @@
+import AppKit
 import CoreGraphics
 import Foundation
 
 /// Tracks mouse position and detects when the cursor enters a different window.
-/// Uses a CGEventTap on mouse-moved events.
+/// Uses a CGEventTap on mouse-moved events with debouncing and menu suppression.
 @MainActor
 final class MouseTracker {
     var onWindowEntered: (@MainActor (_ windowId: UInt32, _ pid: Int32) -> Void)?
@@ -10,17 +11,17 @@ final class MouseTracker {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var lastWindowId: UInt32 = 0
+    private var lastFocusTime: CFAbsoluteTime = 0
+    private let debounceInterval: CFAbsoluteTime = 0.1  // 100ms, same as OmniWM
 
     func start() {
         let eventMask: CGEventMask = (1 << CGEventType.mouseMoved.rawValue)
-
-        // Store self in a pointer for the C callback
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,  // passive — don't block or modify events
+            options: .listenOnly,
             eventsOfInterest: eventMask,
             callback: mouseMovedCallback,
             userInfo: selfPtr
@@ -46,18 +47,25 @@ final class MouseTracker {
         runLoopSource = nil
     }
 
-    /// Called from the C callback on the main thread.
     fileprivate func handleMouseMoved() {
+        // Debounce: 100ms minimum between focus changes
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastFocusTime >= debounceInterval else { return }
+
         // Don't change focus while any mouse button is held (menus, dragging)
-        let pressedButtons = NSEvent.pressedMouseButtons
-        guard pressedButtons == 0 else { return }
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+
+        // Don't change focus while a menu is open
+        // NSApp.mainMenu?.highlightedItem != nil catches menu bar menus
+        // But context menus are trickier. Check if any menu-level window exists
+        // by looking for windows at non-zero layers that appeared recently.
+        if isMenuVisible() { return }
 
         let mouseLocation = NSEvent.mouseLocation
         guard let mainScreen = NSScreen.main else { return }
         let flippedY = mainScreen.frame.height - mouseLocation.y
         let point = CGPoint(x: mouseLocation.x, y: flippedY)
 
-        // Find which normal-layer window is under the cursor
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
@@ -70,8 +78,8 @@ final class MouseTracker {
                   let windowNumber = windowInfo[kCGWindowNumber as String] as? UInt32,
                   let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? Int32,
                   let layer = windowInfo[kCGWindowLayer as String] as? Int,
-                  layer == 0,           // normal windows only (skip menus, popups, overlays)
-                  ownerPID != myPid     // skip our own windows
+                  layer == 0,
+                  ownerPID != myPid
             else { continue }
 
             let bounds = CGRect(
@@ -84,19 +92,34 @@ final class MouseTracker {
             if bounds.contains(point) {
                 if windowNumber != lastWindowId {
                     lastWindowId = windowNumber
+                    lastFocusTime = now
                     onWindowEntered?(windowNumber, ownerPID)
                 }
                 return
             }
         }
     }
+
+    /// Check if any popup menu or context menu is visible.
+    /// Menu windows live at layer 101 (NSPopUpMenuWindowLevel).
+    private func isMenuVisible() -> Bool {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return false }
+
+        for windowInfo in windowList {
+            guard let layer = windowInfo[kCGWindowLayer as String] as? Int else { continue }
+            // Menu windows: layer 101 (popups), 24 (main menu bar items)
+            if layer == 101 || layer == 24 {
+                return true
+            }
+        }
+        return false
+    }
 }
 
-// Needs to be outside the class for @convention(c)
-import AppKit
-
-private nonisolated(unsafe) var mouseMovedCounter: UInt64 = 0
-
+// C callback — must be outside the class
 private func mouseMovedCallback(
     proxy: CGEventTapProxy,
     type: CGEventType,
@@ -104,15 +127,9 @@ private func mouseMovedCallback(
     userInfo: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
     guard let userInfo else { return Unmanaged.passRetained(event) }
-
-    // Debounce: only process every Nth event to avoid flooding
-    mouseMovedCounter &+= 1
-    guard mouseMovedCounter % 3 == 0 else { return Unmanaged.passRetained(event) }
-
     let tracker = Unmanaged<MouseTracker>.fromOpaque(userInfo).takeUnretainedValue()
     DispatchQueue.main.async { @MainActor in
         tracker.handleMouseMoved()
     }
-
     return Unmanaged.passRetained(event)
 }

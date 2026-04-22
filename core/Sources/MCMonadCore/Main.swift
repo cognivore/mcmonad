@@ -102,6 +102,10 @@ struct MCMonadCoreApp {
 
     @MainActor
     private static func launchServices() {
+        // Status bar icon
+        let statusBar = StatusBarController()
+        statusBar.setup()
+
         // Create services
         let hotkeyManager = HotkeyManager()
         let displayManager = DisplayManager()
@@ -144,9 +148,12 @@ struct MCMonadCoreApp {
             socketServer.send(.screensChanged(screens: screens))
         }
 
-        // TODO: focus-follows-mouse disabled — CGEventTap interferes with
-        // right-click context menus. Needs a different approach (SkyLight
-        // window-under-cursor query instead of CGEventTap).
+        // Focus-follows-mouse: CGEventTap with 100ms debounce + menu suppression
+        let mouseTracker = MouseTracker()
+        mouseTracker.onWindowEntered = { windowId, pid in
+            socketServer.send(.mouseEnteredWindow(windowId: windowId, pid: pid))
+        }
+        mouseTracker.start()
 
         // Start event observer
         eventObserver.start()
@@ -157,7 +164,7 @@ struct MCMonadCoreApp {
         logger.info("mcmonad-core fully initialized")
 
         // Keep references alive for the lifetime of the process
-        _keepAlive = (hotkeyManager, displayManager, socketServer, executor, eventBridge)
+        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge, mouseTracker)
     }
 
     // Static storage to prevent ARC from deallocating services

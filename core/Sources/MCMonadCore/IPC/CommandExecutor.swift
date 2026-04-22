@@ -76,22 +76,8 @@ final class CommandExecutor {
         for snap in snapshots {
             if let info = AXWindowService.info(windowId: snap.windowId, pid: snap.pid) {
                 windowInfos.append(info)
-            } else {
-                // Fallback: report with SkyLight data only
-                windowInfos.append(WindowInfo(
-                    windowId: snap.windowId,
-                    pid: snap.pid,
-                    title: nil,
-                    appName: nil,
-                    bundleId: nil,
-                    subrole: nil,
-                    isDialog: false,
-                    isFixedSize: false,
-                    hasCloseButton: false,
-                    hasFullscreenButton: false,
-                    frame: snap.frame
-                ))
             }
+            // If AX can't read the window, skip it — don't fabricate data
         }
 
         let response = QueryWindowsResponse(windows: windowInfos)

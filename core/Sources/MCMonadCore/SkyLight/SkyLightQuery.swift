@@ -23,11 +23,6 @@ enum SkyLightQuery {
             return []
         }
 
-        guard skyLight.hasIteratorSupport else {
-            logger.error("SkyLight iterator symbols not available")
-            return []
-        }
-
         let cid = skyLight.getMainConnectionID()
         guard cid != 0 else {
             logger.warning("SkyLight main connection ID is 0")
@@ -54,17 +49,14 @@ enum SkyLightQuery {
         var results: [WindowSnapshot] = []
 
         while skyLight.iteratorAdvance(iterator) {
-            guard let parentId = skyLight.iteratorGetParentID(iterator),
-                  parentId == 0
-            else { continue }
+            let parentId = skyLight.iteratorGetParentID(iterator)
+            guard parentId == 0 else { continue }
 
-            guard let level = skyLight.iteratorGetLevel(iterator),
-                  level == 0 || level == 3 || level == 8
-            else { continue }
+            let level = skyLight.iteratorGetLevel(iterator)
+            guard level == 0 || level == 3 || level == 8 else { continue }
 
-            guard let tags = skyLight.iteratorGetTags(iterator),
-                  let attributes = skyLight.iteratorGetAttributes(iterator)
-            else { continue }
+            let tags = skyLight.iteratorGetTags(iterator)
+            let attributes = skyLight.iteratorGetAttributes(iterator)
 
             // Visibility check
             let hasVisibleAttribute = (attributes & 0x2) != 0
@@ -77,10 +69,9 @@ enum SkyLightQuery {
             let isModal = (tags & 0x8000_0000) != 0
             guard isDocument || (isFloating && isModal) else { continue }
 
-            guard let windowId = skyLight.iteratorGetWindowID(iterator),
-                  let pid = skyLight.iteratorGetPID(iterator),
-                  let bounds = skyLight.iteratorGetBounds(iterator)
-            else { continue }
+            let windowId = skyLight.iteratorGetWindowID(iterator)
+            let pid = skyLight.iteratorGetPID(iterator)
+            let bounds = skyLight.iteratorGetBounds(iterator)
 
             results.append(WindowSnapshot(
                 windowId: windowId,
@@ -99,7 +90,6 @@ enum SkyLightQuery {
     /// Query a single window by ID. Returns nil if not found.
     static func queryWindow(_ windowId: UInt32) -> WindowSnapshot? {
         guard let skyLight = SkyLight.shared else { return nil }
-        guard skyLight.hasIteratorSupport else { return nil }
 
         let cid = skyLight.getMainConnectionID()
         guard cid != 0 else { return nil }
@@ -124,23 +114,14 @@ enum SkyLightQuery {
 
         guard skyLight.iteratorAdvance(iterator) else { return nil }
 
-        guard let wid = skyLight.iteratorGetWindowID(iterator),
-              let pid = skyLight.iteratorGetPID(iterator),
-              let level = skyLight.iteratorGetLevel(iterator),
-              let bounds = skyLight.iteratorGetBounds(iterator),
-              let tags = skyLight.iteratorGetTags(iterator),
-              let attributes = skyLight.iteratorGetAttributes(iterator),
-              let parentId = skyLight.iteratorGetParentID(iterator)
-        else { return nil }
-
         return WindowSnapshot(
-            windowId: wid,
-            pid: pid,
-            frame: bounds,
-            level: level,
-            tags: tags,
-            attributes: attributes,
-            parentId: parentId
+            windowId: skyLight.iteratorGetWindowID(iterator),
+            pid: skyLight.iteratorGetPID(iterator),
+            frame: skyLight.iteratorGetBounds(iterator),
+            level: skyLight.iteratorGetLevel(iterator),
+            tags: skyLight.iteratorGetTags(iterator),
+            attributes: skyLight.iteratorGetAttributes(iterator),
+            parentId: skyLight.iteratorGetParentID(iterator)
         )
     }
 }

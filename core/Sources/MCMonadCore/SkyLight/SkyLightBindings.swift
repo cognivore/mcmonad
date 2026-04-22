@@ -130,26 +130,26 @@ final class SkyLight: @unchecked Sendable {
     private let _disableUpdate: DisableUpdateFunc
     private let _reenableUpdate: ReenableUpdateFunc
 
-    // Optional iterator symbols
-    private let _windowIteratorGetBounds: WindowIteratorGetBoundsFunc?
-    private let _windowIteratorGetWindowID: WindowIteratorGetWindowIDFunc?
-    private let _windowIteratorGetPID: WindowIteratorGetPIDFunc?
-    private let _windowIteratorGetLevel: WindowIteratorGetLevelFunc?
-    private let _windowIteratorGetTags: WindowIteratorGetTagsFunc?
-    private let _windowIteratorGetAttributes: WindowIteratorGetAttributesFunc?
-    private let _windowIteratorGetParentID: WindowIteratorGetParentIDFunc?
+    // Iterator accessors — all required (can't enumerate windows without them)
+    private let _windowIteratorGetBounds: WindowIteratorGetBoundsFunc
+    private let _windowIteratorGetWindowID: WindowIteratorGetWindowIDFunc
+    private let _windowIteratorGetPID: WindowIteratorGetPIDFunc
+    private let _windowIteratorGetLevel: WindowIteratorGetLevelFunc
+    private let _windowIteratorGetTags: WindowIteratorGetTagsFunc
+    private let _windowIteratorGetAttributes: WindowIteratorGetAttributesFunc
+    private let _windowIteratorGetParentID: WindowIteratorGetParentIDFunc
 
-    // Optional transaction/movement
-    private let _transactionMoveWindowWithGroup: TransactionMoveWindowWithGroupFunc?
-    private let _moveWindow: MoveWindowFunc?
-    private let _getWindowBounds: GetWindowBoundsFunc?
+    // Movement — required (can't tile without moving windows)
+    private let _transactionMoveWindowWithGroup: TransactionMoveWindowWithGroupFunc
+    private let _moveWindow: MoveWindowFunc
+    private let _getWindowBounds: GetWindowBoundsFunc
 
-    // Optional notification symbols
-    private let _registerConnectionNotifyProc: RegisterConnectionNotifyProcFunc?
-    private let _unregisterConnectionNotifyProc: UnregisterConnectionNotifyProcFunc?
-    private let _requestNotificationsForWindows: RequestNotificationsForWindowsFunc?
-    private let _registerNotifyProc: RegisterNotifyProcFunc?
-    private let _unregisterNotifyProc: UnregisterNotifyProcFunc?
+    // Notifications — required (can't observe events without them)
+    private let _registerConnectionNotifyProc: RegisterConnectionNotifyProcFunc
+    private let _unregisterConnectionNotifyProc: UnregisterConnectionNotifyProcFunc
+    private let _requestNotificationsForWindows: RequestNotificationsForWindowsFunc
+    private let _registerNotifyProc: RegisterNotifyProcFunc
+    private let _unregisterNotifyProc: UnregisterNotifyProcFunc
 
     // CFRelease for SkyLight-returned CFTypeRefs
     private let _cfRelease: (@convention(c) (CFTypeRef) -> Void)
@@ -193,69 +193,73 @@ final class SkyLight: @unchecked Sendable {
             return result
         }
 
-        let mainConnectionID = required("SLSMainConnectionID", as: MainConnectionIDFunc.self)
-        let windowQueryWindows = required("SLSWindowQueryWindows", as: WindowQueryWindowsFunc.self)
-        let windowQueryResultCopyWindows = required("SLSWindowQueryResultCopyWindows", as: WindowQueryResultCopyWindowsFunc.self)
-        let windowIteratorGetCount = required("SLSWindowIteratorGetCount", as: WindowIteratorGetCountFunc.self)
-        let windowIteratorAdvance = required("SLSWindowIteratorAdvance", as: WindowIteratorAdvanceFunc.self)
-        let transactionCreate = required("SLSTransactionCreate", as: TransactionCreateFunc.self)
-        let transactionCommit = required("SLSTransactionCommit", as: TransactionCommitFunc.self)
-        let transactionOrderWindow = required("SLSTransactionOrderWindow", as: TransactionOrderWindowFunc.self)
-        let disableUpdate = required("SLSDisableUpdate", as: DisableUpdateFunc.self)
-        let reenableUpdate = required("SLSReenableUpdate", as: ReenableUpdateFunc.self)
+        // Core required symbols
+        let r01 = required("SLSMainConnectionID", as: MainConnectionIDFunc.self)
+        let r02 = required("SLSWindowQueryWindows", as: WindowQueryWindowsFunc.self)
+        let r03 = required("SLSWindowQueryResultCopyWindows", as: WindowQueryResultCopyWindowsFunc.self)
+        let r04 = required("SLSWindowIteratorGetCount", as: WindowIteratorGetCountFunc.self)
+        let r05 = required("SLSWindowIteratorAdvance", as: WindowIteratorAdvanceFunc.self)
+        let r06 = required("SLSTransactionCreate", as: TransactionCreateFunc.self)
+        let r07 = required("SLSTransactionCommit", as: TransactionCommitFunc.self)
+        let r08 = required("SLSTransactionOrderWindow", as: TransactionOrderWindowFunc.self)
+        let r09 = required("SLSDisableUpdate", as: DisableUpdateFunc.self)
+        let r10 = required("SLSReenableUpdate", as: ReenableUpdateFunc.self)
+
+        // Iterator — all required
+        let r11 = required("SLSWindowIteratorGetBounds", as: WindowIteratorGetBoundsFunc.self)
+        let r12 = required("SLSWindowIteratorGetWindowID", as: WindowIteratorGetWindowIDFunc.self)
+        let r13 = required("SLSWindowIteratorGetPID", as: WindowIteratorGetPIDFunc.self)
+        let r14 = required("SLSWindowIteratorGetLevel", as: WindowIteratorGetLevelFunc.self)
+        let r15 = required("SLSWindowIteratorGetTags", as: WindowIteratorGetTagsFunc.self)
+        let r16 = required("SLSWindowIteratorGetAttributes", as: WindowIteratorGetAttributesFunc.self)
+        let r17 = required("SLSWindowIteratorGetParentID", as: WindowIteratorGetParentIDFunc.self)
+
+        // Movement — all required
+        let r18 = required("SLSTransactionMoveWindowWithGroup", as: TransactionMoveWindowWithGroupFunc.self)
+        let r19 = required("SLSMoveWindow", as: MoveWindowFunc.self)
+        let r20 = required("SLSGetWindowBounds", as: GetWindowBoundsFunc.self)
+
+        // Notifications — all required (unregister has alternate names)
+        let r21 = required("SLSRegisterConnectionNotifyProc", as: RegisterConnectionNotifyProcFunc.self)
+        let r22: UnregisterConnectionNotifyProcFunc? =
+            resolve("SLSUnregisterConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
+            ?? resolve("SLSRemoveConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
+        if r22 == nil { missing.append("SLS{Unregister,Remove}ConnectionNotifyProc") }
+        let r23 = required("SLSRequestNotificationsForWindows", as: RequestNotificationsForWindowsFunc.self)
+        let r24 = required("SLSRegisterNotifyProc", as: RegisterNotifyProcFunc.self)
+        let r25: UnregisterNotifyProcFunc? =
+            resolve("SLSUnregisterNotifyProc", as: UnregisterNotifyProcFunc.self)
+            ?? resolve("SLSRemoveNotifyProc", as: UnregisterNotifyProcFunc.self)
+        if r25 == nil { missing.append("SLS{Unregister,Remove}NotifyProc") }
 
         if !missing.isEmpty {
             Self.logger.error("SkyLight missing required symbols: \(missing.joined(separator: ", "), privacy: .public)")
             return nil
         }
 
-        guard let mainConnectionID,
-              let windowQueryWindows,
-              let windowQueryResultCopyWindows,
-              let windowIteratorGetCount,
-              let windowIteratorAdvance,
-              let transactionCreate,
-              let transactionCommit,
-              let transactionOrderWindow,
-              let disableUpdate,
-              let reenableUpdate
-        else {
-            return nil
-        }
+        guard let r01, let r02, let r03, let r04, let r05,
+              let r06, let r07, let r08, let r09, let r10,
+              let r11, let r12, let r13, let r14, let r15, let r16, let r17,
+              let r18, let r19, let r20,
+              let r21, let r22, let r23, let r24, let r25
+        else { return nil }
 
-        self._mainConnectionID = mainConnectionID
-        self._windowQueryWindows = windowQueryWindows
-        self._windowQueryResultCopyWindows = windowQueryResultCopyWindows
-        self._windowIteratorGetCount = windowIteratorGetCount
-        self._windowIteratorAdvance = windowIteratorAdvance
-        self._transactionCreate = transactionCreate
-        self._transactionCommit = transactionCommit
-        self._transactionOrderWindow = transactionOrderWindow
-        self._disableUpdate = disableUpdate
-        self._reenableUpdate = reenableUpdate
-
-        // Optional iterator symbols
-        _windowIteratorGetBounds = resolve("SLSWindowIteratorGetBounds", as: WindowIteratorGetBoundsFunc.self)
-        _windowIteratorGetWindowID = resolve("SLSWindowIteratorGetWindowID", as: WindowIteratorGetWindowIDFunc.self)
-        _windowIteratorGetPID = resolve("SLSWindowIteratorGetPID", as: WindowIteratorGetPIDFunc.self)
-        _windowIteratorGetLevel = resolve("SLSWindowIteratorGetLevel", as: WindowIteratorGetLevelFunc.self)
-        _windowIteratorGetTags = resolve("SLSWindowIteratorGetTags", as: WindowIteratorGetTagsFunc.self)
-        _windowIteratorGetAttributes = resolve("SLSWindowIteratorGetAttributes", as: WindowIteratorGetAttributesFunc.self)
-        _windowIteratorGetParentID = resolve("SLSWindowIteratorGetParentID", as: WindowIteratorGetParentIDFunc.self)
-
-        // Optional transaction/movement
-        _transactionMoveWindowWithGroup = resolve("SLSTransactionMoveWindowWithGroup", as: TransactionMoveWindowWithGroupFunc.self)
-        _moveWindow = resolve("SLSMoveWindow", as: MoveWindowFunc.self)
-        _getWindowBounds = resolve("SLSGetWindowBounds", as: GetWindowBoundsFunc.self)
-
-        // Optional notification symbols
-        _registerConnectionNotifyProc = resolve("SLSRegisterConnectionNotifyProc", as: RegisterConnectionNotifyProcFunc.self)
-        _unregisterConnectionNotifyProc = resolve("SLSUnregisterConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
-            ?? resolve("SLSRemoveConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
-        _requestNotificationsForWindows = resolve("SLSRequestNotificationsForWindows", as: RequestNotificationsForWindowsFunc.self)
-        _registerNotifyProc = resolve("SLSRegisterNotifyProc", as: RegisterNotifyProcFunc.self)
-        _unregisterNotifyProc = resolve("SLSUnregisterNotifyProc", as: UnregisterNotifyProcFunc.self)
-            ?? resolve("SLSRemoveNotifyProc", as: UnregisterNotifyProcFunc.self)
+        _mainConnectionID = r01;  _windowQueryWindows = r02
+        _windowQueryResultCopyWindows = r03
+        _windowIteratorGetCount = r04;  _windowIteratorAdvance = r05
+        _transactionCreate = r06;  _transactionCommit = r07
+        _transactionOrderWindow = r08
+        _disableUpdate = r09;  _reenableUpdate = r10
+        _windowIteratorGetBounds = r11;  _windowIteratorGetWindowID = r12
+        _windowIteratorGetPID = r13;  _windowIteratorGetLevel = r14
+        _windowIteratorGetTags = r15;  _windowIteratorGetAttributes = r16
+        _windowIteratorGetParentID = r17
+        _transactionMoveWindowWithGroup = r18;  _moveWindow = r19
+        _getWindowBounds = r20
+        _registerConnectionNotifyProc = r21
+        _unregisterConnectionNotifyProc = r22
+        _requestNotificationsForWindows = r23
+        _registerNotifyProc = r24;  _unregisterNotifyProc = r25
     }
 
     // MARK: - Public API
@@ -288,43 +292,32 @@ final class SkyLight: @unchecked Sendable {
         _windowIteratorAdvance(iterator)
     }
 
-    func iteratorGetWindowID(_ iterator: CFTypeRef) -> UInt32? {
-        _windowIteratorGetWindowID?(iterator)
+    func iteratorGetWindowID(_ iterator: CFTypeRef) -> UInt32 {
+        _windowIteratorGetWindowID(iterator)
     }
 
-    func iteratorGetPID(_ iterator: CFTypeRef) -> Int32? {
-        _windowIteratorGetPID?(iterator)
+    func iteratorGetPID(_ iterator: CFTypeRef) -> Int32 {
+        _windowIteratorGetPID(iterator)
     }
 
-    func iteratorGetBounds(_ iterator: CFTypeRef) -> CGRect? {
-        _windowIteratorGetBounds?(iterator)
+    func iteratorGetBounds(_ iterator: CFTypeRef) -> CGRect {
+        _windowIteratorGetBounds(iterator)
     }
 
-    func iteratorGetLevel(_ iterator: CFTypeRef) -> Int32? {
-        _windowIteratorGetLevel?(iterator)
+    func iteratorGetLevel(_ iterator: CFTypeRef) -> Int32 {
+        _windowIteratorGetLevel(iterator)
     }
 
-    func iteratorGetTags(_ iterator: CFTypeRef) -> UInt64? {
-        _windowIteratorGetTags?(iterator)
+    func iteratorGetTags(_ iterator: CFTypeRef) -> UInt64 {
+        _windowIteratorGetTags(iterator)
     }
 
-    func iteratorGetAttributes(_ iterator: CFTypeRef) -> UInt32? {
-        _windowIteratorGetAttributes?(iterator)
+    func iteratorGetAttributes(_ iterator: CFTypeRef) -> UInt32 {
+        _windowIteratorGetAttributes(iterator)
     }
 
-    func iteratorGetParentID(_ iterator: CFTypeRef) -> UInt32? {
-        _windowIteratorGetParentID?(iterator)
-    }
-
-    /// Whether all iterator accessors are available.
-    var hasIteratorSupport: Bool {
-        _windowIteratorGetBounds != nil
-            && _windowIteratorGetWindowID != nil
-            && _windowIteratorGetPID != nil
-            && _windowIteratorGetLevel != nil
-            && _windowIteratorGetTags != nil
-            && _windowIteratorGetAttributes != nil
-            && _windowIteratorGetParentID != nil
+    func iteratorGetParentID(_ iterator: CFTypeRef) -> UInt32 {
+        _windowIteratorGetParentID(iterator)
     }
 
     // MARK: Transactions
@@ -350,26 +343,24 @@ final class SkyLight: @unchecked Sendable {
         _ transaction: CFTypeRef,
         windowId: UInt32,
         point: CGPoint
-    ) -> CGError? {
-        _transactionMoveWindowWithGroup?(transaction, windowId, point)
+    ) -> CGError {
+        _transactionMoveWindowWithGroup(transaction, windowId, point)
     }
 
     // MARK: Direct window operations
 
     func moveWindow(_ wid: UInt32, to point: CGPoint) -> Bool {
-        guard let move = _moveWindow else { return false }
         let cid = getMainConnectionID()
         guard cid != 0 else { return false }
         var pt = point
-        return move(cid, wid, &pt) == .success
+        return _moveWindow(cid, wid, &pt) == .success
     }
 
     func getWindowBounds(_ wid: UInt32) -> CGRect? {
-        guard let getBounds = _getWindowBounds else { return nil }
         let cid = getMainConnectionID()
         guard cid != 0 else { return nil }
         var rect = CGRect.zero
-        guard getBounds(cid, wid, &rect) == .success else { return nil }
+        guard _getWindowBounds(cid, wid, &rect) == .success else { return nil }
         return rect
     }
 
@@ -403,24 +394,15 @@ final class SkyLight: @unchecked Sendable {
     // MARK: Batch operations
 
     func batchMoveWindows(_ positions: [(windowId: UInt32, origin: CGPoint)]) {
-        guard let transactionMove = _transactionMoveWindowWithGroup else {
-            for (wid, origin) in positions {
-                _ = moveWindow(wid, to: origin)
-            }
-            return
-        }
-
         let cid = getMainConnectionID()
         guard let transaction = _transactionCreate(cid) else {
-            for (wid, origin) in positions {
-                _ = moveWindow(wid, to: origin)
-            }
+            Self.logger.error("Failed to create SkyLight transaction for batchMoveWindows")
             return
         }
         defer { releaseCF(transaction) }
 
         for (wid, origin) in positions {
-            _ = transactionMove(transaction, wid, origin)
+            _ = _transactionMoveWindowWithGroup(transaction, wid, origin)
         }
         _ = _transactionCommit(transaction, 0)
     }
@@ -443,20 +425,18 @@ final class SkyLight: @unchecked Sendable {
         callback: @escaping ConnectionNotifyCallback,
         context: UnsafeMutableRawPointer? = nil
     ) -> Bool {
-        guard let register = _registerConnectionNotifyProc else { return false }
         let cid = getMainConnectionID()
         guard cid != 0 else { return false }
-        return register(cid, callback, event.rawValue, context) == 0
+        return _registerConnectionNotifyProc(cid, callback, event.rawValue, context) == 0
     }
 
     func unregisterForNotification(
         event: CGSEventType,
         callback: @escaping ConnectionNotifyCallback
     ) -> Bool {
-        guard let unregister = _unregisterConnectionNotifyProc else { return false }
         let cid = getMainConnectionID()
         guard cid != 0 else { return false }
-        return unregister(cid, callback, event.rawValue) == 0
+        return _unregisterConnectionNotifyProc(cid, callback, event.rawValue) == 0
     }
 
     func registerNotifyProc(
@@ -464,8 +444,7 @@ final class SkyLight: @unchecked Sendable {
         callback: @escaping NotifyCallback,
         context: UnsafeMutableRawPointer? = nil
     ) -> Bool {
-        guard let register = _registerNotifyProc else { return false }
-        return register(callback, event.rawValue, context) == 0
+        return _registerNotifyProc(callback, event.rawValue, context) == 0
     }
 
     func unregisterNotifyProc(
@@ -473,17 +452,15 @@ final class SkyLight: @unchecked Sendable {
         callback: @escaping NotifyCallback,
         context: UnsafeMutableRawPointer? = nil
     ) -> Bool {
-        guard let unregister = _unregisterNotifyProc else { return false }
-        return unregister(callback, event.rawValue, context) == 0
+        return _unregisterNotifyProc(callback, event.rawValue, context) == 0
     }
 
     func subscribeToWindowNotifications(_ windowIds: [UInt32]) -> Bool {
-        guard let request = _requestNotificationsForWindows else { return false }
         guard !windowIds.isEmpty else { return true }
         let cid = getMainConnectionID()
         guard cid != 0 else { return false }
         return windowIds.withUnsafeBufferPointer { buffer in
-            request(cid, buffer.baseAddress!, Int32(windowIds.count))
+            _requestNotificationsForWindows(cid, buffer.baseAddress!, Int32(windowIds.count))
         } == 0
     }
 

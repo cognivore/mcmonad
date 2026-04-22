@@ -83,13 +83,12 @@ waitForReady conn = do
         _     -> waitForReady conn
 
 -- | Block until a ScreensChanged event arrives after QueryScreens.
--- Falls back to a single 1920x1080 screen if an unexpected event arrives.
 waitForScreens :: Connection -> IO [ScreenInfo]
 waitForScreens conn = do
     ev <- readEvent conn
     case ev of
         ScreensChanged scs -> return scs
-        _ -> return [ScreenInfo 0 (Rectangle 0 0 1920 1080)]
+        _ -> waitForScreens conn  -- skip unexpected events, keep waiting
 
 -- | Block until a QueryWindowsResponse event arrives after QueryWindows.
 -- Returns an empty list if an unexpected event arrives.
@@ -123,11 +122,7 @@ buildInitialWindowSet cfg screens =
     currentSc = case (visibleWS, screenList) of
         (tag:_, (sid, si):_) ->
             W.Screen (mkWorkspace tag) (S sid) (SD (siFrame si))
-        -- Fallback: must have at least one workspace and one screen
-        (tag:_, []) ->
-            W.Screen (mkWorkspace tag) (S 0) (SD (Rectangle 0 0 1920 1080))
-        ([], _) ->
-            W.Screen (mkWorkspace "1") (S 0) (SD (Rectangle 0 0 1920 1080))
+        _ -> error "mcmonad: no workspaces or no screens — cannot start"
 
     -- Other visible screens
     visibleScs =

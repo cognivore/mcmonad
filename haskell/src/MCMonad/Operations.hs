@@ -31,6 +31,7 @@ import Data.Monoid (Endo(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import System.Exit (exitSuccess)
+import System.IO (hPutStrLn, stderr)
 import System.Process (createProcess, shell, CreateProcess(..))
 import qualified XMonad.StackSet as W
 
@@ -71,6 +72,7 @@ windows f = do
 
     -- 2. Hide windows no longer visible
     let toHide = filter (`notElem` newVisible) oldVisible
+    io $ hPutStrLn stderr $ "WINDOWS: oldVisible=" ++ show (length oldVisible) ++ " newVisible=" ++ show (length newVisible) ++ " toHide=" ++ show (map wrWindowId toHide)
     unless (null toHide) $
         io $ sendCommand conn (HideWindows (map wrWindowId toHide))
 
@@ -130,7 +132,22 @@ windows f = do
     let currentTag = W.tag . W.workspace . W.current $ currentWS'
     io $ sendCommand conn (SetWorkspaceIndicator currentTag)
 
-    -- 9. Update mapped set
+    -- 9. Warp mouse to center of focused window when screen/workspace changed
+    let oldScreen = W.screen (W.current old)
+        newScreen = W.screen (W.current currentWS')
+        oldTag = W.tag (W.workspace (W.current old))
+        newTag = W.tag (W.workspace (W.current currentWS'))
+    when (oldScreen /= newScreen || oldTag /= newTag) $ do
+        case newFocus of
+            Just w -> do
+                let mRect = lookup w (allRects ++ floatRects)
+                case mRect of
+                    Just (Rectangle rx ry rw rh) ->
+                        io $ sendCommand conn (WarpMouse (rx + rw / 2) (ry + rh / 2))
+                    Nothing -> return ()
+            Nothing -> return ()
+
+    -- 10. Update mapped set
     modify $ \s -> s { mapped = S.fromList newVisible }
 
 -- | All windows visible on any screen (current + visible), including

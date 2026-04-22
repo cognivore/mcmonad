@@ -50,6 +50,7 @@ data Command
     | RegisterHotkeys [HotkeySpec]
     | CloseWindow !Word32 !Int32
     | SetWorkspaceIndicator !String
+    | WarpMouse !Double !Double
     deriving (Show, Generic)
 
 -- | A frame assignment: position a specific window at a specific rectangle.
@@ -91,12 +92,12 @@ instance Aeson.ToJSON Command where
         , "pid"      .= pid
         ]
     toJSON (HideWindows wids) = Aeson.object
-        [ "cmd"     .= ("hide-windows" :: Text)
-        , "windows" .= wids
+        [ "cmd"       .= ("hide-windows" :: Text)
+        , "windowIds" .= wids
         ]
     toJSON (ShowWindows wids) = Aeson.object
-        [ "cmd"     .= ("show-windows" :: Text)
-        , "windows" .= wids
+        [ "cmd"       .= ("show-windows" :: Text)
+        , "windowIds" .= wids
         ]
     toJSON QueryWindows = Aeson.object
         [ "cmd" .= ("query-windows" :: Text)
@@ -116,6 +117,11 @@ instance Aeson.ToJSON Command where
     toJSON (SetWorkspaceIndicator tag) = Aeson.object
         [ "cmd" .= ("set-workspace-indicator" :: Text)
         , "tag" .= tag
+        ]
+    toJSON (WarpMouse x y) = Aeson.object
+        [ "cmd" .= ("warp-mouse" :: Text)
+        , "x"   .= x
+        , "y"   .= y
         ]
 
 -- ---------------------------------------------------------------------------

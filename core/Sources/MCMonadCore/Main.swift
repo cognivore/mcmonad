@@ -21,25 +21,19 @@ final class EventBridge: SkyLightEventDelegate {
         case .created(let windowId, _):
             // Query SkyLight for the snapshot, then enrich with AX
             if let snap = SkyLightQuery.queryWindow(windowId) {
-                // Subscribe to per-window notifications for close events
-                observer.subscribeToWindows([windowId])
-
-                let info = AXWindowService.info(
+                guard let info = AXWindowService.info(
                     windowId: snap.windowId,
                     pid: snap.pid
-                ) ?? WindowInfo(
-                    windowId: snap.windowId,
-                    pid: snap.pid,
-                    title: nil,
-                    appName: nil,
-                    bundleId: nil,
-                    subrole: nil,
-                    isDialog: false,
-                    isFixedSize: false,
-                    hasCloseButton: false,
-                    hasFullscreenButton: false,
-                    frame: snap.frame
-                )
+                ) else {
+                    // Can't read AX info — skip (menus, tooltips, etc.)
+                    return
+                }
+
+                // Only manage windows that have a close button — this filters
+                // out context menus, tooltips, popups, and other transient UI
+                guard info.hasCloseButton else { return }
+
+                observer.subscribeToWindows([windowId])
                 socketServer.send(.windowCreated(info))
             }
 
@@ -163,6 +157,9 @@ struct MCMonadCoreApp {
             let screens = displayManager.currentScreens()
             socketServer.send(.screensChanged(screens: screens))
         }
+
+        // Focus-follows-mouse: DISABLED — CGEventTap breaks right-click menus.
+        // Needs a fundamentally different approach (not CGEventTap).
 
         // Start event observer
         eventObserver.start()

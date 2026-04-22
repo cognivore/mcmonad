@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import os
 
@@ -44,6 +45,8 @@ final class CommandExecutor {
             executeShowWindows(windowIds)
         case .setWorkspaceIndicator(let tag):
             statusBarController.updateWorkspace(tag)
+        case .warpMouse(let x, let y):
+            CGWarpMouseCursorPosition(CGPoint(x: x, y: y))
         }
     }
 
@@ -116,14 +119,24 @@ final class CommandExecutor {
     }
 
     private func executeHideWindows(_ windowIds: [UInt32]) {
+        fputs("CMD: hide-windows ids=\(windowIds)\n", stderr)
+        // Move windows far offscreen. SetFrames will reposition them when
+        // they become visible again on a workspace switch.
         for windowId in windowIds {
-            _ = AXWindowService.setMinimized(windowId: windowId, minimized: true)
+            if let snap = SkyLightQuery.queryWindow(windowId) {
+                // Move offscreen but keep original size (some apps enforce minimums)
+                AXWindowService.setFrame(
+                    CGRect(x: -20000, y: -20000, width: snap.frame.width, height: snap.frame.height),
+                    windowId: windowId,
+                    pid: snap.pid,
+                    currentHint: snap.frame
+                )
+            }
         }
     }
 
     private func executeShowWindows(_ windowIds: [UInt32]) {
-        for windowId in windowIds {
-            _ = AXWindowService.setMinimized(windowId: windowId, minimized: false)
-        }
+        // Windows will be repositioned by the SetFrames command that
+        // follows. Nothing to do here.
     }
 }

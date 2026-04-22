@@ -48,26 +48,30 @@ final class MouseTracker {
 
     /// Called from the C callback on the main thread.
     fileprivate func handleMouseMoved() {
+        // Don't change focus while any mouse button is held (menus, dragging)
+        let pressedButtons = NSEvent.pressedMouseButtons
+        guard pressedButtons == 0 else { return }
+
         let mouseLocation = NSEvent.mouseLocation
-        // NSEvent.mouseLocation is in screen coords (origin bottom-left),
-        // but CGWindowListCopyWindowInfo uses top-left origin.
-        // Convert: flip Y using main screen height.
         guard let mainScreen = NSScreen.main else { return }
         let flippedY = mainScreen.frame.height - mouseLocation.y
         let point = CGPoint(x: mouseLocation.x, y: flippedY)
 
-        // Find which window is under the cursor
+        // Find which normal-layer window is under the cursor
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else { return }
+
+        let myPid = ProcessInfo.processInfo.processIdentifier
 
         for windowInfo in windowList {
             guard let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
                   let windowNumber = windowInfo[kCGWindowNumber as String] as? UInt32,
                   let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? Int32,
                   let layer = windowInfo[kCGWindowLayer as String] as? Int,
-                  layer == 0  // normal windows only
+                  layer == 0,           // normal windows only (skip menus, popups, overlays)
+                  ownerPID != myPid     // skip our own windows
             else { continue }
 
             let bounds = CGRect(

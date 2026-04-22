@@ -1,0 +1,16 @@
+# Swift
+core/.build/
+core/.swiftpm/
+
+# Haskell
+haskell/dist-newstyle/
+haskell/.cabal-sandbox/
+haskell/cabal.sandbox.config
+
+# Nix
+result
+result-*
+.direnv/
+
+# macOS
+.DS_Store

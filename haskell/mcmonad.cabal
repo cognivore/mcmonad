@@ -1,0 +1,56 @@
+cabal-version: 3.0
+name:          mcmonad
+version:       0.1.0.0
+build-type:    Simple
+synopsis:      Mac-native tiling window manager
+
+library
+  hs-source-dirs: src
+  default-language: GHC2021
+  ghc-options: -Wall -Wcompat
+  exposed-modules:
+    MCMonad
+    MCMonad.Core
+    MCMonad.Layout
+    MCMonad.ManageHook
+    MCMonad.Operations
+    MCMonad.Main
+    MCMonad.IPC
+    MCMonad.Config
+  build-depends:
+    base >= 4.16 && < 5,
+    xmonad >= 0.18,
+    aeson >= 2.0,
+    bytestring,
+    containers,
+    directory,
+    filepath,
+    mtl,
+    network,
+    process,
+    text,
+    transformers,
+    unix
+
+executable mcmonad
+  main-is: Main.hs
+  hs-source-dirs: app
+  default-language: GHC2021
+  ghc-options: -Wall -threaded
+  build-depends:
+    base,
+    mcmonad
+
+test-suite properties
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  other-modules: Properties
+  hs-source-dirs: tests
+  default-language: GHC2021
+  ghc-options: -Wall
+  build-depends:
+    base,
+    mcmonad,
+    xmonad,
+    QuickCheck >= 2.14,
+    containers

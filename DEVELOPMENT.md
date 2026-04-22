@@ -16,24 +16,17 @@ mcmonad is two binaries that communicate over a Unix socket:
 | `mcmonad-core` | Swift | System (Xcode CLI Tools) | Swift Package Manager |
 | `mcmonad` | Haskell | Nix (`haskellPackages`) | cabal |
 
-### Why system Swift, not Nix Swift
+### Swift: always system, never Nix
 
-nixpkgs provides Swift 5.10.1 via `swiftPackages`. This works for CLI tools
-using `swiftPackages.stdenv` + `swiftpm2nix`. However:
+mcmonad-core uses **system Swift from Xcode Command Line Tools**. Period.
 
-- mcmonad-core targets **Swift 6** strict concurrency (`@MainActor`, `Sendable`,
-  isolation checking). Swift 5.10 can opt in with `@_strictConcurrency` but
-  this is fragile and not the same thing.
-- The SkyLight/Accessibility APIs we use are tightly coupled to the macOS SDK
-  version. System Swift's SDK is always correct for the running OS. Nix's
-  `apple-sdk` packages lag behind.
-- Every real macOS tiling WM in nixpkgs (yabai on aarch64, etc.) ships prebuilt
-  binaries or uses system toolchains. This is the established pattern.
-
-**When nixpkgs gets Swift 6** (tracked in [NixOS Discourse: Swift 6 coming
-soon?](https://discourse.nixos.org/t/swift-6-coming-soon/55447)), we can switch
-to a pure Nix build for mcmonad-core. The architecture is ready for it — just
-change `core-package.nix` from system Swift to `swiftPackages.stdenv`.
+- nixpkgs has Swift 5.10.1. We need Swift 6 strict concurrency (`@MainActor`,
+  `Sendable`, data-race safety). Not negotiable.
+- SkyLight and Accessibility APIs are tightly coupled to the macOS SDK version.
+  System Swift's SDK is always correct for the running OS.
+- Every macOS tiling WM in nixpkgs (yabai, etc.) uses system toolchains or
+  ships prebuilt binaries. This is the only real path.
+- Nix manages Haskell and distribution. Swift builds itself.
 
 ### Why Nix Haskell, not system Haskell
 
@@ -308,41 +301,6 @@ in
 ```
 
 ---
-
-## When nixpkgs gets Swift 6
-
-Replace the impure `mcmonad-core` derivation with a pure build:
-
-```nix
-mcmonad-core = let
-  generated = pkgs.swiftpm2nix.helpers ./core/nix;
-in pkgs.swiftPackages.stdenv.mkDerivation {
-  pname = "mcmonad-core";
-  version = "0.1.0";
-  src = ./core;
-  nativeBuildInputs = [ pkgs.swiftPackages.swift pkgs.swiftPackages.swiftpm ];
-  configurePhase = generated.configure;
-  installPhase = ''
-    binPath="$(swiftpmBinPath)"
-    mkdir -p $out/bin
-    cp $binPath/mcmonad-core $out/bin/
-  '';
-};
-```
-
-Generate the lockfiles:
-
-```bash
-cd core/
-nix-shell -p swiftPackages.swift swiftPackages.swiftpm swiftpm2nix
-swift package resolve
-swiftpm2nix
-# Generates core/nix/ directory with dependency pins
-```
-
-This gives a fully hermetic, reproducible build. Until then, the impure build
-with `__impureHostDeps` is the pragmatic choice — it's what the macOS Nix
-ecosystem actually does.
 
 ---
 

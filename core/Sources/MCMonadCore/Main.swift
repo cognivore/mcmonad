@@ -148,13 +148,6 @@ struct MCMonadCoreApp {
             socketServer.send(.screensChanged(screens: screens))
         }
 
-        // Focus-follows-mouse: CGEventTap with 100ms debounce + menu suppression
-        let mouseTracker = MouseTracker()
-        mouseTracker.onWindowEntered = { windowId, pid in
-            socketServer.send(.mouseEnteredWindow(windowId: windowId, pid: pid))
-        }
-        mouseTracker.start()
-
         // Start event observer
         eventObserver.start()
 
@@ -164,7 +157,7 @@ struct MCMonadCoreApp {
         logger.info("mcmonad-core fully initialized")
 
         // Keep references alive for the lifetime of the process
-        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge, mouseTracker)
+        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge)
     }
 
     // Static storage to prevent ARC from deallocating services

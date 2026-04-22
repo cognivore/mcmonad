@@ -13,11 +13,20 @@ final class DisplayManager {
 
     func currentScreens() -> [ScreenInfo] {
         let screens = NSScreen.screens
+        // Use visibleFrame to exclude menu bar and dock
+        // Convert from AppKit coords (origin bottom-left) to screen coords (origin top-left)
+        let primaryHeight = screens.first?.frame.height ?? 0
         return screens.enumerated().map { index, screen in
-            ScreenInfo(
-                screenId: index,
-                frame: screen.frame
+            let visible = screen.visibleFrame
+            // Flip Y: AppKit has origin at bottom-left, we need top-left
+            let flippedY = primaryHeight - visible.origin.y - visible.height
+            let frame = CGRect(
+                x: visible.origin.x,
+                y: flippedY,
+                width: visible.width,
+                height: visible.height
             )
+            return ScreenInfo(screenId: index, frame: frame)
         }
     }
 

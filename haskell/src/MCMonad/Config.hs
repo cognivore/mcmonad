@@ -18,7 +18,7 @@ import qualified XMonad.StackSet as W
 import MCMonad.Core
 import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
-import MCMonad.Operations (windows, sendMessage, kill, spawn, withFocused)
+import MCMonad.Operations (windows, sendMessage, kill, spawn, withFocused, screenWorkspace)
 
 -- ---------------------------------------------------------------------------
 -- Key types
@@ -151,6 +151,12 @@ defaultKeys conf = Map.fromList $
     [ ((mask, key), windows (action ws))
     | (ws, key) <- zip (mcWorkspaces conf) [k1, k2, k3, k4, k5, k6, k7, k8, k9]
     , (action, mask) <- [(W.greedyView, m), (W.shift, m .|. shiftMask)]
+    ]
+    ++
+    -- Screens: Mod-{w,e,r} to focus, Mod-Shift-{w,e,r} to shift
+    [ ((mask, key), screenWorkspace sc >>= maybe (return ()) (windows . action))
+    | (key, sc) <- zip [kW, kE, kR] [0..]
+    , (action, mask) <- [(W.view, m), (W.shift, m .|. shiftMask)]
     ]
   where
     m = modMask conf

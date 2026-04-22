@@ -3,6 +3,7 @@ module MCMonad.Operations
       windows
       -- * Window lifecycle
     , manage
+    , manageSilent
     , unmanage
       -- * Layout messages
     , sendMessage
@@ -184,6 +185,16 @@ manage wi hook = do
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
         windows (transform . W.insertUp wr)
+
+-- | Insert a window into the StackSet without triggering layout.
+-- Used during startup to batch-insert all existing windows.
+manageSilent :: WindowInfo -> ManageHook -> M ()
+manageSilent wi hook = do
+    let wr = WindowRef (wiWindowId wi) (wiPid wi)
+    ws <- gets windowset
+    when (not (W.member wr ws)) $ do
+        Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
+        modify $ \s -> s { windowset = transform (W.insertUp wr (windowset s)) }
 
 -- | Remove a window from management. Called when a window is destroyed.
 unmanage :: WindowRef -> M ()

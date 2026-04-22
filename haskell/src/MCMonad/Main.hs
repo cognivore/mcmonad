@@ -65,9 +65,12 @@ launch cfg = do
         mst0  = MState { windowset = ws0, mapped = Set.empty }
 
     _ <- runM mconf mst0 $ do
-        -- Manage all existing windows
+        -- Batch-insert all existing windows into the StackSet without
+        -- triggering layout after each one. Then run one layout at the end.
         let hook = manageHook cfg
-        mapM_ (\wi -> manage wi hook) existingWindows
+        mapM_ (\wi -> manageSilent wi hook) existingWindows
+        -- Now run a single layout pass for all windows
+        windows id
 
         -- Run the startup hook
         userCodeDef () (startupHook cfg)
@@ -166,11 +169,13 @@ handleEvent debug cfg hotkeyIdMap evt = do
             return ()
 
         FrontAppChanged pid -> do
+            -- User clicked a window — update StackSet focus WITHOUT sending
+            -- FocusWindow back (macOS already focused it). Avoids feedback loop.
             ws <- gets windowset
             let mref = find (\w -> wrPid w == pid) (W.allWindows ws)
             case mref of
                 Just wref | W.peek ws /= Just wref ->
-                    windows (W.focusWindow wref)
+                    modify $ \s -> s { windowset = W.focusWindow wref (windowset s) }
                 _ -> return ()
 
         MouseEnteredWindow wid _pid ->

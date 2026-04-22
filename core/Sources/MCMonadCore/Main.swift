@@ -55,6 +55,7 @@ final class EventBridge: SkyLightEventDelegate {
             }
 
         case .frontAppChanged(let pid):
+            fputs("BRIDGE: frontAppChanged pid=\(pid)\n", stderr)
             socketServer.send(.frontAppChanged(pid: pid))
 
         case .titleChanged:
@@ -139,6 +140,20 @@ struct MCMonadCoreApp {
             socketServer.send(.screensChanged(screens: screens))
         }
         displayManager.startObserving()
+
+        // App activation via NSWorkspace (reliable, unlike SkyLight 1508)
+        let workspace = NSWorkspace.shared
+        workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication else { return }
+            let pid = app.processIdentifier
+            fputs("NSWORKSPACE: didActivateApplication pid=\(pid)\n", stderr)
+            socketServer.send(.frontAppChanged(pid: pid))
+        }
 
         // On client connection: send Ready + current screens
         socketServer.onClientConnected = {

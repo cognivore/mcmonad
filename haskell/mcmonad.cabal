@@ -42,7 +42,8 @@ executable mcmonad
   ghc-options: -Wall -threaded
   build-depends:
     base,
-    mcmonad
+    mcmonad,
+    xmonad-contrib
 
 test-suite properties
   type: exitcode-stdio-1.0

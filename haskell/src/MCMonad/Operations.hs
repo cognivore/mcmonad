@@ -116,6 +116,7 @@ windows f = do
 
     -- 6. Send frame assignments
     let frames = map toFrameAssignment (allRects ++ floatRects)
+    io $ hPutStrLn stderr $ "FRAMES: " ++ show [(wrWindowId w, rect_x r, rect_y r, rect_w r, rect_h r) | (w, r) <- allRects ++ floatRects]
     unless (null frames) $
         io $ sendCommand conn (SetFrames frames)
 

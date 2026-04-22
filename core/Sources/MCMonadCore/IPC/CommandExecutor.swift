@@ -1,3 +1,4 @@
+import ApplicationServices
 import CoreGraphics
 import Foundation
 import os
@@ -62,15 +63,41 @@ final class CommandExecutor {
         skylight.disableUpdate()
         defer { skylight.reenableUpdate() }
 
+        // Phase 1: Set all sizes first (shrink windows to target size).
+        // This prevents temporary overlaps that cause macOS to clamp sizes.
         for assignment in frames {
-            // Read current frame as hint for write ordering (grow vs shrink)
-            let currentFrame = skylight.getWindowBounds(assignment.windowId)
-            _ = AXWindowService.setFrame(
-                assignment.frame,
-                windowId: assignment.windowId,
-                pid: assignment.pid,
-                currentHint: currentFrame
-            )
+            if let axWindow = AXWindowService.findAXWindow(
+                windowId: assignment.windowId, pid: assignment.pid
+            ) {
+                var size = CGSize(width: assignment.frame.width, height: assignment.frame.height)
+                if let sizeValue = AXValueCreate(.cgSize, &size) {
+                    AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeValue)
+                }
+            }
+        }
+
+        // Phase 2: Set all positions (move shrunken windows to target location).
+        for assignment in frames {
+            if let axWindow = AXWindowService.findAXWindow(
+                windowId: assignment.windowId, pid: assignment.pid
+            ) {
+                var position = CGPoint(x: assignment.frame.origin.x, y: assignment.frame.origin.y)
+                if let positionValue = AXValueCreate(.cgPoint, &position) {
+                    AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, positionValue)
+                }
+            }
+        }
+
+        // Phase 3: Set sizes again (in case any were clamped during position changes).
+        for assignment in frames {
+            if let axWindow = AXWindowService.findAXWindow(
+                windowId: assignment.windowId, pid: assignment.pid
+            ) {
+                var size = CGSize(width: assignment.frame.width, height: assignment.frame.height)
+                if let sizeValue = AXValueCreate(.cgSize, &size) {
+                    AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeValue)
+                }
+            }
         }
     }
 

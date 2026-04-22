@@ -354,7 +354,7 @@ enum AXWindowService {
 
     // MARK: - Internal: find AX element for window
 
-    private static func findAXWindow(
+    static func findAXWindow(
         windowId: UInt32,
         pid: pid_t
     ) -> AXUIElement? {

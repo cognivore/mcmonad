@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
@@ -60,43 +61,49 @@ final class CommandExecutor {
             return
         }
 
+        // Resolve AX elements once
+        let resolved: [(FrameAssignment, AXUIElement)] = frames.compactMap { a in
+            AXWindowService.findAXWindow(windowId: a.windowId, pid: a.pid).map { (a, $0) }
+        }
+
         skylight.disableUpdate()
-        defer { skylight.reenableUpdate() }
 
-        // Phase 1: Set all sizes first (shrink windows to target size).
-        // This prevents temporary overlaps that cause macOS to clamp sizes.
-        for assignment in frames {
-            if let axWindow = AXWindowService.findAXWindow(
-                windowId: assignment.windowId, pid: assignment.pid
-            ) {
-                var size = CGSize(width: assignment.frame.width, height: assignment.frame.height)
-                if let sizeValue = AXValueCreate(.cgSize, &size) {
-                    AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeValue)
-                }
+        // Phase 1: Set all sizes (prevents overlaps that clamp sizes)
+        for (a, ax) in resolved {
+            var size = CGSize(width: a.frame.width, height: a.frame.height)
+            if let v = AXValueCreate(.cgSize, &size) {
+                AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
             }
         }
 
-        // Phase 2: Set all positions (move shrunken windows to target location).
-        for assignment in frames {
-            if let axWindow = AXWindowService.findAXWindow(
-                windowId: assignment.windowId, pid: assignment.pid
-            ) {
-                var position = CGPoint(x: assignment.frame.origin.x, y: assignment.frame.origin.y)
-                if let positionValue = AXValueCreate(.cgPoint, &position) {
-                    AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, positionValue)
-                }
+        // Phase 2: Set all positions
+        for (a, ax) in resolved {
+            var pos = CGPoint(x: a.frame.origin.x, y: a.frame.origin.y)
+            if let v = AXValueCreate(.cgPoint, &pos) {
+                AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, v)
             }
         }
 
-        // Phase 3: Set sizes again (in case any were clamped during position changes).
-        for assignment in frames {
-            if let axWindow = AXWindowService.findAXWindow(
-                windowId: assignment.windowId, pid: assignment.pid
-            ) {
-                var size = CGSize(width: assignment.frame.width, height: assignment.frame.height)
-                if let sizeValue = AXValueCreate(.cgSize, &size) {
-                    AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeValue)
-                }
+        // Phase 3: Set sizes again (fix any clamped during moves)
+        for (a, ax) in resolved {
+            var size = CGSize(width: a.frame.width, height: a.frame.height)
+            if let v = AXValueCreate(.cgSize, &size) {
+                AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
+            }
+        }
+
+        skylight.reenableUpdate()
+
+        // Phase 4: Raise all visible windows to cover hidden windows
+        // that refused to move offscreen (e.g. Slack).
+        // AXRaise only works within an app, so also use SkyLight to
+        // order visible windows above everything.
+        var seenPids = Set<Int32>()
+        for (a, ax) in resolved {
+            AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
+            // Activate each unique app so its windows come to front
+            if seenPids.insert(a.pid).inserted {
+                NSRunningApplication(processIdentifier: a.pid)?.activate()
             }
         }
     }

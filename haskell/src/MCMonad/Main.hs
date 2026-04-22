@@ -3,7 +3,7 @@ module MCMonad.Main
     , launch
     ) where
 
-import Control.Monad (forever)
+import Control.Monad (forever, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -159,8 +159,16 @@ handleEvent cfg hotkeyIdMap evt = case evt of
         return ()
 
     FrontAppChanged _pid ->
-        -- TODO: if focusFollowsMouse, update focus based on the front app
         return ()
+
+    MouseEnteredWindow wid _pid ->
+        when (focusFollowsMouse cfg) $ do
+            ws <- gets windowset
+            let mref = findByWindowId wid (W.allWindows ws)
+            whenJust mref $ \wref ->
+                -- Only change focus, don't relayout (avoid feedback loop)
+                when (W.peek ws /= Just wref) $
+                    windows (W.focusWindow wref)
 
     ScreensChanged scs ->
         rescreen scs

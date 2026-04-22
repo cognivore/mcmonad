@@ -142,6 +142,7 @@ enum IPCEvent: Encodable, Sendable {
     case frontAppChanged(pid: Int32)
     case screensChanged(screens: [ScreenInfo])
     case hotkeyPressed(hotkeyId: Int)
+    case mouseEnteredWindow(windowId: UInt32, pid: Int32)
     case ready
 
     func encode(to encoder: Encoder) throws {
@@ -176,6 +177,10 @@ enum IPCEvent: Encodable, Sendable {
         case .hotkeyPressed(let hotkeyId):
             try container.encode("hotkey-pressed", forKey: .event)
             try container.encode(hotkeyId, forKey: .hotkeyId)
+        case .mouseEnteredWindow(let windowId, let pid):
+            try container.encode("mouse-entered-window", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
+            try container.encode(pid, forKey: .pid)
         case .ready:
             try container.encode("ready", forKey: .event)
         }

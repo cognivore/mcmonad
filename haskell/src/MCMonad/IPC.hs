@@ -124,6 +124,7 @@ data Event
     | FrontAppChanged !Int32
     | ScreensChanged [ScreenInfo]
     | HotkeyPressed !Int
+    | MouseEnteredWindow !Word32 !Int32
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
@@ -184,6 +185,7 @@ instance Aeson.FromJSON Event where
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
+                "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"
                 "ready"                -> pure Ready
                 other                  -> fail $ "Unknown event type: " ++ show other
             (_, Just resp) -> case resp of

@@ -60,6 +60,7 @@
             hsPkgs.cabal-install
             hsPkgs.haskell-language-server
             pkgs.jq
+            pkgs.socat
           ];
           shellHook = ''
             echo "mcmonad dev shell"

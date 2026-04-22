@@ -8,7 +8,12 @@ let package = Package(
         .executableTarget(
             name: "mcmonad-core",
             path: "Sources/MCMonadCore",
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("Carbon"),
+                .unsafeFlags(["-F/System/Library/PrivateFrameworks", "-framework", "SkyLight"])
+            ]
         )
     ]
 )

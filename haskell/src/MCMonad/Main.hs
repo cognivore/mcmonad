@@ -91,13 +91,12 @@ waitForScreens conn = do
         _ -> waitForScreens conn  -- skip unexpected events, keep waiting
 
 -- | Block until a QueryWindowsResponse event arrives after QueryWindows.
--- Returns an empty list if an unexpected event arrives.
 waitForWindows :: Connection -> IO [WindowInfo]
 waitForWindows conn = do
     ev <- readEvent conn
     case ev of
         QueryWindowsResponse ws -> return ws
-        _ -> return []
+        _ -> waitForWindows conn  -- skip unexpected events, keep waiting
 
 -- | Build the initial 'WindowSet' from config and screen info.
 buildInitialWindowSet :: MConfig Layout -> [ScreenInfo] -> WindowSet

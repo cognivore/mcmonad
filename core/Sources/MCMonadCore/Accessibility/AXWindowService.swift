@@ -6,7 +6,7 @@ import os
 // MARK: - Private AX bridge
 
 @_silgen_name("_AXUIElementGetWindow")
-private func _AXUIElementGetWindow(
+func _AXUIElementGetWindow(
     _ element: AXUIElement,
     _ windowId: inout CGWindowID
 ) -> AXError

@@ -4,16 +4,21 @@ module MCMonad.Config
     ( MConfig(..)
     , KeyCode, Modifiers
     , optionMask, commandMask, shiftMask, controlMask
-    , defaultConfig
+    , defaultConfig, defaultKeys
     ) where
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Bits (Bits(..))
 import Data.Word (Word32)
+import System.Exit (exitSuccess)
+
+import qualified XMonad.StackSet as W
 
 import MCMonad.Core
 import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
+import MCMonad.Operations (windows, sendMessage, kill, spawn, withFocused)
 
 -- ---------------------------------------------------------------------------
 -- Key types
@@ -91,7 +96,7 @@ defaultConfig = MConfig
     , manageHook         = defaultManageHook
     , mcWorkspaces       = map show [1 :: Int .. 9]
     , modMask            = optionMask
-    , mcKeys             = const Map.empty
+    , mcKeys             = defaultKeys
     , borderWidth        = 2
     , normalBorderColor  = "#444444"
     , focusedBorderColor = "#ffffff"
@@ -99,3 +104,54 @@ defaultConfig = MConfig
     , logHook            = return ()
     , startupHook        = return ()
     }
+
+-- ---------------------------------------------------------------------------
+-- Default keybindings (xmonad conventions)
+
+-- | Carbon virtual keycodes (macOS).
+kJ, kK, kH, kL, kReturn, kSpace, kC, kT, kQ, kW, kE, kR :: KeyCode
+kJ = 38; kK = 40; kH = 4; kL = 37; kReturn = 36; kSpace = 49
+kC = 8; kT = 17; kQ = 12; kW = 13; kE = 14; kR = 15
+
+kComma, kPeriod :: KeyCode
+kComma = 43; kPeriod = 47
+
+k1, k2, k3, k4, k5, k6, k7, k8, k9 :: KeyCode
+k1 = 18; k2 = 19; k3 = 20; k4 = 21; k5 = 23; k6 = 22; k7 = 26; k8 = 28; k9 = 25
+
+-- | Default keybindings, matching xmonad conventions.
+defaultKeys :: MConfig Layout -> Map (Modifiers, KeyCode) (M ())
+defaultKeys conf = Map.fromList $
+    -- Focus
+    [ ((m, kJ),      windows W.focusDown)
+    , ((m, kK),      windows W.focusUp)
+    , ((m, kReturn), windows W.swapMaster)
+
+    -- Swap
+    , ((m .|. shiftMask, kJ), windows W.swapDown)
+    , ((m .|. shiftMask, kK), windows W.swapUp)
+
+    -- Layout
+    , ((m, kH),      sendMessage Shrink)
+    , ((m, kL),      sendMessage Expand)
+    , ((m, kSpace),  sendMessage NextLayout)
+    , ((m, kComma),  sendMessage (IncMasterN 1))
+    , ((m, kPeriod), sendMessage (IncMasterN (-1)))
+
+    -- Window management
+    , ((m .|. shiftMask, kC),      kill)
+    , ((m, kT),                    withFocused $ \w -> windows (W.sink w))
+    , ((m .|. shiftMask, kReturn), spawn (terminal conf))
+
+    -- Quit / restart
+    , ((m .|. shiftMask, kQ), io exitSuccess)
+    ]
+    ++
+    -- Workspaces: Mod-1..9 to view, Mod-Shift-1..9 to shift
+    [ ((mask, key), windows (action ws))
+    | (ws, key) <- zip (mcWorkspaces conf) [k1, k2, k3, k4, k5, k6, k7, k8, k9]
+    , (action, mask) <- [(W.greedyView, m), (W.shift, m .|. shiftMask)]
+    ]
+  where
+    m = modMask conf
+    (.|.) = (Data.Bits..|.)

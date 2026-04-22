@@ -171,18 +171,26 @@ instance Aeson.FromJSON ScreenInfo where
 
 instance Aeson.FromJSON Event where
     parseJSON = Aeson.withObject "Event" $ \v -> do
-        evt <- v .: "event" :: Aeson.Parser Text
-        case evt of
-            "window-created"       -> WindowCreated      <$> Aeson.parseJSON (Aeson.Object v)
-            "window-destroyed"     -> WindowDestroyed    <$> v .: "windowId"
-            "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
-            "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
-            "screens-changed"      -> ScreensChanged     <$> v .: "screens"
-            "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
-            "ready"                -> pure Ready
-            "query-windows-response" -> QueryWindowsResponse <$> v .: "windows"
-            "query-screens-response" -> QueryScreensResponse <$> v .: "screens"
-            other                  -> fail $ "Unknown event type: " ++ show other
+        -- Swift sends events with "event" key and query responses with "response" key
+        let tryEvent = v .:? "event" :: Aeson.Parser (Maybe Text)
+            tryResponse = v .:? "response" :: Aeson.Parser (Maybe Text)
+        mEvt <- tryEvent
+        mResp <- tryResponse
+        case (mEvt, mResp) of
+            (Just evt, _) -> case evt of
+                "window-created"       -> WindowCreated      <$> Aeson.parseJSON (Aeson.Object v)
+                "window-destroyed"     -> WindowDestroyed    <$> v .: "windowId"
+                "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
+                "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
+                "screens-changed"      -> ScreensChanged     <$> v .: "screens"
+                "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
+                "ready"                -> pure Ready
+                other                  -> fail $ "Unknown event type: " ++ show other
+            (_, Just resp) -> case resp of
+                "windows" -> QueryWindowsResponse <$> v .: "windows"
+                "screens" -> QueryScreensResponse <$> v .: "screens"
+                other     -> fail $ "Unknown response type: " ++ show other
+            _ -> fail "Message has neither 'event' nor 'response' key"
 
 -- ---------------------------------------------------------------------------
 -- Connection management

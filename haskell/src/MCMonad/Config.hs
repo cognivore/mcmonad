@@ -5,6 +5,11 @@ module MCMonad.Config
     , KeyCode, Modifiers
     , optionMask, commandMask, shiftMask, controlMask
     , defaultConfig, defaultKeys
+      -- * Key codes (Carbon virtual keycodes)
+    , kJ, kK, kH, kL, kReturn, kSpace, kC, kT, kQ, kW, kE, kR
+    , kComma, kPeriod
+    , k1, k2, k3, k4, k5, k6, k7, k8, k9
+    , kA, kB, kV, kF
     ) where
 
 import Data.Map.Strict (Map)
@@ -114,6 +119,9 @@ defaultConfig = MConfig
 kJ, kK, kH, kL, kReturn, kSpace, kC, kT, kQ, kW, kE, kR :: KeyCode
 kJ = 38; kK = 40; kH = 4; kL = 37; kReturn = 36; kSpace = 49
 kC = 8; kT = 17; kQ = 12; kW = 13; kE = 14; kR = 15
+
+kA, kB, kV, kF :: KeyCode
+kA = 0; kB = 11; kV = 9; kF = 3
 
 kComma, kPeriod :: KeyCode
 kComma = 43; kPeriod = 47

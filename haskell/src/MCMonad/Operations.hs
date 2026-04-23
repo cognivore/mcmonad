@@ -78,7 +78,8 @@ windows f = do
         newVisible = allVisibleWindows ws
 
     -- 1. Update state immediately
-    modify $ \s -> s { windowset = ws }
+    modify $ \s -> s { windowset = ws
+                     , affinity = updateAffinities ws (affinity s) }
 
     conn <- asks connection
 
@@ -314,6 +315,8 @@ data RestartState = RestartState
       -- ^ Tag of the focused workspace
     , rsFloating   :: [(WindowRef, (Rational, Rational, Rational, Rational))]
       -- ^ Floating window positions as (x, y, w, h) rationals
+    , rsAffinity   :: [(String, Int)]
+      -- ^ Serialised affinity map (workspace tag, screen index)
     } deriving (Show, Read)
 
 -- | Serialisable version of a Stack zipper.
@@ -323,14 +326,15 @@ data SerStack = SerStack
     , ssDown  :: [WindowRef]
     } deriving (Show, Read)
 
--- | Extract a 'RestartState' from the current 'WindowSet'.
-serializeState :: WindowSet -> RestartState
-serializeState ws = RestartState
+-- | Extract a 'RestartState' from the current 'WindowSet' and affinity map.
+serializeState :: WindowSet -> M.Map String ScreenId -> RestartState
+serializeState ws aff = RestartState
     { rsStacks     = map serWsp allWsps
     , rsCurrentTag = W.tag (W.workspace (W.current ws))
     , rsFloating   = [ (w, (rx, ry, rw, rh))
                      | (w, W.RationalRect rx ry rw rh) <- M.toList (W.floating ws)
                      ]
+    , rsAffinity   = [(tag, n) | (tag, S n) <- M.toList aff]
     }
   where
     allWsps = map W.workspace (W.current ws : W.visible ws) ++ W.hidden ws
@@ -401,9 +405,10 @@ restart :: M ()
 restart = do
     -- 1. Serialise state
     ws <- gets windowset
+    aff <- gets affinity
     io $ do
         sf <- getStateFile
-        writeFile sf (show (serializeState ws))
+        writeFile sf (show (serializeState ws aff))
         hPutStrLn stderr $ "mcmonad: state written to " ++ sf
 
     -- 2. Recompile
@@ -456,6 +461,9 @@ rescreen newScreens = do
                          , W.hidden  = newHidden
                          }
             modify $ \s -> s { windowset = ws' }
+            -- Clean affinities that refer to screens no longer present
+            let liveScreens = S.fromList [sid' | (sid', _) <- newDetails]
+            modify $ \s -> s { affinity = M.filter (`S.member` liveScreens) (affinity s) }
             windows id  -- trigger relayout
         -- Edge cases: no workspaces or no screens should not happen in practice
         _ -> return ()

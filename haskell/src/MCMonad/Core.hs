@@ -26,6 +26,8 @@ module MCMonad.Core
     , Rectangle(..)
       -- * IPC connection (opaque)
     , Connection(..)
+      -- * Affinity
+    , updateAffinities
     ) where
 
 import Control.Concurrent.MVar
@@ -35,6 +37,7 @@ import Control.Monad.State.Strict
 import Data.Aeson (FromJSON(..), ToJSON(..), (.=), (.:))
 import qualified Data.Aeson as Aeson
 import Data.Int (Int32)
+import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word32)
@@ -195,6 +198,7 @@ data Connection = Connection
 data MState = MState
     { windowset :: !WindowSet
     , mapped    :: !(Set WindowRef)
+    , affinity  :: !(Map.Map String ScreenId)
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's
@@ -241,3 +245,17 @@ withConnection f = asks connection >>= f
 -- | Access the current window set.
 withWindowSet :: (WindowSet -> M a) -> M a
 withWindowSet f = gets windowset >>= f
+
+-- ---------------------------------------------------------------------------
+-- Affinity tracking
+
+-- | Record current workspace-to-screen associations. Visible workspaces
+-- get their screen recorded; hidden workspaces retain their previous affinity.
+updateAffinities :: Ord i => W.StackSet i l a sid sd -> Map.Map i sid -> Map.Map i sid
+updateAffinities ws existing =
+    Map.union current existing
+  where
+    current = Map.fromList
+        [ (W.tag (W.workspace scr), W.screen scr)
+        | scr <- W.current ws : W.visible ws
+        ]

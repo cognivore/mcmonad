@@ -68,8 +68,16 @@ launch cfg = do
     when debug $ hPutStrLn stderr "mcmonad: debug logging enabled (MCMONAD_DEBUG)"
 
     -- 8. Run the M monad
+    -- Restore affinities from saved state, or seed from initial screen layout
+    let restoredAffinity = case mSavedState of
+            Just saved -> Map.fromList [(tag, S n) | (tag, n) <- rsAffinity saved]
+            Nothing    -> initialAffinities ws0
+
     let mconf = MConf { connection = conn }
-        mst0  = MState { windowset = ws0, mapped = Set.empty }
+        mst0  = MState { windowset = ws0
+                       , mapped = Set.empty
+                       , affinity = restoredAffinity
+                       }
 
     _ <- runM mconf mst0 $ do
         case mSavedState of
@@ -253,6 +261,13 @@ buildInitialWindowSet cfg screens =
 
     -- Hidden workspaces (not displayed on any screen)
     hiddenWSs = map mkWorkspace hiddenWS
+
+-- | Seed the affinity map from the initial screen assignments.
+initialAffinities :: WindowSet -> Map.Map String ScreenId
+initialAffinities ws = Map.fromList
+    [ (W.tag (W.workspace scr), W.screen scr)
+    | scr <- W.current ws : W.visible ws
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Event loop

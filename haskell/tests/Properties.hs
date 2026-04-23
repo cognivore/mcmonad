@@ -2,8 +2,10 @@ module Properties where
 
 import Test.QuickCheck
 import qualified XMonad.StackSet as W
-import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..))
+import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..), updateAffinities)
+import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
+import qualified Data.Map.Strict as Map
 import Control.Monad (foldM)
 
 -- Simplified layout for testing (no need for real LayoutClass)
@@ -235,6 +237,42 @@ prop_screens_current x = W.current x `elem` W.screens x
 prop_mapLayout_id :: TestStackSet -> Bool
 prop_mapLayout_id x = W.mapLayout id x == x
 
+-- === AFFINITY ===
+
+prop_updateAffinities_records_visible :: TestStackSet -> Bool
+prop_updateAffinities_records_visible ss =
+    let aff = updateAffinities ss Map.empty
+        visibleTags = map (W.tag . W.workspace) (W.current ss : W.visible ss)
+    in all (`Map.member` aff) visibleTags
+
+prop_updateAffinities_preserves_hidden :: TestStackSet -> Bool
+prop_updateAffinities_preserves_hidden ss =
+    let hiddenTags = map W.tag (W.hidden ss)
+        -- Seed: pretend all hidden workspaces were on screen S 99
+        seed = Map.fromList [(t, S 99) | t <- hiddenTags]
+        aff = updateAffinities ss seed
+    in all (\t -> Map.lookup t aff == Just (S 99)) hiddenTags
+
+prop_viewOnScreen_invariant :: TestStackSet -> Property
+prop_viewOnScreen_invariant ss =
+    let screens = W.current ss : W.visible ss
+        sids = map W.screen screens
+    in length sids >= 2 ==>
+        forAll (elements sids) $ \sid ->
+            forAll (elements (map W.tag (W.hidden ss) ++ map (W.tag . W.workspace) screens)) $ \tag ->
+                invariant (viewOnScreen sid tag ss)
+
+prop_viewOnScreen_places_workspace :: TestStackSet -> Property
+prop_viewOnScreen_places_workspace ss =
+    let screens = W.current ss : W.visible ss
+        sids = map W.screen screens
+        hiddenTags = map W.tag (W.hidden ss)
+    in (length sids >= 2 && not (null hiddenTags)) ==>
+        forAll (elements sids) $ \sid ->
+            forAll (elements hiddenTags) $ \tag ->
+                let ss' = viewOnScreen sid tag ss
+                in W.currentTag ss' == tag
+
 -- Collect all properties
 allProperties :: [(String, Property)]
 allProperties =
@@ -281,4 +319,9 @@ allProperties =
     , ("currentTag",              property prop_currentTag)
     , ("screens current",         property prop_screens_current)
     , ("mapLayout id",            property prop_mapLayout_id)
+    -- Affinity
+    , ("updateAffinities records visible", property prop_updateAffinities_records_visible)
+    , ("updateAffinities preserves hidden", property prop_updateAffinities_preserves_hidden)
+    , ("viewOnScreen invariant",  property prop_viewOnScreen_invariant)
+    , ("viewOnScreen places workspace", property prop_viewOnScreen_places_workspace)
     ]

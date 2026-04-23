@@ -154,7 +154,7 @@ final class CommandExecutor {
         // SkyLight SLSMoveWindow can't move other apps' windows (permission).
         // AX works because we have Accessibility permission.
         let screenMaxX = NSScreen.screens.map { $0.frame.maxX }.max() ?? 5000
-        let hideX = screenMaxX + 10000
+        let hideX = screenMaxX + 100
 
         for wid in windowIds {
             if let snap = SkyLightQuery.queryWindow(wid) {

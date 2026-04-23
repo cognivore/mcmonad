@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
   test-haskell:
     runs-on: ubuntu-latest
@@ -44,3 +47,28 @@ jobs:
             exit 1
           fi
           echo "All clear"
+      - name: Package dev release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cp -r result/Applications/MCMonad.app .
+          zip -r MCMonad-dev-arm64.zip MCMonad.app
+      - name: Update dev release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: Development Build
+          prerelease: true
+          files: MCMonad-dev-arm64.zip
+          body: |
+            Latest build from `main` (updated on every push).
+
+            **Commit:** ${{ github.sha }}
+            **Date:** ${{ github.event.head_commit.timestamp }}
+
+            ### Install
+            1. Download and unzip `MCMonad-dev-arm64.zip`
+            2. Move `MCMonad.app` to `/Applications/`
+            3. Double-click to launch — it will install itself as a login item
+            4. Grant Accessibility permission when prompted
+            5. To bypass Gatekeeper: `xattr -cr /Applications/MCMonad.app`

@@ -20,17 +20,39 @@
             pname = "mcmonad-core";
             version = "0.1.0";
             src = pkgs.lib.cleanSource ./core;
+
+            # Swift must use the system Xcode/CommandLineTools SDK, not the
+            # Nix-provided apple-sdk.  We clear the Nix cc-wrapper env that
+            # injects the wrong SDK via VFS overlays.
+            dontFixup = true;
             buildPhase = ''
-              swift build -c release --package-path . --scratch-path .build
+              runHook preBuild
+
+              # Clear Nix cc-wrapper environment
+              unset NIX_CFLAGS_COMPILE NIX_LDFLAGS CC CXX
+
+              export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+              export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+              export PATH="/usr/bin:$PATH"
+
+              # Give SPM a writable cache/config directory
+              export HOME="$TMPDIR"
+
+              /usr/bin/swift build -c release \
+                --package-path . \
+                --scratch-path .build \
+                --disable-sandbox
+
+              runHook postBuild
             '';
             installPhase = ''
+              runHook preInstall
               mkdir -p $out/bin
               cp .build/release/mcmonad-core $out/bin/
+              runHook postInstall
             '';
             __impureHostDeps = [
-              "/usr/bin/xcrun"
-              "/usr/bin/swift"
-              "/usr/bin/swiftc"
+              "/usr/bin"
               "/Library/Developer/CommandLineTools"
               "/Applications/Xcode.app"
             ];

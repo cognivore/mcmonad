@@ -152,14 +152,13 @@ PLIST
     cp ${resourceDir}/MenuBarIcon.png "$APP/Resources/MenuBarIcon.png"
     cp "${resourceDir}/MenuBarIcon@2x.png" "$APP/Resources/MenuBarIcon@2x.png"
 
-    # --- Ad-hoc codesign ---
+    # --- Ad-hoc /usr/bin/codesign ---
     echo "Codesigning..."
     for f in "$APP/Frameworks/"*.dylib; do
-      codesign --force --sign - "$f"
+      /usr/bin/codesign --force --sign - "$f"
     done
-    codesign --force --sign - "$APP/MacOS/mcmonad"
-    codesign --force --sign - "$APP/MacOS/mcmonad-core"
-    codesign --force --deep --sign - "MCMonad.app"
+    /usr/bin/codesign --force --sign - "$APP/MacOS/mcmonad"
+    /usr/bin/codesign --force --sign - "$APP/MacOS/mcmonad-core"
 
     echo "Built MCMonad.app"
 
@@ -175,7 +174,7 @@ PLIST
 
   # The mcmonad-core build needs Xcode
   __impureHostDeps = [
-    "/usr/bin/codesign"
+    "/usr/bin//usr/bin/codesign"
     "/usr/bin/xcrun"
   ];
 }

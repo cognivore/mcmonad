@@ -114,14 +114,32 @@ enum SkyLightQuery {
 
         guard skyLight.iteratorAdvance(iterator) else { return nil }
 
+        let parentId = skyLight.iteratorGetParentID(iterator)
+        guard parentId == 0 else { return nil }
+
+        let level = skyLight.iteratorGetLevel(iterator)
+        guard level == 0 || level == 3 || level == 8 else { return nil }
+
+        let tags = skyLight.iteratorGetTags(iterator)
+        let attributes = skyLight.iteratorGetAttributes(iterator)
+
+        let hasVisibleAttribute = (attributes & 0x2) != 0
+        let hasTagBit54 = (tags & 0x0040_0000_0000_0000) != 0
+        guard hasVisibleAttribute || hasTagBit54 else { return nil }
+
+        let isDocument = (tags & 0x1) != 0
+        let isFloating = (tags & 0x2) != 0
+        let isModal = (tags & 0x8000_0000) != 0
+        guard isDocument || (isFloating && isModal) else { return nil }
+
         return WindowSnapshot(
             windowId: skyLight.iteratorGetWindowID(iterator),
             pid: skyLight.iteratorGetPID(iterator),
             frame: skyLight.iteratorGetBounds(iterator),
-            level: skyLight.iteratorGetLevel(iterator),
-            tags: skyLight.iteratorGetTags(iterator),
-            attributes: skyLight.iteratorGetAttributes(iterator),
-            parentId: skyLight.iteratorGetParentID(iterator)
+            level: level,
+            tags: tags,
+            attributes: attributes,
+            parentId: parentId
         )
     }
 }

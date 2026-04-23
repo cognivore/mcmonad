@@ -18,7 +18,7 @@ private func axFocusCallback(
     guard _AXUIElementGetWindow(element, &windowId) == .success else { return }
 
     let wid = UInt32(windowId)
-    DispatchQueue.main.async {
+    Task { @MainActor in
         AXFocusTracker.shared?.handleFocusChange(windowId: wid, pid: pid)
     }
 }

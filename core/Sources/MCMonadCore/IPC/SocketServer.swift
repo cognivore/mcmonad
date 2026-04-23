@@ -87,7 +87,7 @@ final class SocketServer {
 
                 sharedState.setClientHandle(handle)
 
-                DispatchQueue.main.async {
+                Task { @MainActor [weak self] in
                     self?.onClientConnected?()
                 }
 
@@ -96,7 +96,7 @@ final class SocketServer {
                     handle: handle,
                     decoder: decoder,
                     onCommand: { [weak self] command in
-                        DispatchQueue.main.async {
+                        Task { @MainActor in
                             self?.onCommand?(command)
                         }
                     }

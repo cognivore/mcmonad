@@ -13,8 +13,16 @@
         hsPkgs = pkgs.haskellPackages;
       in
       {
-        packages = {
+        packages = rec {
           mcmonad = hsPkgs.callCabal2nix "mcmonad" ./haskell { };
+
+          # GHC with the mcmonad library available — used by recompile
+          # so users can compile ~/.config/mcmonad/mcmonad.hs
+          mcmonad-ghc = hsPkgs.ghcWithPackages (hp: [
+            mcmonad
+            hp.xmonad
+            hp.xmonad-contrib
+          ]);
 
           mcmonad-core = pkgs.stdenv.mkDerivation {
             pname = "mcmonad-core";
@@ -71,8 +79,7 @@
 
           mcmonad-app = import ./nix/app-bundle.nix {
             inherit pkgs;
-            mcmonad = self.packages.${system}.mcmonad;
-            mcmonad-core = self.packages.${system}.mcmonad-core;
+            inherit mcmonad mcmonad-core mcmonad-ghc;
           };
         };
 

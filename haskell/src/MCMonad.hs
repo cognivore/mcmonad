@@ -1,7 +1,17 @@
 -- | MCMonad: mac-native tiling window manager.
 --
 -- This module re-exports the user-facing API. Import this in your
--- @~\/.config\/mcmonad\/mcmonad.hs@ configuration file.
+-- @~\/.config\/mcmonad\/mcmonad.hs@ configuration file:
+--
+-- @
+-- import MCMonad
+--
+-- main = mcmonad defaultConfig
+--     { terminal   = "\/Applications\/Ghostty.app\/Contents\/MacOS\/ghostty"
+--     , layoutHook = Layout (Tall 1 0.03 0.5 ||| Full)
+--     , modMask    = optionMask
+--     }
+-- @
 module MCMonad
     ( module MCMonad.Core
     , module MCMonad.Config

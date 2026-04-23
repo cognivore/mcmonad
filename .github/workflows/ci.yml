@@ -39,13 +39,21 @@ jobs:
           APP="result/Applications/MCMonad.app/Contents"
           echo "=== Binaries ==="
           ls -la "$APP/MacOS/"
+          echo "=== GHC ==="
+          ls -la "$APP/GHC/bin/" | head -5
+          ls -la "$APP/GHC/topdir/" | head -5
           echo "=== Frameworks ==="
           ls -la "$APP/Frameworks/"
           echo "=== Checking for nix store refs ==="
-          if otool -L "$APP/MacOS/mcmonad" | grep /nix/store; then
-            echo "FAIL: mcmonad still has nix store references"
-            exit 1
-          fi
+          FAIL=0
+          for f in "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core" "$APP/GHC/bin/"* "$APP/Frameworks/"*.dylib; do
+            [ -f "$f" ] || continue
+            if otool -L "$f" 2>/dev/null | grep /nix/store; then
+              echo "FAIL: $(basename $f) still has nix store references"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
           echo "All clear"
       - name: Package dev release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

@@ -2,7 +2,8 @@ flake: { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.mcmonad;
-  pkg = flake.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  flakePkgs = flake.packages.${pkgs.stdenv.hostPlatform.system};
+  pkg = flakePkgs.default;
   homeDir = config.home.homeDirectory;
 in
 {
@@ -24,6 +25,7 @@ in
         EnvironmentVariables = {
           MCMONAD_CORE_BIN = "${pkg}/bin/mcmonad-core";
           MCMONAD_HASKELL_BIN = "${pkg}/bin/mcmonad";
+          MCMONAD_GHC = "${flakePkgs.mcmonad-ghc}/bin/ghc";
         };
         KeepAlive = true;
         RunAtLoad = true;

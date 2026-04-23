@@ -30,12 +30,15 @@ jobs:
       - name: Verify no nix store references
         run: |
           APP="result/Applications/MCMonad.app/Contents"
-          for f in "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core" "$APP/Frameworks/"*.dylib; do
-            if otool -L "$f" | grep /nix/store; then
+          FAIL=0
+          for f in "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core" "$APP/GHC/bin/"* "$APP/Frameworks/"*.dylib; do
+            [ -f "$f" ] || continue
+            if otool -L "$f" 2>/dev/null | grep /nix/store; then
               echo "FAIL: $(basename $f) still references nix store"
-              exit 1
+              FAIL=1
             fi
           done
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
           echo "Verification passed"
 
       - name: Package

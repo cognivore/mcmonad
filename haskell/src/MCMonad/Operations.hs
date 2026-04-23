@@ -17,6 +17,13 @@ module MCMonad.Operations
     , spawn
       -- * Restart
     , restart
+    , recompile
+      -- * State serialization
+    , RestartState(..)
+    , SerStack(..)
+    , serializeState
+    , getConfigDir
+    , getStateFile
       -- * Screens
     , screenWorkspace
     , rescreen
@@ -30,9 +37,14 @@ import Data.List (find)
 import Data.Monoid (Endo(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
-import System.Exit (exitSuccess)
+import System.Directory (doesFileExist, getHomeDirectory)
+import System.Environment (getExecutablePath, lookupEnv)
+import System.Exit (ExitCode(..))
+import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
-import System.Process (createProcess, shell, CreateProcess(..))
+import System.Info (arch, os)
+import System.Posix.Process (executeFile)
+import System.Process (createProcess, shell, readProcessWithExitCode, CreateProcess(..))
 import qualified XMonad.StackSet as W
 
 import MCMonad.Core
@@ -293,14 +305,119 @@ spawn cmd = io $ void $ forkIO $ void $
 -- ---------------------------------------------------------------------------
 -- Restart
 
--- | Recompile and restart the Haskell process. The Swift daemon stays
+-- | Serialisable snapshot of the WindowSet for transparent restart.
+-- Layout state is not preserved — layouts reset to the config default.
+data RestartState = RestartState
+    { rsStacks     :: [(String, Maybe SerStack)]
+      -- ^ (workspace tag, stack zipper)
+    , rsCurrentTag :: String
+      -- ^ Tag of the focused workspace
+    , rsFloating   :: [(WindowRef, (Rational, Rational, Rational, Rational))]
+      -- ^ Floating window positions as (x, y, w, h) rationals
+    } deriving (Show, Read)
+
+-- | Serialisable version of a Stack zipper.
+data SerStack = SerStack
+    { ssFocus :: WindowRef
+    , ssUp    :: [WindowRef]
+    , ssDown  :: [WindowRef]
+    } deriving (Show, Read)
+
+-- | Extract a 'RestartState' from the current 'WindowSet'.
+serializeState :: WindowSet -> RestartState
+serializeState ws = RestartState
+    { rsStacks     = map serWsp allWsps
+    , rsCurrentTag = W.tag (W.workspace (W.current ws))
+    , rsFloating   = [ (w, (rx, ry, rw, rh))
+                     | (w, W.RationalRect rx ry rw rh) <- M.toList (W.floating ws)
+                     ]
+    }
+  where
+    allWsps = map W.workspace (W.current ws : W.visible ws) ++ W.hidden ws
+    serWsp wsp = (W.tag wsp, serStack <$> W.stack wsp)
+    serStack (W.Stack f u d) = SerStack f u d
+
+-- | The mcmonad config directory: @~\/.config\/mcmonad@.
+getConfigDir :: IO FilePath
+getConfigDir = do
+    home <- getHomeDirectory
+    return (home </> ".config" </> "mcmonad")
+
+-- | Path to the user's custom config source.
+getConfigSource :: IO FilePath
+getConfigSource = (</> "mcmonad.hs") <$> getConfigDir
+
+-- | Path to the compiled custom binary.
+getCustomBinary :: IO FilePath
+getCustomBinary = (</> ("mcmonad-" ++ arch ++ "-" ++ os)) <$> getConfigDir
+
+-- | Path to the serialised state file for transparent restart.
+getStateFile :: IO FilePath
+getStateFile = (</> "mcmonad.state") <$> getConfigDir
+
+-- | Recompile the user's @mcmonad.hs@.  Returns 'True' on success (or if
+-- no custom config exists).
+--
+-- Requires @$MCMONAD_GHC@ to point to a GHC that has the mcmonad library
+-- in its package database.  The home-manager module and app bundle both
+-- set this automatically.
+recompile :: IO Bool
+recompile = do
+    src <- getConfigSource
+    exists <- doesFileExist src
+    if not exists
+        then return True
+        else do
+            mGhc <- lookupEnv "MCMONAD_GHC"
+            case mGhc of
+                Nothing -> do
+                    hPutStrLn stderr $ unlines
+                        [ "mcmonad: MCMONAD_GHC is not set."
+                        , "  Set MCMONAD_GHC to a ghc that has the mcmonad library"
+                        , "  in its package database. The home-manager module and"
+                        , "  .app bundle set this automatically."
+                        ]
+                    return False
+                Just ghc -> do
+                    bin <- getCustomBinary
+                    hPutStrLn stderr $ "mcmonad: recompiling " ++ src ++ " with " ++ ghc
+                    (exit, _, err) <- readProcessWithExitCode ghc
+                        ["--make", src, "-o", bin, "-v0"] ""
+                    case exit of
+                        ExitSuccess -> do
+                            hPutStrLn stderr "mcmonad: recompile succeeded"
+                            return True
+                        _ -> do
+                            hPutStrLn stderr $ "mcmonad: recompile FAILED:\n" ++ err
+                            return False
+
+-- | Recompile and restart the Haskell process.  The Swift daemon stays
 -- running and the new process reconnects.
+--
+-- 1. Serialise 'WindowSet' state to disk
+-- 2. Recompile @~\/.config\/mcmonad\/mcmonad.hs@ (if it exists)
+-- 3. @exec@ the new binary (or self) with @--resume@
 restart :: M ()
-restart = io $ do
-    -- TODO: serialize WindowSet state for transparent restart
-    -- TODO: recompile mcmonad.hs
-    -- TODO: exec the new binary
-    exitSuccess
+restart = do
+    -- 1. Serialise state
+    ws <- gets windowset
+    io $ do
+        sf <- getStateFile
+        writeFile sf (show (serializeState ws))
+        hPutStrLn stderr $ "mcmonad: state written to " ++ sf
+
+    -- 2. Recompile
+    ok <- io recompile
+    unless ok $ io $ hPutStrLn stderr "mcmonad: recompile failed, restarting with old binary"
+
+    -- 3. Determine which binary to exec
+    io $ do
+        customBin <- getCustomBinary
+        hasCustom <- doesFileExist customBin
+        self <- getExecutablePath
+        let bin = if hasCustom then customBin else self
+        hPutStrLn stderr $ "mcmonad: exec " ++ bin ++ " --resume"
+        executeFile bin False ["--resume"] Nothing
 
 -- ---------------------------------------------------------------------------
 -- Screens

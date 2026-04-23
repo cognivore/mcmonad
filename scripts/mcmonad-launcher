@@ -10,10 +10,6 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-# Support both .app bundle (binaries alongside launcher) and home-manager
-# (paths passed via MCMONAD_CORE_BIN / MCMONAD_HASKELL_BIN env vars).
-CORE_BIN="${MCMONAD_CORE_BIN:-$APP_DIR/MacOS/mcmonad-core}"
-HASKELL_BIN="${MCMONAD_HASKELL_BIN:-$APP_DIR/MacOS/mcmonad}"
 LOG_DIR="$HOME/Library/Logs"
 CORE_LOG="$LOG_DIR/mcmonad-core.log"
 HASKELL_LOG="$LOG_DIR/mcmonad.log"
@@ -21,6 +17,39 @@ AGENT_LABEL="com.mcmonad.agent"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 
 log() { echo "[mcmonad-launcher] $(date '+%H:%M:%S') $*" >&2; }
+
+# Support both .app bundle (binaries alongside launcher) and home-manager
+# (paths passed via MCMONAD_CORE_BIN / MCMONAD_HASKELL_BIN env vars).
+CORE_BIN="${MCMONAD_CORE_BIN:-$APP_DIR/MacOS/mcmonad-core}"
+DEFAULT_HASKELL_BIN="${MCMONAD_HASKELL_BIN:-$APP_DIR/MacOS/mcmonad}"
+
+# MCMONAD_GHC: path to a GHC that has the mcmonad library.
+# Set by home-manager module or derived from the app bundle below.
+# Required for Mod-q recompilation — not defaulted.
+if [ -z "${MCMONAD_GHC:-}" ]; then
+    BUNDLED_GHC="$APP_DIR/MacOS/mcmonad-ghc"
+    if [ -x "$BUNDLED_GHC" ]; then
+        export MCMONAD_GHC="$BUNDLED_GHC"
+        log "Using bundled GHC: $BUNDLED_GHC"
+    fi
+fi
+
+# Prefer user-compiled custom binary over the bundled default.
+# The custom binary is produced by Mod-q (recompile) and lives at
+# ~/.config/mcmonad/mcmonad-<arch>-<os> using GHC's arch naming
+# (aarch64 for ARM, x86_64 for Intel).
+UNAME_ARCH="$(uname -m)"
+case "$UNAME_ARCH" in
+    arm64) GHC_ARCH="aarch64" ;;
+    *)     GHC_ARCH="$UNAME_ARCH" ;;
+esac
+CUSTOM_BIN="$HOME/.config/mcmonad/mcmonad-${GHC_ARCH}-darwin"
+if [ -x "$CUSTOM_BIN" ]; then
+    HASKELL_BIN="$CUSTOM_BIN"
+    log "Using custom binary: $CUSTOM_BIN"
+else
+    HASKELL_BIN="$DEFAULT_HASKELL_BIN"
+fi
 
 install_agent() {
     mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"

@@ -145,8 +145,6 @@ defaultKeys conf = Map.fromList $
     , ((m, kT),                    withFocused $ \w -> windows (W.sink w))
     , ((m .|. shiftMask, kReturn), spawn (terminal conf))
 
-    -- Quit / restart
-    , ((m .|. shiftMask, kQ), io exitSuccess)
     ]
     ++
     -- Workspaces: Mod-1..9 to view, Mod-Shift-1..9 to shift

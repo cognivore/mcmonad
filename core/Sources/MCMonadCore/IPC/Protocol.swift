@@ -199,6 +199,7 @@ enum IPCCommand: Decodable, Sendable {
     case registerHotkeys(hotkeys: [HotkeySpec])
     case closeWindow(windowId: UInt32, pid: Int32)
     case setWorkspaceIndicator(tag: String)
+    case warpMouse(x: Double, y: Double)
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -210,6 +211,7 @@ enum IPCCommand: Decodable, Sendable {
         case registerHotkeys = "register-hotkeys"
         case closeWindow = "close-window"
         case setWorkspaceIndicator = "set-workspace-indicator"
+        case warpMouse = "warp-mouse"
     }
 
     init(from decoder: Decoder) throws {
@@ -243,6 +245,10 @@ enum IPCCommand: Decodable, Sendable {
         case .setWorkspaceIndicator:
             let tag = try container.decode(String.self, forKey: .tag)
             self = .setWorkspaceIndicator(tag: tag)
+        case .warpMouse:
+            let x = try container.decode(Double.self, forKey: .x)
+            let y = try container.decode(Double.self, forKey: .y)
+            self = .warpMouse(x: x, y: y)
         }
     }
 }
@@ -287,4 +293,6 @@ private struct DynamicCodingKey: CodingKey {
     static let hotkeyId = DynamicCodingKey(stringValue: "hotkeyId")!
     static let hotkeys = DynamicCodingKey(stringValue: "hotkeys")!
     static let tag = DynamicCodingKey(stringValue: "tag")!
+    static let x = DynamicCodingKey(stringValue: "x")!
+    static let y = DynamicCodingKey(stringValue: "y")!
 }

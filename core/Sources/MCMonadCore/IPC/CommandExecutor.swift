@@ -94,17 +94,11 @@ final class CommandExecutor {
 
         skylight.reenableUpdate()
 
-        // Phase 4: Raise all visible windows to cover hidden windows
-        // that refused to move offscreen (e.g. Slack).
-        // AXRaise only works within an app, so also use SkyLight to
-        // order visible windows above everything.
-        var seenPids = Set<Int32>()
-        for (a, ax) in resolved {
+        // Phase 4: Raise visible windows (AXRaise only, no app activation —
+        // NSRunningApplication.activate() would bring ALL windows of that app
+        // to front, including hidden ones on other workspaces)
+        for (_, ax) in resolved {
             AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
-            // Activate each unique app so its windows come to front
-            if seenPids.insert(a.pid).inserted {
-                NSRunningApplication(processIdentifier: a.pid)?.activate()
-            }
         }
     }
 
@@ -154,14 +148,19 @@ final class CommandExecutor {
 
     private func executeHideWindows(_ windowIds: [UInt32]) {
         fputs("CMD: hide-windows ids=\(windowIds)\n", stderr)
-        // Move windows far offscreen. SetFrames will reposition them when
-        // they become visible again on a workspace switch.
-        for windowId in windowIds {
-            if let snap = SkyLightQuery.queryWindow(windowId) {
-                // Move offscreen but keep original size (some apps enforce minimums)
+        guard !windowIds.isEmpty else { return }
+
+        // Move windows just past the right screen edge via AX.
+        // SkyLight SLSMoveWindow can't move other apps' windows (permission).
+        // AX works because we have Accessibility permission.
+        let screenMaxX = NSScreen.screens.map { $0.frame.maxX }.max() ?? 5000
+        let hideX = screenMaxX + 100
+
+        for wid in windowIds {
+            if let snap = SkyLightQuery.queryWindow(wid) {
                 AXWindowService.setFrame(
-                    CGRect(x: -20000, y: -20000, width: snap.frame.width, height: snap.frame.height),
-                    windowId: windowId,
+                    CGRect(x: hideX, y: 0, width: snap.frame.width, height: snap.frame.height),
+                    windowId: wid,
                     pid: snap.pid,
                     currentHint: snap.frame
                 )
@@ -170,7 +169,7 @@ final class CommandExecutor {
     }
 
     private func executeShowWindows(_ windowIds: [UInt32]) {
-        // Windows will be repositioned by the SetFrames command that
-        // follows. Nothing to do here.
+        fputs("CMD: show-windows ids=\(windowIds)\n", stderr)
+        // SetFrames follows immediately and repositions windows correctly.
     }
 }

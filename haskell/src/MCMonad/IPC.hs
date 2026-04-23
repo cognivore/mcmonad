@@ -18,7 +18,9 @@ module MCMonad.IPC
     , ScreenInfo(..)
     ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (withMVar, newMVar)
+import Control.Exception (IOException, catch)
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
@@ -32,7 +34,7 @@ import GHC.Generics (Generic)
 import Network.Socket
 import System.Directory (getHomeDirectory)
 import System.FilePath ((</>))
-import System.IO (hSetBuffering, BufferMode(..), hFlush, IOMode(..))
+import System.IO (hSetBuffering, BufferMode(..), hFlush, hPutStrLn, IOMode(..), stderr)
 
 import MCMonad.Core (Connection(..), Rectangle(..))
 
@@ -209,17 +211,37 @@ instance Aeson.FromJSON Event where
 -- Connection management
 
 -- | Connect to the mcmonad-core Unix domain socket at
--- @~\/.config\/mcmonad\/core.sock@.
+-- @~\/.config\/mcmonad\/core.sock@.  Retries with exponential backoff
+-- (up to ~30 s between attempts) so the Haskell side can start before
+-- mcmonad-core has created its socket.
 connectToCore :: IO Connection
 connectToCore = do
     home <- getHomeDirectory
     let sockPath = home </> ".config" </> "mcmonad" </> "core.sock"
-    sock <- socket AF_UNIX Stream defaultProtocol
-    connect sock (SockAddrUnix sockPath)
-    hdl <- socketToHandle sock ReadWriteMode
-    hSetBuffering hdl LineBuffering
-    lock <- newMVar ()
-    return $ Connection hdl lock
+    go sockPath (500 * 1000)  -- start at 500 ms
+  where
+    maxDelay = 30 * 1000 * 1000  -- 30 s ceiling
+
+    go sockPath delay = do
+        result <- tryConnect sockPath
+        case result of
+            Right conn -> return conn
+            Left err   -> do
+                hPutStrLn stderr $
+                    "mcmonad: waiting for core socket (" ++ show err ++ "), retrying in "
+                    ++ show (delay `div` 1000000) ++ "s"
+                threadDelay delay
+                go sockPath (min (delay * 2) maxDelay)
+
+    tryConnect :: FilePath -> IO (Either IOException Connection)
+    tryConnect sockPath =
+        (do sock <- socket AF_UNIX Stream defaultProtocol
+            connect sock (SockAddrUnix sockPath)
+            hdl <- socketToHandle sock ReadWriteMode
+            hSetBuffering hdl LineBuffering
+            lock <- newMVar ()
+            return $ Right $ Connection hdl lock
+        ) `catch` (\e -> return (Left e))
 
 -- | Send a command to the Swift daemon as a JSON line.
 sendCommand :: Connection -> Command -> IO ()

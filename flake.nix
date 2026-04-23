@@ -43,6 +43,12 @@
               self.packages.${system}.mcmonad-core
             ];
           };
+
+          mcmonad-app = import ./nix/app-bundle.nix {
+            inherit pkgs;
+            mcmonad = self.packages.${system}.mcmonad;
+            mcmonad-core = self.packages.${system}.mcmonad-core;
+          };
         };
 
         devShells.default = pkgs.mkShell {

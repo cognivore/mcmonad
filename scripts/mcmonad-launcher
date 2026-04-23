@@ -1,0 +1,116 @@
+#!/bin/bash
+# mcmonad-launcher — manages both mcmonad-core and mcmonad processes.
+# Lives at MCMonad.app/Contents/MacOS/mcmonad-launcher.
+#
+# Modes:
+#   --daemon     Run both processes (called by launchd)
+#   --install    Install launchd agent and start
+#   --uninstall  Remove launchd agent
+#   (default)    First-launch: install agent if missing, then start daemon
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Support both .app bundle (binaries alongside launcher) and home-manager
+# (paths passed via MCMONAD_CORE_BIN / MCMONAD_HASKELL_BIN env vars).
+CORE_BIN="${MCMONAD_CORE_BIN:-$APP_DIR/MacOS/mcmonad-core}"
+HASKELL_BIN="${MCMONAD_HASKELL_BIN:-$APP_DIR/MacOS/mcmonad}"
+LOG_DIR="$HOME/Library/Logs"
+CORE_LOG="$LOG_DIR/mcmonad-core.log"
+HASKELL_LOG="$LOG_DIR/mcmonad.log"
+AGENT_LABEL="com.mcmonad.agent"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+
+log() { echo "[mcmonad-launcher] $(date '+%H:%M:%S') $*" >&2; }
+
+install_agent() {
+    mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+
+    # Generate plist pointing to this .app's launcher
+    cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$AGENT_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$APP_DIR/MacOS/mcmonad-launcher</string>
+        <string>--daemon</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/mcmonad-launcher.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/mcmonad-launcher.log</string>
+</dict>
+</plist>
+PLIST
+
+    launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+    log "Installed and loaded launchd agent"
+}
+
+uninstall_agent() {
+    launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null || true
+    rm -f "$AGENT_PLIST"
+    log "Removed launchd agent"
+}
+
+run_daemon() {
+    log "Starting mcmonad-core"
+    "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
+    CORE_PID=$!
+
+    log "Starting mcmonad (haskell)"
+    "$HASKELL_BIN" >> "$HASKELL_LOG" 2>&1 &
+    HASKELL_PID=$!
+
+    cleanup() {
+        log "Shutting down"
+        kill "$CORE_PID" "$HASKELL_PID" 2>/dev/null || true
+        wait "$CORE_PID" "$HASKELL_PID" 2>/dev/null || true
+    }
+    trap cleanup TERM INT
+
+    # Monitor both processes. If either dies, restart it.
+    while true; do
+        if ! kill -0 "$CORE_PID" 2>/dev/null; then
+            log "mcmonad-core died, restarting"
+            "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
+            CORE_PID=$!
+        fi
+        if ! kill -0 "$HASKELL_PID" 2>/dev/null; then
+            log "mcmonad died, restarting"
+            "$HASKELL_BIN" >> "$HASKELL_LOG" 2>&1 &
+            HASKELL_PID=$!
+        fi
+        sleep 2
+    done
+}
+
+case "${1:-}" in
+    --daemon)
+        run_daemon
+        ;;
+    --install)
+        install_agent
+        ;;
+    --uninstall)
+        uninstall_agent
+        ;;
+    *)
+        # Default: first-launch behavior
+        if [ ! -f "$AGENT_PLIST" ]; then
+            log "First launch — installing launchd agent"
+            install_agent
+        else
+            # Agent exists, just run as daemon (likely called manually)
+            run_daemon
+        fi
+        ;;
+esac

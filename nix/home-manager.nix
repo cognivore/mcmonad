@@ -11,25 +11,24 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    launchd.agents.mcmonad-core = {
-      enable = true;
-      config = {
-        ProgramArguments = [ "${pkg}/bin/mcmonad-core" ];
-        KeepAlive = true;
-        RunAtLoad = true;
-        StandardOutPath = "${homeDir}/Library/Logs/mcmonad-core.log";
-        StandardErrorPath = "${homeDir}/Library/Logs/mcmonad-core.log";
-      };
-    };
-
+    # Single launchd agent that manages both processes via the launcher script.
+    # The launcher starts mcmonad-core and mcmonad, monitors both, and restarts
+    # whichever dies. The Haskell side also retries connecting to core on its own.
     launchd.agents.mcmonad = {
       enable = true;
       config = {
-        ProgramArguments = [ "${pkg}/bin/mcmonad" ];
+        ProgramArguments = [
+          "${../scripts/mcmonad-launcher}"
+          "--daemon"
+        ];
+        EnvironmentVariables = {
+          MCMONAD_CORE_BIN = "${pkg}/bin/mcmonad-core";
+          MCMONAD_HASKELL_BIN = "${pkg}/bin/mcmonad";
+        };
         KeepAlive = true;
         RunAtLoad = true;
-        StandardOutPath = "${homeDir}/Library/Logs/mcmonad.log";
-        StandardErrorPath = "${homeDir}/Library/Logs/mcmonad.log";
+        StandardOutPath = "${homeDir}/Library/Logs/mcmonad-launcher.log";
+        StandardErrorPath = "${homeDir}/Library/Logs/mcmonad-launcher.log";
       };
     };
   };

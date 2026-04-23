@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-app:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16'
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+          extra_nix_config: |
+            extra-platforms = aarch64-darwin
+            allowed-impure-host-deps = /System/Library /bin/sh /dev /usr/lib /Applications/Xcode.app /Library/Developer/CommandLineTools
+
+      - name: Build .app bundle
+        run: nix build .#mcmonad-app
+
+      - name: Verify no nix store references
+        run: |
+          APP="result/Applications/MCMonad.app/Contents"
+          for f in "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core" "$APP/Frameworks/"*.dylib; do
+            if otool -L "$f" | grep /nix/store; then
+              echo "FAIL: $(basename $f) still references nix store"
+              exit 1
+            fi
+          done
+          echo "Verification passed"
+
+      - name: Package
+        run: |
+          cp -r result/Applications/MCMonad.app .
+          zip -r "MCMonad-${{ github.ref_name }}-arm64.zip" MCMonad.app
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MCMonad-*.zip
+          body: |
+            ## MCMonad ${{ github.ref_name }}
+
+            Standalone macOS app bundle (Apple Silicon).
+
+            ### Install
+            1. Download and unzip `MCMonad-${{ github.ref_name }}-arm64.zip`
+            2. Move `MCMonad.app` to `/Applications/`
+            3. Double-click to launch — it will install itself as a login item
+            4. Grant Accessibility permission when prompted
+
+            ### Uninstall
+            ```
+            /Applications/MCMonad.app/Contents/MacOS/mcmonad-launcher --uninstall
+            ```
+            Then delete the app.

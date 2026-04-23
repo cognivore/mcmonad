@@ -141,12 +141,14 @@ struct MCMonadCoreApp {
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
-        ) { @MainActor notification in
+        ) { notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
                     as? NSRunningApplication else { return }
             let pid = app.processIdentifier
             fputs("NSWORKSPACE: didActivateApplication pid=\(pid)\n", stderr)
-            socketServer.send(.frontAppChanged(pid: pid))
+            Task { @MainActor in
+                socketServer.send(.frontAppChanged(pid: pid))
+            }
         }
 
         // On client connection: send Ready + current screens

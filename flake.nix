@@ -94,6 +94,7 @@
             hsPkgs.haskell-language-server
             pkgs.jq
             pkgs.socat
+            pkgs.gh
           ];
           shellHook = ''
             echo "mcmonad dev shell"

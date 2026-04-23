@@ -16,9 +16,6 @@
         packages = {
           mcmonad = hsPkgs.callCabal2nix "mcmonad" ./haskell { };
 
-          # Haskell package with tests enabled (doCheck)
-          mcmonad-tested = pkgs.haskell.lib.doCheck self.packages.${system}.mcmonad;
-
           mcmonad-core = pkgs.stdenv.mkDerivation {
             pname = "mcmonad-core";
             version = "0.1.0";

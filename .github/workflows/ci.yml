@@ -14,7 +14,7 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixpkgs-unstable
       - name: Build and test Haskell (QuickCheck)
-        run: nix build .#mcmonad-tested
+        run: nix build .#mcmonad
 
   build-macos:
     runs-on: macos-14

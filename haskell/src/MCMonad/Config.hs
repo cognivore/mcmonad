@@ -88,12 +88,12 @@ data MConfig l = MConfig
 
 -- | Sensible default configuration.
 --
--- Terminal: ghostty. Mod key: option. Workspaces: 1 through 9.
+-- Terminal: Ghostty (via open -a). Mod key: option. Workspaces: 1 through 9.
 -- Default manage hook floats dialogs and fixed-size windows.
 -- No keybindings (users add their own via 'mcKeys').
 defaultConfig :: MConfig Layout
 defaultConfig = MConfig
-    { terminal           = "ghostty"
+    { terminal           = "open -a Ghostty"
     , layoutHook         = Layout (Tall 1 0.03 0.5 ||| Full)
     , manageHook         = defaultManageHook
     , mcWorkspaces       = map show [1 :: Int .. 9]

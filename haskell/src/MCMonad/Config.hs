@@ -93,7 +93,7 @@ data MConfig l = MConfig
 -- No keybindings (users add their own via 'mcKeys').
 defaultConfig :: MConfig Layout
 defaultConfig = MConfig
-    { terminal           = "ghostty"
+    { terminal           = "/Applications/Ghostty.app/Contents/MacOS/ghostty"
     , layoutHook         = Layout (Tall 1 0.03 0.5 ||| Full)
     , manageHook         = defaultManageHook
     , mcWorkspaces       = map show [1 :: Int .. 9]

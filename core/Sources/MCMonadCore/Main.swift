@@ -141,7 +141,7 @@ struct MCMonadCoreApp {
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
-        ) { notification in
+        ) { @MainActor notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
                     as? NSRunningApplication else { return }
             let pid = app.processIdentifier

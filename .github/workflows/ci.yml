@@ -13,10 +13,8 @@ jobs:
       - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixpkgs-unstable
-      - name: Build Haskell
-        run: nix build .#mcmonad
-      - name: Run QuickCheck tests
-        run: nix build .#mcmonad.tests.properties
+      - name: Build and test Haskell (QuickCheck)
+        run: nix build .#mcmonad-tested
 
   build-macos:
     runs-on: macos-14
@@ -30,9 +28,7 @@ jobs:
           nix_path: nixpkgs=channel:nixpkgs-unstable
           extra_nix_config: |
             extra-platforms = aarch64-darwin
-            allowed-impure-host-deps = /System/Library /bin/sh /dev /usr/lib /Applications/Xcode.app /Library/Developer/CommandLineTools
-      - name: Build both binaries
-        run: nix build .
+            allowed-impure-host-deps = /System/Library /bin/sh /dev /usr/lib /usr/bin /Applications/Xcode.app /Library/Developer/CommandLineTools
       - name: Build .app bundle
         run: nix build .#mcmonad-app
       - name: Verify .app bundle

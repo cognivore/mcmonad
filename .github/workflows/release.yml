@@ -22,7 +22,7 @@ jobs:
           nix_path: nixpkgs=channel:nixpkgs-unstable
           extra_nix_config: |
             extra-platforms = aarch64-darwin
-            allowed-impure-host-deps = /System/Library /bin/sh /dev /usr/lib /Applications/Xcode.app /Library/Developer/CommandLineTools
+            allowed-impure-host-deps = /System/Library /bin/sh /dev /usr/lib /usr/bin /Applications/Xcode.app /Library/Developer/CommandLineTools
 
       - name: Build .app bundle
         run: nix build .#mcmonad-app

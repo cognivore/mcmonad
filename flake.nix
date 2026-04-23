@@ -16,6 +16,9 @@
         packages = {
           mcmonad = hsPkgs.callCabal2nix "mcmonad" ./haskell { };
 
+          # Haskell package with tests enabled (doCheck)
+          mcmonad-tested = pkgs.haskell.lib.doCheck self.packages.${system}.mcmonad;
+
           mcmonad-core = pkgs.stdenv.mkDerivation {
             pname = "mcmonad-core";
             version = "0.1.0";
@@ -58,13 +61,16 @@
             ];
           };
 
-          default = pkgs.symlinkJoin {
-            name = "mcmonad";
-            paths = [
-              self.packages.${system}.mcmonad
-              self.packages.${system}.mcmonad-core
-            ];
-          };
+          default = if pkgs.stdenv.isDarwin then
+            pkgs.symlinkJoin {
+              name = "mcmonad";
+              paths = [
+                self.packages.${system}.mcmonad
+                self.packages.${system}.mcmonad-core
+              ];
+            }
+          else
+            self.packages.${system}.mcmonad;
 
           mcmonad-app = import ./nix/app-bundle.nix {
             inherit pkgs;

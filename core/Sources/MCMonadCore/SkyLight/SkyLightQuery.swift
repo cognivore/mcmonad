@@ -18,11 +18,7 @@ enum SkyLightQuery {
     /// - Visible: `attributes & 0x2 != 0` OR tag bit 54 set
     /// - Document: `tags & 0x1 != 0` OR (floating `tags & 0x2` AND modal `tags & 0x8000_0000`)
     static func queryAllVisibleWindows() -> [WindowSnapshot] {
-        guard let skyLight = SkyLight.shared else {
-            logger.error("SkyLight not available for window query")
-            return []
-        }
-
+        let skyLight = SkyLight.shared
         let cid = skyLight.getMainConnectionID()
         guard cid != 0 else {
             logger.warning("SkyLight main connection ID is 0")
@@ -89,8 +85,7 @@ enum SkyLightQuery {
 
     /// Query a single window by ID. Returns nil if not found.
     static func queryWindow(_ windowId: UInt32) -> WindowSnapshot? {
-        guard let skyLight = SkyLight.shared else { return nil }
-
+        let skyLight = SkyLight.shared
         let cid = skyLight.getMainConnectionID()
         guard cid != 0 else { return nil }
 

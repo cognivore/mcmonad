@@ -37,10 +37,10 @@ struct WindowSnapshot: Equatable, Sendable {
 // MARK: - SkyLight private framework bindings
 
 /// Loads SkyLight private framework symbols via dlopen/dlsym.
-/// Returns `nil` from `init` if critical symbols cannot be resolved.
+/// Fatal error if symbols cannot be resolved — SkyLight is required on Tahoe+.
 /// All function pointers are `@convention(c)`.
 final class SkyLight: @unchecked Sendable {
-    static let shared: SkyLight? = SkyLight()
+    static let shared = SkyLight()
 
     private static let logger = Logger(
         subsystem: "com.mcmonad.core",
@@ -154,28 +154,25 @@ final class SkyLight: @unchecked Sendable {
     // CFRelease for SkyLight-returned CFTypeRefs
     private let _cfRelease: (@convention(c) (CFTypeRef) -> Void)
 
-    // MARK: - Init (returns nil on failure)
+    // MARK: - Init (fatal on failure — SkyLight is required)
 
-    private init?() {
+    private init() {
         guard let lib = dlopen(
             "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
             RTLD_LAZY
         ) else {
-            Self.logger.error("Failed to dlopen SkyLight.framework")
-            return nil
+            fatalError("Failed to dlopen SkyLight.framework — macOS Tahoe+ required")
         }
 
         guard let cfLib = dlopen(
             "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
             RTLD_LAZY
         ) else {
-            Self.logger.error("Failed to dlopen CoreFoundation.framework")
-            return nil
+            fatalError("Failed to dlopen CoreFoundation.framework")
         }
 
         guard let cfReleasePtr = dlsym(cfLib, "CFRelease") else {
-            Self.logger.error("Failed to resolve CFRelease")
-            return nil
+            fatalError("Failed to resolve CFRelease")
         }
         _cfRelease = unsafeBitCast(cfReleasePtr, to: (@convention(c) (CFTypeRef) -> Void).self)
 
@@ -219,22 +216,15 @@ final class SkyLight: @unchecked Sendable {
         let r19 = required("SLSMoveWindow", as: MoveWindowFunc.self)
         let r20 = required("SLSGetWindowBounds", as: GetWindowBoundsFunc.self)
 
-        // Notifications — all required (unregister has alternate names)
+        // Notifications — all required
         let r21 = required("SLSRegisterConnectionNotifyProc", as: RegisterConnectionNotifyProcFunc.self)
-        let r22: UnregisterConnectionNotifyProcFunc? =
-            resolve("SLSUnregisterConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
-            ?? resolve("SLSRemoveConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
-        if r22 == nil { missing.append("SLS{Unregister,Remove}ConnectionNotifyProc") }
+        let r22 = required("SLSUnregisterConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
         let r23 = required("SLSRequestNotificationsForWindows", as: RequestNotificationsForWindowsFunc.self)
         let r24 = required("SLSRegisterNotifyProc", as: RegisterNotifyProcFunc.self)
-        let r25: UnregisterNotifyProcFunc? =
-            resolve("SLSUnregisterNotifyProc", as: UnregisterNotifyProcFunc.self)
-            ?? resolve("SLSRemoveNotifyProc", as: UnregisterNotifyProcFunc.self)
-        if r25 == nil { missing.append("SLS{Unregister,Remove}NotifyProc") }
+        let r25 = required("SLSUnregisterNotifyProc", as: UnregisterNotifyProcFunc.self)
 
         if !missing.isEmpty {
-            Self.logger.error("SkyLight missing required symbols: \(missing.joined(separator: ", "), privacy: .public)")
-            return nil
+            fatalError("SkyLight missing required symbols: \(missing.joined(separator: ", "))")
         }
 
         guard let r01, let r02, let r03, let r04, let r05,
@@ -242,7 +232,7 @@ final class SkyLight: @unchecked Sendable {
               let r11, let r12, let r13, let r14, let r15, let r16, let r17,
               let r18, let r19, let r20,
               let r21, let r22, let r23, let r24, let r25
-        else { return nil }
+        else { fatalError("SkyLight symbol resolution failed") }
 
         _mainConnectionID = r01;  _windowQueryWindows = r02
         _windowQueryResultCopyWindows = r03

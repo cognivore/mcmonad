@@ -44,7 +44,7 @@ final class EventBridge: SkyLightEventDelegate {
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .frameChanged(let windowId):
-            if let bounds = SkyLight.shared?.getWindowBounds(windowId) {
+            if let bounds = SkyLight.shared.getWindowBounds(windowId) {
                 socketServer.send(.windowFrameChanged(windowId: windowId, frame: bounds))
             }
 
@@ -75,12 +75,8 @@ struct MCMonadCoreApp {
             )
         }
 
-        // 2. Verify SkyLight loaded
-        if SkyLight.shared == nil {
-            logger.error(
-                "SkyLight framework failed to load — window management unavailable"
-            )
-        }
+        // 2. SkyLight is required — access triggers load (fatal on failure)
+        _ = SkyLight.shared
 
         // 3. Configure as background daemon — no dock icon, no menu bar
         NSApplication.shared.setActivationPolicy(.accessory)

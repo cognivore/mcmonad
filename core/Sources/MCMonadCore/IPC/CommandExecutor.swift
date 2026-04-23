@@ -56,10 +56,7 @@ final class CommandExecutor {
 
     private func executeSetFrames(_ frames: [FrameAssignment]) {
         fputs("CMD: set-frames count=\(frames.count)\n", stderr)
-        guard let skylight = SkyLight.shared else {
-            logger.error("SkyLight not available for setFrames")
-            return
-        }
+        let skylight = SkyLight.shared
 
         // Resolve AX elements once
         let resolved: [(FrameAssignment, AXUIElement)] = frames.compactMap { a in

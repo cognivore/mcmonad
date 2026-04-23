@@ -45,10 +45,7 @@ final class SkyLightEventObserver {
 
     func start() {
         guard !isRegistered else { return }
-        guard let skyLight = SkyLight.shared else {
-            Self.logger.error("Cannot start event observer: SkyLight not available")
-            return
-        }
+        let skyLight = SkyLight.shared
 
         let eventsViaConnectionNotify: [CGSEventType] = [
             .spaceWindowCreated,
@@ -97,7 +94,7 @@ final class SkyLightEventObserver {
     }
 
     func stop() {
-        guard let skyLight = SkyLight.shared else { return }
+        let skyLight = SkyLight.shared
 
         if isRegistered {
             let eventsToUnregister: [CGSEventType] = [
@@ -139,8 +136,7 @@ final class SkyLightEventObserver {
 
     @discardableResult
     func subscribeToWindows(_ windowIds: [UInt32]) -> Bool {
-        guard let skyLight = SkyLight.shared else { return false }
-        return skyLight.subscribeToWindowNotifications(windowIds)
+        return SkyLight.shared.subscribeToWindowNotifications(windowIds)
     }
 
     // MARK: - Drain

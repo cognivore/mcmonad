@@ -16,6 +16,8 @@ module MCMonad.Layout.I3Tree
     , ContainerMode(..)
       -- * Messages
     , I3Msg(..)
+      -- * Tree normalization
+    , flatten
     ) where
 
 import Data.List (findIndex)
@@ -94,10 +96,11 @@ instance LayoutClass I3Layout WindowRef where
 
     doLayout layout rect stack = do
         let (reconciledTree, _) = reconcile (tree layout) (nextSplit layout) stack
+            flatTree = flatten reconciledTree
             focused = W.focus stack
             barH = tabbedBarH layout
-            rects = renderTree focused barH reconciledTree rect
-            layout' = layout { tree = Just reconciledTree }
+            rects = renderTree focused barH flatTree rect
+            layout' = layout { tree = Just flatTree }
         return (rects, Just layout')
 
     emptyLayout layout _ =
@@ -384,6 +387,38 @@ removeAt i xs = take i xs ++ drop (i + 1) xs
 -- | Replace element at index.
 replaceAt :: Int -> a -> [a] -> [a]
 replaceAt i x xs = take i xs ++ [x] ++ drop (i + 1) xs
+
+-- ---------------------------------------------------------------------------
+-- Tree flattening (i3's tree_flatten)
+
+-- | Flatten redundant nesting in the tree. Merges children whose container
+-- mode matches their parent's mode, and collapses single-child containers.
+-- Called after every layout pass to prevent phantom groups from accumulating.
+--
+-- Example: @V[A, V[B, C]]@ becomes @V[A, B, C]@.
+flatten :: ITree a -> ITree a
+flatten (Leaf w) = Leaf w
+flatten (Container mode weights children) =
+    let flatChildren = map flatten children
+        (ws', cs') = promoteMatching mode (zip weights flatChildren)
+    in case cs' of
+        [c] -> c  -- collapse single-child container
+        _   -> Container mode ws' cs'
+
+-- | For each child: if it's a Container with the same mode as the parent,
+-- splice its children into the parent level (scaling weights proportionally).
+promoteMatching :: ContainerMode -> [(Double, ITree a)] -> ([Double], [ITree a])
+promoteMatching _ [] = ([], [])
+promoteMatching parentMode ((w, Container childMode childWs childCs) : rest)
+    | parentMode == childMode =
+        let total = sum childWs
+            scale = if total > 0 then w / total else 1
+            scaledWs = map (* scale) childWs
+            (restWs, restCs) = promoteMatching parentMode rest
+        in (scaledWs ++ restWs, childCs ++ restCs)
+promoteMatching parentMode ((w, c) : rest) =
+    let (restWs, restCs) = promoteMatching parentMode rest
+    in (w : restWs, c : restCs)
 
 -- ---------------------------------------------------------------------------
 -- Reconciliation

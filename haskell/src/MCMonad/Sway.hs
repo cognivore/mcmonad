@@ -430,10 +430,15 @@ data Direction2D = DirLeft | DirRight | DirUp | DirDown
 -- | Move focus to the nearest window in the given direction.
 -- Uses window rectangles from the last layout pass for spatial navigation.
 -- This is the core of i3/Sway's h\/j\/k\/l directional focus.
+-- Only considers windows on visible workspaces (excludes hidden scratchpads
+-- on NSP and other hidden workspaces).
 focusDir :: Direction2D -> M ()
 focusDir dir = do
     rects <- gets windowRects
     ws <- gets windowset
+    let visibleWins = Set.fromList $ concatMap
+            (W.integrate' . W.stack . W.workspace)
+            (W.current ws : W.visible ws)
     case W.peek ws of
         Nothing -> return ()
         Just focused ->
@@ -445,6 +450,7 @@ focusDir dir = do
                             [ (w, rectCenter r)
                             | (w, r) <- Map.toList rects
                             , w /= focused
+                            , Set.member w visibleWins
                             , inDirection dir fc (rectCenter r)
                             ]
                         sorted = sortBy (comparing (rectDist fc . snd)) candidates

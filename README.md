@@ -68,7 +68,7 @@ kill $(pgrep -f mcmonad)
 McMonad defaults to Option as the mod key. If you are a proper Linux / XMonad user who is accustomed to the keybinds and wants the full experience on macOS, you will find [my Karabiner configuration](https://github.com/geosurge-ai/nixvana-ii/blob/main/imperative-darwin/configs/karabiner/karabiner.json) to be a nice starter pack for your keybinds. It remaps PC-style shortcuts to macOS equivalents, swaps Fn and Ctrl, adds Right Command + HJKL as arrow keys, and a few other XMonad-flavoured niceties (Option+Shift+Enter spawns a terminal, Option+P opens Spotlight, Option+Shift+C closes a window).
 
 | Keys | Action |
-|———|————|
+|------|--------|
 | `Opt-j` / `Opt-k` | Focus down / up |
 | `Opt-Return` | Swap focused window with main |
 | `Opt-Shift-j` / `Opt-Shift-k` | Swap down / up |

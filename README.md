@@ -95,6 +95,10 @@ A complete Ghostty configuration that works well with McMonad is also available 
 
 The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.999`. Next: `0.9999`. Then `0.99999`. This is called "ClownVer".
 
+## Who made this and why?
+
+McMonad was developed to enable performance among the engineering team at geoSurge. If you want to join our hip company, you are [most welcome to](https://geosurge.md110.se).
+
 ---
 
 ## The big idea

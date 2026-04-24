@@ -103,7 +103,7 @@ The versioning policy is to just keep adding 9s to the minor version after `0.` 
 
 ### From X to M
 
-In 2007, Stewart and Sjanssen published *xmonad: A Tiling Window Manager* (Haskell Workshop '07), which demonstrated that a window manager could be structured as a pure function from events to window configurations, with all mutable state confined to a well-typed monad stack. The core insight was that the `X` monad — `ReaderT XConf (StateT XState IO)` — cleanly separated pure layout computation from X11herc
+In 2007, Stewart and Janssen published *xmonad: A Tiling Window Manager* (Haskell Workshop '07), which demonstrated that a window manager could be structured as a pure function from events to window configurations, with all mutable state confined to a well-typed monad stack. The core insight was that the `X` monad — `ReaderT XConf (StateT XState IO)` — cleanly separated pure layout computation from X11herc
 side effects.
 
 We asked a simple question: what if we replace the X monad with an M monad, and replace the X11 `Display*` with a Unix socket to a macOS Accessibility server?
@@ -223,4 +223,4 @@ Layouts that perform effects in the `X` monad (reading X11 atoms, spawning proce
 
 ---
 
-*McMonad builds on the work of Stewart, Sjanssen, and the xmonad community. We just put clown shoes on it and made it honk on macOS.*
+*McMonad builds on the work of Stewart, Janssen, and the xmonad community. We just put clown shoes on it and made it honk on macOS.*

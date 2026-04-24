@@ -40,6 +40,10 @@ module MCMonad.Sway
     , toggleSticky
       -- * Named scratchpads
     , toggleScratchpad
+      -- * Directional window movement
+    , moveDir
+      -- * Floating resize
+    , resizeOrFloat
       -- * Affinity helpers
     , getAffinity
     , setAffinity
@@ -99,24 +103,27 @@ swayKeys :: MConfig Layout -> Map (Modifiers, KeyCode) (M ())
 swayKeys conf = Map.fromList $
     -- Focus / resize (mode-aware: resize mode changes h/j/k/l)
     -- Normal mode: directional spatial focus (like i3/Sway)
-    -- Resize mode: directional container resize
+    -- Resize mode: directional container resize (tiled) or edge resize (floating)
     [ ((m, kH),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitH (-0.05)))
+                                       (resizeOrFloat SplitH (-0.05))
                                        (focusDir DirLeft))
     , ((m, kJ),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitV 0.05))
+                                       (resizeOrFloat SplitV 0.05)
                                        (focusDir DirDown))
     , ((m, kK),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitV (-0.05)))
+                                       (resizeOrFloat SplitV (-0.05))
                                        (focusDir DirUp))
     , ((m, kL),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitH 0.05))
+                                       (resizeOrFloat SplitH 0.05)
                                        (focusDir DirRight))
     , ((m, kReturn),               modeAction "resize"
                                        exitMode
                                        (spawn (terminal conf)))
-    , ((m .|. shiftMask, kJ),      windows W.swapDown)
-    , ((m .|. shiftMask, kK),      windows W.swapUp)
+    -- Directional window movement (i3's move left/right/up/down)
+    , ((m .|. shiftMask, kH),      moveDir DirLeft)
+    , ((m .|. shiftMask, kJ),      moveDir DirDown)
+    , ((m .|. shiftMask, kK),      moveDir DirUp)
+    , ((m .|. shiftMask, kL),      moveDir DirRight)
 
     -- Kill / restart
     , ((m .|. shiftMask, kQ),      kill)
@@ -205,6 +212,32 @@ modeAction modeName modeAct defaultAct = do
     mode <- gets inputMode
     if mode == modeName then modeAct else defaultAct
 
+-- | Resize the focused window. If floating, adjust its RationalRect directly
+-- (grow/shrink the right or bottom edge). If tiled, send ResizeDir to the
+-- i3 tree layout. Matches i3/Sway resize mode behaviour.
+resizeOrFloat :: SplitDir -> Double -> M ()
+resizeOrFloat dir delta = withFocused $ \w -> do
+    ws <- gets windowset
+    case Map.lookup w (W.floating ws) of
+        Just (W.RationalRect rx ry rw rh) ->
+            let (rx', ry', rw', rh') = case dir of
+                    SplitH -> (rx, ry, max 0.05 (rw + toRational delta), rh)
+                    SplitV -> (rx, ry, rw, max 0.05 (rh + toRational delta))
+            in windows (W.float w (W.RationalRect rx' ry' rw' rh'))
+        Nothing ->
+            sendMessage (ResizeDir dir delta)
+
+-- | Move the focused window in the given direction within the i3 tree.
+-- Matches i3/Sway's @move left\/right\/up\/down@.
+moveDir :: Direction2D -> M ()
+moveDir dir =
+    let (splitDir, delta) = case dir of
+            DirLeft  -> (SplitH, -1)
+            DirRight -> (SplitH, 1)
+            DirUp    -> (SplitV, -1)
+            DirDown  -> (SplitV, 1)
+    in sendMessage (MoveDir splitDir delta)
+
 -- ---------------------------------------------------------------------------
 -- Sticky windows
 
@@ -252,16 +285,26 @@ toggleScratchpad name cmd = do
                     let ct = W.currentTag ws
                     case W.findTag wr ws of
                         Just tag | tag == ct -> do
-                            -- On current workspace: hide it (move to hidden "NSP" workspace)
+                            -- On current workspace: save geometry and hide
+                            case Map.lookup wr (W.floating ws) of
+                                Just rr -> modify $ \s -> s
+                                    { scratchpadRects = Map.insert name rr
+                                                            (scratchpadRects s) }
+                                Nothing -> return ()
                             windows (W.shift "NSP" . W.focusWindow wr)
                         _ -> do
-                            -- Elsewhere: bring to current workspace, float it
+                            -- Elsewhere: bring to current workspace, restore saved geometry
+                            savedRects <- gets scratchpadRects
+                            let rr = case Map.lookup name savedRects of
+                                        Just r  -> r
+                                        Nothing -> W.RationalRect 0.1 0.05 0.8 0.6
                             windows $ \ws' ->
-                                W.float wr (W.RationalRect 0.1 0.05 0.8 0.6)
+                                W.float wr rr
                                 $ W.shiftWin (W.currentTag ws') wr ws'
                 else do
                     -- Window was destroyed, clear and re-spawn
-                    modify $ \s -> s { scratchpads = Map.delete name (scratchpads s) }
+                    modify $ \s -> s { scratchpads = Map.delete name (scratchpads s)
+                                     , scratchpadRects = Map.delete name (scratchpadRects s) }
                     modify $ \s -> s { pendingScratchpad = Just name }
                     spawn cmd
         Nothing -> do

@@ -44,22 +44,25 @@ cstKeys conf = Map.fromList $
     , ((m .|. shiftMask, kR),      restart)
 
     -- Focus / resize (mode-aware: resize mode changes h/j/k/l)
+    -- Resize works on both tiled (tree) and floating (scratchpad) windows
     , ((m, kJ),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitV 0.05))
+                                       (resizeOrFloat SplitV 0.05)
                                        (windows focusDown))
     , ((m, kK),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitV (-0.05)))
+                                       (resizeOrFloat SplitV (-0.05))
                                        (windows focusUp))
     , ((m, kH),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitH (-0.05)))
+                                       (resizeOrFloat SplitH (-0.05))
                                        (sendMessage XMonad.Shrink))
     , ((m, kL),                    modeAction "resize"
-                                       (sendMessage (ResizeDir SplitH 0.05))
+                                       (resizeOrFloat SplitH 0.05)
                                        (sendMessage XMonad.Expand))
 
-    -- Move windows in the stack
-    , ((m .|. shiftMask, kJ),      windows swapDown)
-    , ((m .|. shiftMask, kK),      windows swapUp)
+    -- Directional window movement (i3's move left/right/up/down)
+    , ((m .|. shiftMask, kH),      moveDir DirLeft)
+    , ((m .|. shiftMask, kJ),      moveDir DirDown)
+    , ((m .|. shiftMask, kK),      moveDir DirUp)
+    , ((m .|. shiftMask, kL),      moveDir DirRight)
 
     -- Resize mode: Mod+r toggles, Mod+Escape exits
     -- (macOS global hotkeys require modifier — bare keys would block typing)

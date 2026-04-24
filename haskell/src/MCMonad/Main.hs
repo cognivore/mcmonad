@@ -80,6 +80,7 @@ launch cfg = do
                        , inputMode = "default"
                        , sticky = Set.empty
                        , scratchpads = Map.empty
+                       , scratchpadRects = Map.empty
                        , pendingScratchpad = Nothing
                        , windowRects = Map.empty
                        , warpOnSwitch = mouseWarping cfg

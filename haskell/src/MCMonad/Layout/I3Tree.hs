@@ -60,6 +60,12 @@ data I3Msg
       -- nearest ancestor with matching split direction, adjust weight.
       -- E.g. @ResizeDir SplitH (-0.05)@ shrinks width,
       -- @ResizeDir SplitV 0.05@ grows height.
+    | MoveDir SplitDir Int
+      -- ^ Directional window movement within the tree (i3's @move left\/right\/up\/down@).
+      -- Walk up from focused to find a container with matching split direction,
+      -- then move the window to the adjacent position. If the target is a leaf,
+      -- swap. If the target is a container, move the window into it.
+      -- E.g. @MoveDir SplitH 1@ moves right, @MoveDir SplitV (-1)@ moves up.
     deriving (Show, Typeable)
 
 instance XCore.Message I3Msg
@@ -134,6 +140,13 @@ instance LayoutClass I3Layout WindowRef where
             return $ case (W.peek ws, tree layout) of
                 (Just focused, Just t) ->
                     Just layout { tree = Just (resizeDirAt focused dir delta t) }
+                _ -> Nothing
+        -- Directional move: move window within the tree
+        | Just (MoveDir dir delta) <- fromMessage msg = do
+            ws <- gets windowset
+            return $ case (W.peek ws, tree layout) of
+                (Just focused, Just t) ->
+                    Just layout { tree = Just (moveDirAt focused dir delta t) }
                 _ -> Nothing
         -- Resize: adjust weight of the focused child in its parent container
         | Just XLayout.Shrink <- fromMessage msg = do
@@ -275,6 +288,102 @@ adjustWeight idx delta (Container mode weights children)
         in Container mode weights' children
     | otherwise = Container mode weights children
 adjustWeight _ _ t = t
+
+-- ---------------------------------------------------------------------------
+-- Directional move
+
+-- | Move the focused window in a direction within the tree.
+-- Walk up from the focused leaf to find the nearest container with matching
+-- split direction, then move the window to the adjacent position.
+-- If the target is a leaf, swap. If the target is a container, move into it.
+moveDirAt :: Eq a => a -> SplitDir -> Int -> ITree a -> ITree a
+moveDirAt focused dir delta t = case pathToWindow focused t of
+    Nothing   -> t
+    Just path -> tryMove (length path - 1) path
+  where
+    tryMove depth _
+        | depth < 0 = t
+    tryMove depth path' =
+        let cpath    = take depth path'
+            childIdx = path' !! depth
+        in case nodeAtPath cpath t of
+            Just (Container (Split d) _ children) | d == dir ->
+                let targetIdx = childIdx + delta
+                in if targetIdx >= 0 && targetIdx < length children
+                   then modifyAtPath cpath
+                            (moveChild focused childIdx targetIdx delta) t
+                   else tryMove (depth - 1) path'
+            _ -> tryMove (depth - 1) path'
+
+-- | Move a window between two child positions within a container.
+--
+-- Four cases, matching i3 behaviour:
+--
+-- 1. Direct child + leaf target  → swap the two children
+-- 2. Direct child + container target → remove leaf, insert into target at near edge
+-- 3. Nested child + leaf target  → extract leaf from subtree, insert adjacent to target
+-- 4. Nested child + container target → extract leaf from subtree, insert into target
+moveChild :: Eq a => a -> Int -> Int -> Int -> ITree a -> ITree a
+moveChild focused srcIdx tgtIdx delta node@(Container mode weights children)
+    | tgtIdx < 0 || tgtIdx >= length children = node
+    | otherwise = case (src, tgt) of
+        -- Case 1: Direct child, leaf target → swap
+        (Leaf s, Leaf _) | s == focused ->
+            swapChildren srcIdx tgtIdx node
+        -- Case 2: Direct child, container target → move into container
+        (Leaf s, Container tMode tWeights tChildren) | s == focused ->
+            let (tws, tcs) = nearEdge delta tWeights tChildren
+                newTarget = Container tMode tws tcs
+                tgtIdx' = if srcIdx < tgtIdx then tgtIdx - 1 else tgtIdx
+                ws' = removeAt srcIdx weights
+                cs' = replaceAt tgtIdx' newTarget (removeAt srcIdx children)
+            in case cs' of
+                [c] -> c  -- collapse single-child container
+                _   -> Container mode ws' cs'
+        -- Cases 3 & 4: Nested child → extract focused leaf from subtree
+        _ -> case removeWindow focused src of
+            Nothing -> node  -- shouldn't happen
+            Just src' -> case tgt of
+                -- Case 3: Leaf target → insert adjacent
+                Leaf _ ->
+                    let insertIdx = if delta > 0 then tgtIdx else tgtIdx + 1
+                        cs' = replaceAt srcIdx src' children
+                    in Container mode
+                        (insertAtIdx insertIdx 1.0 weights)
+                        (insertAtIdx insertIdx (Leaf focused) cs')
+                -- Case 4: Container target → insert into container
+                Container tMode tWeights tChildren ->
+                    let (tws, tcs) = nearEdge delta tWeights tChildren
+                        newTarget = Container tMode tws tcs
+                    in Container mode weights
+                        (replaceAt srcIdx src' (replaceAt tgtIdx newTarget children))
+  where
+    src = children !! srcIdx
+    tgt = children !! tgtIdx
+    nearEdge d tws tcs
+        | d > 0     = (1.0 : tws, Leaf focused : tcs)
+        | otherwise = (tws ++ [1.0], tcs ++ [Leaf focused])
+moveChild _ _ _ _ t = t
+
+-- | Insert element at index in a list.
+insertAtIdx :: Int -> a -> [a] -> [a]
+insertAtIdx i x xs = take i xs ++ [x] ++ drop i xs
+
+-- | Swap two children in a container (weights stay with positions).
+swapChildren :: Int -> Int -> ITree a -> ITree a
+swapChildren i j (Container mode ws cs) =
+    Container mode ws
+        [ if k == i then cs !! j else if k == j then cs !! i else c
+        | (k, c) <- zip [0..] cs ]
+swapChildren _ _ t = t
+
+-- | Remove element at index.
+removeAt :: Int -> [a] -> [a]
+removeAt i xs = take i xs ++ drop (i + 1) xs
+
+-- | Replace element at index.
+replaceAt :: Int -> a -> [a] -> [a]
+replaceAt i x xs = take i xs ++ [x] ++ drop (i + 1) xs
 
 -- ---------------------------------------------------------------------------
 -- Reconciliation

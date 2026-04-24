@@ -205,6 +205,9 @@ data MState = MState
       -- ^ Windows that follow focus across workspace switches.
     , scratchpads       :: !(Map.Map String WindowRef)
       -- ^ Named scratchpad windows (name -> window ref).
+    , scratchpadRects   :: !(Map.Map String W.RationalRect)
+      -- ^ Last known geometry of each scratchpad, saved on hide so it
+      -- can be restored on the next show (preserves user resizes).
     , pendingScratchpad :: !(Maybe String)
       -- ^ When set, the next window created is registered as this scratchpad.
     , windowRects      :: !(Map.Map WindowRef Rectangle)

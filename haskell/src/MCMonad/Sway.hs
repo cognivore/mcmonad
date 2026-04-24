@@ -43,14 +43,8 @@ import qualified XMonad.Layout as XLayout (Resize(..))
 import qualified XMonad.StackSet as W
 
 import MCMonad.Core
-import MCMonad.Config
-    ( MConfig(..), KeyCode, Modifiers
-    , shiftMask
-    , kJ, kK, kH, kL, kReturn, kSpace, kC
-    , kW, kE, kR
-    , kA, kB, kV, kF, kT
-    , k1, k2, k3, k4, k5, k6, k7, k8, k9
-    )
+import MCMonad.Config (MConfig(..), Modifiers, shiftMask)
+import MCMonad.Config.Keys
 import MCMonad.Layout.I3Tree (I3Layout(..), I3Msg(..), SplitDir(..))
 import MCMonad.Operations
     ( windows, sendMessage, kill, spawn, withFocused, screenWorkspace )

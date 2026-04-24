@@ -18,6 +18,7 @@ library
     MCMonad.Main
     MCMonad.IPC
     MCMonad.Config
+    MCMonad.Config.Keys
     MCMonad.Sway
     MCMonad.Compat.XMonadContrib
   build-depends:

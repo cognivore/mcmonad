@@ -15,6 +15,7 @@
 module MCMonad
     ( module MCMonad.Core
     , module MCMonad.Config
+    , module MCMonad.Config.Keys
     , module MCMonad.Layout
     , module MCMonad.Layout.I3Tree
     , module MCMonad.ManageHook
@@ -27,6 +28,7 @@ module MCMonad
 
 import MCMonad.Core
 import MCMonad.Config
+import MCMonad.Config.Keys
 import MCMonad.Layout
 import MCMonad.Layout.I3Tree
 import MCMonad.ManageHook

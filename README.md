@@ -101,6 +101,8 @@ McMonad was developed to enable performance among the engineering team at geoSur
 
 ---
 
+# Deep dive
+
 ## The big idea
 
 <img width="1422" height="711" alt="image" src="https://github.com/user-attachments/assets/34442c06-83de-4a0d-8fe9-b347ff65d615" />

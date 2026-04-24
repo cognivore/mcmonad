@@ -65,14 +65,14 @@ kill $(pgrep -f mcmonad)
 
 ### Default keybindings
 
-McMonad defaults to Option as the mod key. If you are a proper Linux / XMonad user who is accustomed to the keybinds and wants the full experience on macOS, you will find [this Karabiner configuration](https://github.com/geosurge-ai/nixvana-ii/blob/main/imperative-darwin/configs/karabiner/karabiner.json) to be a nice starter pack for your keybinds. It remaps PC-style shortcuts to macOS equivalents, swaps Fn and Ctrl, adds Right Command + HJKL as arrow keys, and a few other XMonad-flavoured niceties (Option+Shift+Enter spawns a terminal, Option+P opens Spotlight, Option+Shift+C closes a window).
+McMonad defaults to Option as the mod key. If you are a proper Linux / XMonad user who is accustomed to the keybinds and wants the full experience on macOS, you will find [my Karabiner configuration](https://github.com/geosurge-ai/nixvana-ii/blob/main/imperative-darwin/configs/karabiner/karabiner.json) to be a nice starter pack for your keybinds. It remaps PC-style shortcuts to macOS equivalents, swaps Fn and Ctrl, adds Right Command + HJKL as arrow keys, and a few other XMonad-flavoured niceties (Option+Shift+Enter spawns a terminal, Option+P opens Spotlight, Option+Shift+C closes a window).
 
 | Keys | Action |
 |———|————|
 | `Opt-j` / `Opt-k` | Focus down / up |
-| `Opt-Return` | Swap focused window with master |
+| `Opt-Return` | Swap focused window with main |
 | `Opt-Shift-j` / `Opt-Shift-k` | Swap down / up |
-| `Opt-h` / `Opt-l` | Shrink / expand master area |
+| `Opt-h` / `Opt-l` | Shrink / expand main area |
 | `Opt-Space` | Next layout |
 | `Opt-Shift-Return` | Spawn terminal |
 | `Opt-Shift-c` | Close focused window |
@@ -80,7 +80,6 @@ McMonad defaults to Option as the mod key. If you are a proper Linux / XMonad us
 | `Opt-1`..`Opt-9` | Switch to workspace |
 | `Opt-Shift-1`..`Opt-Shift-9` | Move window to workspace |
 | `Opt-w` / `Opt-e` / `Opt-r` | Focus screen 1 / 2 / 3 |
-| `Opt-Shift-q` | Quit mcmonad |
 
 ### Default terminal
 
@@ -90,11 +89,11 @@ McMonad defaults to [Ghostty](https://ghostty.org/). If you are using Ghostty (a
 quit-after-last-window-closed = true
 ```
 
-A complete Ghostty configuration that works well with McMonad is available [here](https://github.com/geosurge-ai/nixvana-ii/blob/main/imperative-darwin/configs/ghostty/config).
+A complete Ghostty configuration that works well with McMonad is also available [in my configuration starter pack](https://github.com/geosurge-ai/nixvana-ii/blob/main/imperative-darwin/configs/ghostty/config).
 
 ### Versioning
 
-The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.999`. Next: `0.9999`. Then `0.99999`. You get the idea.
+The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.999`. Next: `0.9999`. Then `0.99999`. This is called "ClownVer".
 
 ---
 
@@ -102,7 +101,8 @@ The versioning policy is to just keep adding 9s to the minor version after `0.` 
 
 ### From X to M
 
-In 2007, Stewart and Sjanssen published *xmonad: A Tiling Window Manager* (Haskell Workshop '07), which demonstrated that a window manager could be structured as a pure function from events to window configurations, with all mutable state confined to a well-typed monad stack. The core insight was that the `X` monad — `ReaderT XConf (StateT XState IO)` — cleanly separated pure layout computation from X11 side effects.
+In 2007, Stewart and Sjanssen published *xmonad: A Tiling Window Manager* (Haskell Workshop '07), which demonstrated that a window manager could be structured as a pure function from events to window configurations, with all mutable state confined to a well-typed monad stack. The core insight was that the `X` monad — `ReaderT XConf (StateT XState IO)` — cleanly separated pure layout computation from X11herc
+side effects.
 
 We asked a simple question: what if we replace the X monad with an M monad, and replace the X11 `Display*` with a Unix socket to a macOS Accessibility server?
 
@@ -124,31 +124,40 @@ type WindowSet = StackSet WorkspaceId (Layout Window) Window ScreenId ScreenDeta
 type WindowSet = StackSet String (Layout WindowRef) WindowRef ScreenId ScreenDetail
 ```
 
+Boy, do I love strings.
+
 Where xmonad calls `XSync`, `XSetInputFocus`, and `XMoveResizeWindow`, mcmonad sends JSON commands over a Unix socket: `SetFrames`, `FocusWindow`, `HideWindows`. Where xmonad reads X11 events, mcmonad reads events from `mcmonad-core`: `WindowCreated`, `WindowDestroyed`, `HotkeyPressed`, `ScreensChanged`.
 
-The **entire pure core** — StackSet operations, layout algorithms, ManageHook queries, the `windows` function that is the single point of truth for all state transitions — is structurally identical to xmonad. We inherit the same invariant that every window appears exactly once in the StackSet, verified by the same QuickCheck property suite (44 properties, ported verbatim).
+The pure core is the single source of truth for correct window placements, we inherit the invariants and tests verbatim from XMonad.
 
 ### mcmonad-core: the Effectful backend
 
-`mcmonad-core` is a Swift 6 daemon (~2,400 lines) that serves as the effectful backend for the M monad. It performs all I/O — talking to the window server, observing events, registering hotkeys, managing displays — and exposes a clean command/event protocol over a Unix socket at `~/.config/mcmonad/core.sock`.
+`mcmonad-core` is a small Swift 6 daemon that serves as the effectful backend for the M monad. It performs all I/O — talking to the window server, observing events, registering hotkeys, managing displays — and exposes a clean command/event protocol over a Unix socket at `~/.config/mcmonad/core.sock`.
 
 The primitives it provides, and their implementation status:
 
-**Window enumeration and observation** (principled). We use the SkyLight private framework to enumerate windows and observe creation/destruction/move/resize events. SkyLight is Apple's private interface to the window server (`WindowServer` process) — the layer beneath AppKit that actually composites and manages windows on screen. It is not documented, not stable across macOS versions, and not supposed to be used by third-party applications. Every serious macOS tiling window manager (yabai, Amethyst's lower layers, AeroSpace's experimental paths) uses it, because the public APIs (`CGWindowListCopyWindowInfo` and friends) are too slow and too limited for real-time window management. We load it via `dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight")` and resolve symbols with `dlsym` at runtime. Window filtering applies the same heuristics proven in OmniWM: top-level windows only, correct window levels (Normal, Floating, ModalPanel), proper visibility attributes and tag bits. Event coalescing deduplicates `frameChanged` per window ID and drains on the main runloop.
+**Window enumeration and observation**. We use the SkyLight private framework to enumerate windows and observe creation/destruction/move/resize events. SkyLight is Apple's private interface to the window server (`WindowServer` process) — the layer beneath AppKit that actually composites and manages windows on screen. *It is not documented, not stable across macOS versions, and not supposed to be used by third-party applications* but every macOS tiling window manager (yabai, Amethyst's lower layers, AeroSpace's experimental paths) uses it anyway.
 
-**Window metadata** (principled). `AXUIElement` APIs provide structured metadata: title, app name, bundle ID, subrole, dialog classification, fixed-size detection, button presence. This feeds directly into the `WindowInfo` record that the Haskell `Query` monad reads. The `defaultManageHook` classifies windows using this metadata (dialogs and fixed-size windows float, everything else tiles).
+We load it via `dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight")` and resolve symbols with `dlsym` at runtime. Window filtering applies the same heuristics proven in OmniWM: top-level windows only, correct window levels (Normal, Floating, ModalPanel), proper visibility attributes and tag bits. Event coalescing deduplicates `frameChanged` per window ID and drains on the main runloop.
 
-**Frame writes** (principled, with a necessary hack). Writing window frames uses `AXUIElement` position/size attributes. The write ordering is deliberate: when growing a window, we set position first then size (to avoid clipping at screen edges); when shrinking, size first then position (to avoid overlap). Batch writes are wrapped in `SkyLight.disableUpdate`/`reenableUpdate` to suppress redraws.
+**Window metadata**. `AXUIElement` APIs provide structured metadata: title, app name, bundle ID, subrole, dialog classification, fixed-size detection, button presence. This feeds directly into the `WindowInfo` record that the Haskell `Query` monad reads. The `defaultManageHook` classifies windows using this metadata (dialogs and fixed-size windows float, everything else tiles).
 
-**Window focus** (unprincipled — necessarily). Focusing a window on macOS is a three-step ritual that requires three separate private APIs: (1) `NSRunningApplication.activate` to bring the app forward, (2) `_SLPSSetFrontProcessWithOptions` via a `ProcessSerialNumber` to tell the window server which specific window to front, (3) posting synthetic key-window event records via `SLPSPostEventRecordTo` — a 248-byte event structure with magic constants at specific offsets. Finally, (4) `AXUIElementPerformAction(kAXRaiseAction)` to raise via Accessibility. This is the ugliest code in the project. It works.
+**Frame writes**. Writing window frames uses `AXUIElement` position/size attributes. The write ordering is deliberate: when growing a window, we set position first then size (to avoid clipping at screen edges); when shrinking, size first then position (to avoid overlap). Batch writes are wrapped in `SkyLight.disableUpdate`/`reenableUpdate` to suppress redraws.
 
-**The CGWindowID-to-AXUIElement bridge** (unprincipled). The private function `_AXUIElementGetWindow` bridges SkyLight's `CGWindowID` namespace to the Accessibility API's `AXUIElement` namespace. Without it, we would have no way to correlate the windows we observe (via SkyLight) with the windows we manipulate (via AX). Apple provides no public API for this.
+**Window focus**. Focusing a window on macOS is a three-step ritual that requires three separate private APIs:
 
-**Hotkey registration** (principled, but using an obsolete API). We use Carbon's `RegisterEventHotKey` because it is the only macOS API that provides global hotkey registration without requiring an event tap (which would need additional permissions). The API is deprecated but stable — it has worked since Mac OS X 10.0 and Apple has not removed it.
+1. `NSRunningApplication.activate` to bring the app forward,
+2. `_SLPSSetFrontProcessWithOptions` via a `ProcessSerialNumber` to tell the window server which specific window to front,
+3. posting synthetic key-window event records via `SLPSPostEventRecordTo` — a 248-byte event structure with magic constants at specific offsets. Finally
+4. `AXUIElementPerformAction(kAXRaiseAction)` to raise via Accessibility.
 
-**Display management** (principled). `NSScreen` observation for display changes, with Y-coordinate flipping from AppKit's origin-bottom-left to standard origin-top-left coordinates.
+This is the ugliest code in the project. It works.
 
-**Coordinate system** (a permanent headache). macOS uses `CGFloat` (doubles) where X11 uses integers. AppKit has origin at bottom-left, SkyLight at top-left, and some AX calls return yet another coordinate space. `mcmonad-core` normalises everything to top-left-origin doubles before sending to Haskell.
+**The CGWindowID-to-AXUIElement bridge**. The private function `_AXUIElementGetWindow` bridges SkyLight's `CGWindowID` namespace to the Accessibility API's `AXUIElement` namespace. Without it, we would have no way to correlate the windows we observe (via SkyLight) with the windows we manipulate (via AX). Apple provides no public API for this. Please note that other window managers report Tahoe-related bugs when window IDs are not stable between screen locks. I haven't hit this with McMonad yet, but, you know, if you suffer send PRs.
+
+**Hotkey registration**. We use Carbon's `RegisterEventHotKey` because it is the only macOS API that provides global hotkey registration without requiring an event tap (which would need additional permissions). The API is deprecated but stable — it has worked since Mac OS X 10.0 and Apple has not removed it. If Apple removes it, I will switch to Framework Pro and SSH to my Mac Book.
+
+**Clownordinate system**. macOS uses `CGFloat` (doubles) where X11 uses integers. AppKit has origin at bottom-left, SkyLight at top-left, and some AX calls return yet another coordinate space :clown:. `mcmonad-core` normalises everything to top-left-origin doubles before sending to Haskell.
 
 ## Closing the loop
 
@@ -172,11 +181,15 @@ The `haskell/` directory contains ~5,500 lines of Haskell that wire xmonad's pur
 
 ### The process boundary as a reliability mechanism
 
-If the Haskell process crashes, `mcmonad-core` keeps running. `launchd` restarts Haskell, which reconnects, queries current state, and resumes layout. If `mcmonad-core` crashes, `launchd` restarts it, and Haskell reconnects on the next event. No FFI, no shared memory, no coroutine tricks. Two processes, one socket. Sub-second recovery.
+If the Haskell process crashes, `mcmonad-core` keeps running. `launchd` restarts Haskell, which reconnects, queries current state, and resumes layout. If `mcmonad-core` crashes, `launchd` restarts it, and Haskell reconnects on the next event. Probably there are bugs here because `launchd` is a joke, but I suffered 0 crashes so far.
 
 ## Appendix A: Shimming for xmonad-contrib
 
-One of our goals was to let users use their elongated 21st century screens properly. For that, they need ThreeCol layout, which is trivially importable from xmonad-contrib. Thus we figured — heck, let's just import it! This will also allow fellow XMonad enjoyers bring their full configs to macOS without modification. The problem: xmonad-contrib layouts implement `XMonad.LayoutClass`, which lives in the `X` monad and uses X11's integer `Rectangle`. McMonad has its own `LayoutClass` in the `M` monad with double-precision `Rectangle`. Thus, we are shimming it!
+One of our goals was to let users use their elongated 21st century screens properly.
+
+For that, they need ThreeCol layout, which is trivially importable from xmonad-contrib. Thus we figured — heck, let's just import it! This will also allow fellow XMonad enjoyers bring their full configs to macOS without modification.
+
+**The problem**: xmonad-contrib layouts implement `XMonad.LayoutClass`, which lives in the `X` monad and uses X11's integer `Rectangle`. McMonad has its own `LayoutClass` in the `M` monad with double-precision `Rectangle`. Thus, we are shimming it!
 
 The shim lives in `MCMonad.Compat.XMonadContrib`:
 
@@ -189,7 +202,7 @@ fromXMonad = Layout . XW
 
 `XMonadWrapper` implements McMonad's `LayoutClass` by delegating to xmonad's `LayoutClass`, converting rectangles at the boundary (`toX11Rect` truncates doubles to integers, `fromX11Rect` promotes integers to doubles). Since xmonad-contrib layouts are overwhelmingly pure — they implement `pureLayout` and `pureMessage`, not the effectful variants — the `X` monad is never actually entered. The wrapper calls `XMonad.pureLayout` directly.
 
-This means `ThreeColMid`, and the other less useful layouts work out of the box:
+This means `ThreeColMid`, and the other less useful layouts nobody I know cares about, work out of the box:
 
 ```haskell
 import MCMonad.Compat.XMonadContrib (XMonadWrapper(..))
@@ -208,4 +221,4 @@ Layouts that perform effects in the `X` monad (reading X11 atoms, spawning proce
 
 ---
 
-*McMonad builds on the work of Stewart, Sjanssen, and the xmonad community. The StackSet, the zipper, the layout typeclass, the single-`windows`-function architecture, the QuickCheck property suite — all of this is their contribution. We just put clown shoes on it and made it honk on macOS.*
+*McMonad builds on the work of Stewart, Sjanssen, and the xmonad community. We just put clown shoes on it and made it honk on macOS.*

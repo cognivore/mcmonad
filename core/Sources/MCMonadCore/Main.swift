@@ -184,6 +184,15 @@ struct MCMonadCoreApp {
         }
         dragHandler.start()
 
+        // Periodic window validation — catches windows that vanish without
+        // firing SkyLight 804/1326 (e.g. quickly closed system dialogs).
+        // Runs every 2 seconds on the main run loop.
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            Task { @MainActor in
+                eventBridge.validateWindows()
+            }
+        }
+
         // Start event observer
         eventObserver.start()
 

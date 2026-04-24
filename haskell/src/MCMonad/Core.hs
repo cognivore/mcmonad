@@ -196,9 +196,20 @@ data Connection = Connection
 
 -- | Mutable window manager state.
 data MState = MState
-    { windowset :: !WindowSet
-    , mapped    :: !(Set WindowRef)
-    , affinity  :: !(Map.Map String ScreenId)
+    { windowset         :: !WindowSet
+    , mapped            :: !(Set WindowRef)
+    , affinity          :: !(Map.Map String ScreenId)
+    , inputMode         :: !String
+      -- ^ Current input mode (\"default\", \"resize\", etc.).
+    , sticky            :: !(Set WindowRef)
+      -- ^ Windows that follow focus across workspace switches.
+    , scratchpads       :: !(Map.Map String WindowRef)
+      -- ^ Named scratchpad windows (name -> window ref).
+    , pendingScratchpad :: !(Maybe String)
+      -- ^ When set, the next window created is registered as this scratchpad.
+    , windowRects      :: !(Map.Map WindowRef Rectangle)
+      -- ^ Last known positions of all visible windows (from the most recent
+      -- layout pass). Used for directional focus navigation.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's

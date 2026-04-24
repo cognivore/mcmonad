@@ -77,6 +77,11 @@ launch cfg = do
         mst0  = MState { windowset = ws0
                        , mapped = Set.empty
                        , affinity = restoredAffinity
+                       , inputMode = "default"
+                       , sticky = Set.empty
+                       , scratchpads = Map.empty
+                       , pendingScratchpad = Nothing
+                       , windowRects = Map.empty
                        }
 
     _ <- runM mconf mst0 $ do
@@ -283,8 +288,18 @@ handleEvent :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> Event -> M ()
 handleEvent debug cfg hotkeyIdMap evt = do
     when debug $ io $ hPutStrLn stderr $ "EVENT: " ++ show evt
     case evt of
-        WindowCreated winfo ->
+        WindowCreated winfo -> do
             manage winfo (manageHook cfg)
+            -- Register as named scratchpad if one is pending
+            pending <- gets pendingScratchpad
+            whenJust pending $ \name -> do
+                let wr = WindowRef (wiWindowId winfo) (wiPid winfo)
+                modify $ \s -> s
+                    { scratchpads = Map.insert name wr (scratchpads s)
+                    , pendingScratchpad = Nothing
+                    }
+                -- Float the scratchpad window
+                windows (W.float wr (W.RationalRect 0.1 0.05 0.8 0.6))
 
         WindowDestroyed wid -> do
             ws <- gets windowset

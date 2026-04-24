@@ -71,20 +71,63 @@ import MCMonad.ManageHook (ManageHook, runManageHook)
 windows :: (WindowSet -> WindowSet) -> M ()
 windows f = do
     old <- gets windowset
+    stickySet <- gets sticky
+
+    -- Record which screen each sticky window is on BEFORE the transformation,
+    -- so we can keep them on the same screen after workspace switches.
+    let stickyScreenMap = if S.null stickySet then M.empty else M.fromList
+            [ (w, W.screen scr)
+            | w <- S.toList stickySet
+            , Just tag <- [W.findTag w old]
+            , scr <- W.current old : W.visible old
+            , W.tag (W.workspace scr) == tag
+            ]
+
     let ws = f old
 
-    -- Compute visibility before and after
-    let oldVisible = allVisibleWindows old
-        newVisible = allVisibleWindows ws
-
-    -- 1. Update state immediately
+    -- 1. Update state immediately + affinity bookkeeping
     modify $ \s -> s { windowset = ws
                      , affinity = updateAffinities ws (affinity s) }
 
+    -- 1b. Sticky: keep sticky windows on their original screen.
+    -- Sticky windows must be floating (same as Sway). When the workspace
+    -- a sticky window was on goes hidden, shift it to whatever workspace
+    -- is now on that screen. Preserve focus if a sticky window was focused.
+    unless (S.null stickySet) $ do
+        ws' <- gets windowset
+        let screenToTag = M.fromList
+                [ (W.screen scr, W.tag (W.workspace scr))
+                | scr <- W.current ws' : W.visible ws'
+                ]
+            ws'' = S.foldl' (\acc w ->
+                case W.findTag w acc of
+                    Just tag
+                        -- Window's workspace is still visible: leave it
+                        | any ((== tag) . W.tag . W.workspace)
+                              (W.current acc : W.visible acc) -> acc
+                        -- Workspace went hidden: move to same screen's new workspace
+                        | otherwise ->
+                            case M.lookup w stickyScreenMap >>= \sid -> M.lookup sid screenToTag of
+                                Just targetTag -> W.shiftWin targetTag w acc
+                                Nothing -> acc  -- screen gone (unplugged), leave hidden
+                    Nothing -> acc
+                ) ws' stickySet
+            -- Preserve focus: if the old focus was a sticky window, re-focus it
+            ws''' = case W.peek old of
+                Just w | S.member w stickySet, W.member w ws'' ->
+                    W.focusWindow w ws''
+                _ -> ws''
+        modify $ \s -> s { windowset = ws''' }
+
+    -- Recompute visibility AFTER sticky adjustments
+    currentAfterSticky <- gets windowset
+    let oldVisible = allVisibleWindows old
+        newVisible = allVisibleWindows currentAfterSticky
+
     conn <- asks connection
 
-    -- 2. Hide windows no longer visible
-    let toHide = filter (`notElem` newVisible) oldVisible
+    -- 2. Hide windows no longer visible (never hide sticky windows)
+    let toHide = filter (\w -> w `notElem` newVisible && not (S.member w stickySet)) oldVisible
     io $ hPutStrLn stderr $ "WINDOWS: oldVisible=" ++ show (length oldVisible) ++ " newVisible=" ++ show (length newVisible) ++ " toHide=" ++ show (map wrWindowId toHide)
     unless (null toHide) $
         io $ sendCommand conn (HideWindows (map wrWindowId toHide))
@@ -128,10 +171,14 @@ windows f = do
     let floatRects = resolveFloating currentWS
 
     -- 6. Send frame assignments
-    let frames = map toFrameAssignment (allRects ++ floatRects)
-    io $ hPutStrLn stderr $ "FRAMES: " ++ show [(wrWindowId w, rect_x r, rect_y r, rect_w r, rect_h r) | (w, r) <- allRects ++ floatRects]
+    let allPositions = allRects ++ floatRects
+        frames = map toFrameAssignment allPositions
+    io $ hPutStrLn stderr $ "FRAMES: " ++ show [(wrWindowId w, rect_x r, rect_y r, rect_w r, rect_h r) | (w, r) <- allPositions]
     unless (null frames) $
         io $ sendCommand conn (SetFrames frames)
+
+    -- 6b. Store window positions for directional focus navigation
+    modify $ \s -> s { windowRects = M.fromList allPositions }
 
     -- 7. Focus the top window (only if focus actually changed)
     currentWS' <- gets windowset
@@ -142,9 +189,13 @@ windows f = do
             Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
             Nothing -> return ()
 
-    -- 8. Send workspace indicator update
+    -- 8. Send workspace indicator update (with mode indicator)
+    mode <- gets inputMode
     let currentTag = W.tag . W.workspace . W.current $ currentWS'
-    io $ sendCommand conn (SetWorkspaceIndicator currentTag)
+        indicator = if mode /= "default"
+                    then currentTag ++ " \x2020"  -- † dagger for non-default mode
+                    else currentTag
+    io $ sendCommand conn (SetWorkspaceIndicator indicator)
 
     -- 9. Warp mouse to center of focused window when screen/workspace changed
     let oldScreen = W.screen (W.current old)
@@ -231,7 +282,12 @@ manageSilent wi hook = do
 unmanage :: WindowRef -> M ()
 unmanage w = do
     ws <- gets windowset
-    when (W.member w ws) $
+    when (W.member w ws) $ do
+        -- Clean from sticky and scratchpads before removing
+        modify $ \s -> s
+            { sticky = S.delete w (sticky s)
+            , scratchpads = M.filter (/= w) (scratchpads s)
+            }
         windows (W.delete' w)
 
 -- ---------------------------------------------------------------------------

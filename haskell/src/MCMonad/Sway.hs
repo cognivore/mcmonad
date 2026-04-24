@@ -8,6 +8,9 @@
 --   instead of pulling the workspace (like Sway, unlike xmonad).
 -- * The layout is an i3-style binary tree of splits (not Tall/Full).
 -- * @mod-b@\/@mod-v@ set split direction, @mod-t@ toggles tabbed.
+-- * @mod-r@ enters resize mode (h\/j\/k\/l resize directionally).
+-- * @mod-w@ toggles sticky (window follows across workspaces).
+-- * Named scratchpads for quake-style toggle windows.
 --
 -- Without 'withSway', mcmonad behaves exactly like xmonad.
 -- With it, mcmonad behaves like Sway.
@@ -26,6 +29,17 @@ module MCMonad.Sway
     , cycleGlobal
       -- * Direction
     , Direction(..)
+      -- * Directional focus
+    , Direction2D(..)
+    , focusDir
+      -- * Input modes
+    , enterMode
+    , exitMode
+    , modeAction
+      -- * Sticky windows
+    , toggleSticky
+      -- * Named scratchpads
+    , toggleScratchpad
       -- * Affinity helpers
     , getAffinity
     , setAffinity
@@ -35,19 +49,23 @@ module MCMonad.Sway
     , findVisible
     ) where
 
+import Control.Monad (when)
 import Data.Bits ((.|.))
-import Data.List (findIndex, sort)
+import Data.List (findIndex, sort, sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import qualified XMonad.Layout as XLayout (Resize(..))
+import Data.Ord (comparing)
+import qualified Data.Set as Set
 import qualified XMonad.StackSet as W
 
 import MCMonad.Core
-import MCMonad.Config (MConfig(..), Modifiers, shiftMask)
+import MCMonad.Config (MConfig(..), Modifiers, shiftMask, controlMask)
 import MCMonad.Config.Keys
 import MCMonad.Layout.I3Tree (I3Layout(..), I3Msg(..), SplitDir(..))
+import MCMonad.IPC (sendCommand, Command(..))
 import MCMonad.Operations
-    ( windows, sendMessage, kill, spawn, withFocused, screenWorkspace )
+    ( windows, sendMessage, kill, spawn, withFocused, screenWorkspace
+    , restart )
 
 -- ---------------------------------------------------------------------------
 -- The combinator
@@ -67,36 +85,52 @@ withSway cfg = cfg
     }
 
 -- | The default Sway layout: an i3-style tree with horizontal initial split.
+-- Titlebar height defaults to 28px for macOS tabbed stacking.
 swayLayout :: Layout WindowRef
-swayLayout = Layout (I3Layout Nothing SplitH 0)
+swayLayout = Layout (I3Layout Nothing SplitH 0 28.0)
 
 -- ---------------------------------------------------------------------------
 -- Sway-style keybindings
 
 -- | Keybinding generator for Sway mode. Uses 'affinityView' instead of
--- 'W.greedyView', adds split/tabbed/parent bindings, and per-output cycling.
+-- 'W.greedyView', adds split/tabbed/parent bindings, per-output cycling,
+-- resize mode, sticky toggle, and scratchpad support.
 swayKeys :: MConfig Layout -> Map (Modifiers, KeyCode) (M ())
 swayKeys conf = Map.fromList $
-    -- Focus
-    [ ((m, kJ),                    windows W.focusDown)
-    , ((m, kK),                    windows W.focusUp)
-    , ((m, kReturn),               windows W.swapMaster)
+    -- Focus / resize (mode-aware: resize mode changes h/j/k/l)
+    -- Normal mode: directional spatial focus (like i3/Sway)
+    -- Resize mode: directional container resize
+    [ ((m, kH),                    modeAction "resize"
+                                       (sendMessage (ResizeDir SplitH (-0.05)))
+                                       (focusDir DirLeft))
+    , ((m, kJ),                    modeAction "resize"
+                                       (sendMessage (ResizeDir SplitV 0.05))
+                                       (focusDir DirDown))
+    , ((m, kK),                    modeAction "resize"
+                                       (sendMessage (ResizeDir SplitV (-0.05)))
+                                       (focusDir DirUp))
+    , ((m, kL),                    modeAction "resize"
+                                       (sendMessage (ResizeDir SplitH 0.05))
+                                       (focusDir DirRight))
+    , ((m, kReturn),               modeAction "resize"
+                                       exitMode
+                                       (spawn (terminal conf)))
     , ((m .|. shiftMask, kJ),      windows W.swapDown)
     , ((m .|. shiftMask, kK),      windows W.swapUp)
 
-    -- Window management
-    , ((m .|. shiftMask, kC),      kill)
-    , ((m .|. shiftMask, kReturn), spawn (terminal conf))
+    -- Kill / restart
+    , ((m .|. shiftMask, kQ),      kill)
+    , ((m .|. shiftMask, kR),      restart)
+
+    -- Resize mode toggle
+    , ((m, kR),                    modeAction "resize" exitMode (enterMode "resize"))
+    , ((m, kEscape),               exitMode)
 
     -- i3/Sway tree operations
     , ((m, kB), sendMessage SetSplitH)     -- next split horizontal
     , ((m, kV), sendMessage SetSplitV)     -- next split vertical
     , ((m, kT), sendMessage ToggleTabbed)  -- toggle tabbed/split
     , ((m, kA), sendMessage FocusParent)   -- focus parent container
-
-    -- Resize
-    , ((m, kH), sendMessage XLayout.Shrink)
-    , ((m, kL), sendMessage XLayout.Expand)
 
     -- Fullscreen toggle (float at full screen or unfloat)
     , ((m, kF), withFocused $ \w -> do
@@ -111,6 +145,15 @@ swayKeys conf = Map.fromList $
             if Map.member w (W.floating ws)
                 then windows (W.sink w)
                 else windows (W.float w (W.RationalRect 0.1 0.1 0.8 0.8)))
+
+    -- Sticky toggle (window follows across workspace switches)
+    , ((m, kW), toggleSticky)
+
+    -- Per-output workspace cycling (Sway's prev_on_output / next_on_output)
+    , ((m, kComma),                    cycleOnOutput Prev)
+    , ((m, kSemicolon),                cycleOnOutput Next)
+    , ((m .|. shiftMask, kComma),      cycleGlobal Prev)
+    , ((m .|. shiftMask, kSemicolon),  cycleGlobal Next)
     ]
     ++
     -- Workspace switching: affinity-aware (THE difference from defaultKeys)
@@ -121,14 +164,110 @@ swayKeys conf = Map.fromList $
     [ ((m .|. shiftMask, key), affinityShift ws')
     | (ws', key) <- zip (mcWorkspaces conf) [k1, k2, k3, k4, k5, k6, k7, k8, k9]
     ]
-    ++
-    -- Screen focus (same as xmonad -- orthogonal to affinity)
-    [ ((mask, key), screenWorkspace sc >>= maybe (return ()) (windows . action))
-    | (key, sc) <- zip [kW, kE, kR] [0..]
-    , (action, mask) <- [(W.view, m), (W.shift, m .|. shiftMask)]
-    ]
   where
     m = modMask conf
+
+-- ---------------------------------------------------------------------------
+-- Input modes
+
+-- | Enter a named input mode (e.g. \"resize\").
+-- On macOS, mode keys still require the modifier (global hotkeys cannot
+-- capture bare keystrokes without blocking all typing).
+enterMode :: String -> M ()
+enterMode mode = do
+    modify $ \s -> s { inputMode = mode }
+    refreshModeIndicator
+
+-- | Return to the default input mode.
+exitMode :: M ()
+exitMode = do
+    modify $ \s -> s { inputMode = "default" }
+    refreshModeIndicator
+
+-- | Update the workspace indicator to reflect the current input mode.
+-- Shows a dagger (†) when in a non-default mode.
+refreshModeIndicator :: M ()
+refreshModeIndicator = do
+    ws <- gets windowset
+    mode <- gets inputMode
+    let tag = W.tag (W.workspace (W.current ws))
+        indicator = if mode /= "default"
+                    then tag ++ " \x2020"
+                    else tag
+    withConnection $ \conn ->
+        io $ sendCommand conn (SetWorkspaceIndicator indicator)
+
+-- | Run different actions depending on the current input mode.
+-- @modeAction \"resize\" resizeAction defaultAction@ runs @resizeAction@
+-- when in resize mode, @defaultAction@ otherwise.
+modeAction :: String -> M () -> M () -> M ()
+modeAction modeName modeAct defaultAct = do
+    mode <- gets inputMode
+    if mode == modeName then modeAct else defaultAct
+
+-- ---------------------------------------------------------------------------
+-- Sticky windows
+
+-- | Toggle sticky status for the focused window. Sticky windows stay
+-- visible on their screen across workspace switches (Sway's @sticky toggle@).
+--
+-- Sticky requires floating (same as Sway/i3). If the window is tiled,
+-- it is auto-floated when made sticky. Focus is preserved across
+-- workspace switches for sticky windows.
+toggleSticky :: M ()
+toggleSticky = withFocused $ \w -> do
+    s <- gets sticky
+    if Set.member w s
+        then modify $ \st -> st { sticky = Set.delete w (sticky st) }
+        else do
+            -- Sticky requires floating — auto-float if tiled
+            ws <- gets windowset
+            when (not $ Map.member w (W.floating ws)) $
+                windows (W.float w (W.RationalRect 0.1 0.1 0.8 0.8))
+            modify $ \st -> st { sticky = Set.insert w (sticky st) }
+
+-- ---------------------------------------------------------------------------
+-- Named scratchpads
+
+-- | Toggle a named scratchpad window. If the scratchpad exists and is on
+-- the current workspace, hide it. If it exists elsewhere, bring it to the
+-- current workspace and float it. If it doesn't exist, spawn @cmd@ and
+-- register the next window created as this scratchpad.
+--
+-- This gives quake-style dropdown behaviour:
+--
+-- @
+-- toggleScratchpad \"terminal\" \"kitty\"
+-- toggleScratchpad \"notes\" \"kitty -e nvim ~\/Notes\"
+-- @
+toggleScratchpad :: String -> String -> M ()
+toggleScratchpad name cmd = do
+    pads <- gets scratchpads
+    case Map.lookup name pads of
+        Just wr -> do
+            ws <- gets windowset
+            if W.member wr ws
+                then do
+                    -- Window exists in the StackSet
+                    let ct = W.currentTag ws
+                    case W.findTag wr ws of
+                        Just tag | tag == ct -> do
+                            -- On current workspace: hide it (move to hidden "NSP" workspace)
+                            windows (W.shift "NSP" . W.focusWindow wr)
+                        _ -> do
+                            -- Elsewhere: bring to current workspace, float it
+                            windows $ \ws' ->
+                                W.float wr (W.RationalRect 0.1 0.05 0.8 0.6)
+                                $ W.shiftWin (W.currentTag ws') wr ws'
+                else do
+                    -- Window was destroyed, clear and re-spawn
+                    modify $ \s -> s { scratchpads = Map.delete name (scratchpads s) }
+                    modify $ \s -> s { pendingScratchpad = Just name }
+                    spawn cmd
+        Nothing -> do
+            -- Not registered yet, spawn and register on creation
+            modify $ \s -> s { pendingScratchpad = Just name }
+            spawn cmd
 
 -- ---------------------------------------------------------------------------
 -- Affinity-aware workspace switching
@@ -237,6 +376,50 @@ setAffinity tag sid =
 clearAffinity :: String -> M ()
 clearAffinity tag =
     modify $ \s -> s { affinity = Map.delete tag (affinity s) }
+
+-- ---------------------------------------------------------------------------
+-- Directional focus (spatial navigation)
+
+-- | Spatial direction for focus/move operations.
+data Direction2D = DirLeft | DirRight | DirUp | DirDown
+    deriving (Eq, Show)
+
+-- | Move focus to the nearest window in the given direction.
+-- Uses window rectangles from the last layout pass for spatial navigation.
+-- This is the core of i3/Sway's h\/j\/k\/l directional focus.
+focusDir :: Direction2D -> M ()
+focusDir dir = do
+    rects <- gets windowRects
+    ws <- gets windowset
+    case W.peek ws of
+        Nothing -> return ()
+        Just focused ->
+            case Map.lookup focused rects of
+                Nothing -> return ()
+                Just fr ->
+                    let fc = rectCenter fr
+                        candidates =
+                            [ (w, rectCenter r)
+                            | (w, r) <- Map.toList rects
+                            , w /= focused
+                            , inDirection dir fc (rectCenter r)
+                            ]
+                        sorted = sortBy (comparing (rectDist fc . snd)) candidates
+                    in case sorted of
+                        ((w, _):_) -> windows (W.focusWindow w)
+                        []         -> return ()
+
+rectCenter :: Rectangle -> (Double, Double)
+rectCenter (Rectangle x y w h) = (x + w / 2, y + h / 2)
+
+inDirection :: Direction2D -> (Double, Double) -> (Double, Double) -> Bool
+inDirection DirLeft  (fx, _) (cx, _) = cx < fx
+inDirection DirRight (fx, _) (cx, _) = cx > fx
+inDirection DirUp    (_, fy) (_, cy) = cy < fy
+inDirection DirDown  (_, fy) (_, cy) = cy > fy
+
+rectDist :: (Double, Double) -> (Double, Double) -> Double
+rectDist (x1, y1) (x2, y2) = (x2 - x1) ** 2 + (y2 - y1) ** 2
 
 -- ---------------------------------------------------------------------------
 -- Pure helpers

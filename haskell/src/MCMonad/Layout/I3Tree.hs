@@ -50,11 +50,16 @@ data ITree a
 
 -- | Messages that 'I3Layout' responds to.
 data I3Msg
-    = SetSplitH       -- ^ Set next split direction to horizontal
-    | SetSplitV       -- ^ Set next split direction to vertical
-    | ToggleTabbed    -- ^ Toggle current container between tabbed and split
-    | FocusParent     -- ^ Move structural focus up the tree
-    | FocusChild      -- ^ Move structural focus down the tree
+    = SetSplitH            -- ^ Set next split direction to horizontal
+    | SetSplitV            -- ^ Set next split direction to vertical
+    | ToggleTabbed         -- ^ Toggle current container between tabbed and split
+    | FocusParent          -- ^ Move structural focus up the tree
+    | FocusChild           -- ^ Move structural focus down the tree
+    | ResizeDir SplitDir Double
+      -- ^ Directional resize: walk up from focused window to find the
+      -- nearest ancestor with matching split direction, adjust weight.
+      -- E.g. @ResizeDir SplitH (-0.05)@ shrinks width,
+      -- @ResizeDir SplitV 0.05@ grows height.
     deriving (Show, Typeable)
 
 instance XCore.Message I3Msg
@@ -70,6 +75,10 @@ data I3Layout a = I3Layout
     , parentDepth :: !Int
     -- ^ How many levels above the focused window's leaf the structural focus
     -- sits. 0 = leaf's direct parent. Incremented by 'FocusParent'.
+    , tabbedBarH  :: !Double
+    -- ^ Height in pixels reserved for each non-focused window's titlebar
+    -- in tabbed containers. macOS windows have native titlebars, so this
+    -- creates a stacked-titlebar effect. Default: 28.0.
     } deriving (Show, Read)
 
 -- ---------------------------------------------------------------------------
@@ -80,7 +89,8 @@ instance LayoutClass I3Layout WindowRef where
     doLayout layout rect stack = do
         let (reconciledTree, _) = reconcile (tree layout) (nextSplit layout) stack
             focused = W.focus stack
-            rects = renderTree focused reconciledTree rect
+            barH = tabbedBarH layout
+            rects = renderTree focused barH reconciledTree rect
             layout' = layout { tree = Just reconciledTree }
         return (rects, Just layout')
 
@@ -118,6 +128,13 @@ instance LayoutClass I3Layout WindowRef where
             return $ Just layout { parentDepth = parentDepth layout + 1 }
         | Just FocusChild <- fromMessage msg =
             return $ Just layout { parentDepth = max 0 (parentDepth layout - 1) }
+        -- Directional resize: find nearest ancestor with matching split direction
+        | Just (ResizeDir dir delta) <- fromMessage msg = do
+            ws <- gets windowset
+            return $ case (W.peek ws, tree layout) of
+                (Just focused, Just t) ->
+                    Just layout { tree = Just (resizeDirAt focused dir delta t) }
+                _ -> Nothing
         -- Resize: adjust weight of the focused child in its parent container
         | Just XLayout.Shrink <- fromMessage msg = do
             ws <- gets windowset
@@ -206,7 +223,37 @@ toggleMode dir (Container Tabbed ws cs)    = Container (Split dir) ws cs
 toggleMode _   t                           = t
 
 -- ---------------------------------------------------------------------------
+-- Tree queries (continued)
+
+-- | Get the tree node at a given path. Returns 'Nothing' if the path
+-- is invalid.
+nodeAtPath :: [Int] -> ITree a -> Maybe (ITree a)
+nodeAtPath [] t = Just t
+nodeAtPath (i:is) (Container _ _ children)
+    | i >= 0, i < length children = nodeAtPath is (children !! i)
+    | otherwise = Nothing
+nodeAtPath _ _ = Nothing
+
+-- ---------------------------------------------------------------------------
 -- Resize
+
+-- | Directional resize: walk up from the focused window to find the nearest
+-- ancestor container with the given split direction, then adjust the focused
+-- subtree's weight in that container.
+resizeDirAt :: Eq a => a -> SplitDir -> Double -> ITree a -> ITree a
+resizeDirAt focused dir delta t = case pathToWindow focused t of
+    Nothing   -> t
+    Just path -> findAndResize (length path - 1) path
+  where
+    findAndResize depth _
+        | depth < 0 = t  -- no matching container found, no change
+    findAndResize depth path' =
+        let containerPath = take depth path'
+            childIdx      = path' !! depth
+        in case nodeAtPath containerPath t of
+            Just (Container (Split d) _ _) | d == dir ->
+                modifyAtPath containerPath (adjustWeight childIdx delta) t
+            _ -> findAndResize (depth - 1) path'
 
 -- | Adjust the weight of the focused window's slot in its parent container.
 resizeAt :: Eq a => a -> Double -> ITree a -> ITree a
@@ -261,36 +308,72 @@ reconcile (Just t) splitDir stack =
         Just t1
             | null new  -> (t1, not (null dead))
             | otherwise ->
-                -- Find a window in the tree to use as insertion target
+                -- Find a window in the tree to use as insertion target.
+                -- W.insertUp makes the NEW window the focus, so W.focus stack
+                -- is the new window (not in the tree). The PREVIOUSLY focused
+                -- window (where the user was when they spawned) is the first
+                -- element of W.down, or failing that, W.up.
                 let focused = W.focus stack
-                    target = if containsWindow focused t1
-                             then focused
-                             else case treeWindows t1 of
-                                     (tw:_) -> tw
-                                     []     -> focused  -- shouldn't happen
+                    oldFocus = case W.down stack of
+                        (w:_) -> w
+                        []    -> case W.up stack of
+                            (w:_) -> w
+                            []    -> focused
+                    target
+                        | containsWindow focused t1  = focused
+                        | containsWindow oldFocus t1 = oldFocus
+                        | otherwise = case treeWindows t1 of
+                            (tw:_) -> tw
+                            []     -> focused
                     t2 = foldl (\tr w -> insertAt w target splitDir tr) t1 new
                 in (t2, True)
 
 -- ---------------------------------------------------------------------------
 -- Rendering
 
--- | Render the tree into (window, rectangle) pairs. For tabbed containers,
--- the child containing the focused window is emitted last (drawn on top).
-renderTree :: Eq a => a -> ITree a -> Rectangle -> [(a, Rectangle)]
-renderTree _ (Leaf w) rect = [(w, rect)]
-renderTree focused (Container (Split dir) weights children) rect =
+-- | Render the tree into (window, rectangle) pairs.
+--
+-- For tabbed containers, non-focused children show only their titlebar
+-- (a strip of @barH@ pixels). The focused child fills the remaining space.
+-- This creates a stacked-titlebar effect using macOS native titlebars.
+renderTree :: Eq a => a -> Double -> ITree a -> Rectangle -> [(a, Rectangle)]
+renderTree _ _ (Leaf w) rect = [(w, rect)]
+renderTree focused barH (Container (Split dir) weights children) rect =
     let rects = splitProportionally dir weights rect
-    in concat [renderTree focused child r | (child, r) <- zip children rects]
-renderTree focused (Container Tabbed _weights children) rect =
-    -- All children get the full rect; focused child comes last (on top)
-    let outputs = map (\child -> renderTree focused child rect) children
-        focusIdx = case findIndex (containsWindow focused) children of
-            Just i  -> i
-            Nothing -> 0
-        n = length outputs
-        reordered = [outputs !! i | i <- [0..n-1], i /= focusIdx]
-                    ++ [outputs !! focusIdx]
-    in concat reordered
+    in concat [renderTree focused barH child r | (child, r) <- zip children rects]
+renderTree focused barH (Container Tabbed _weights children) rect
+    | barH <= 0 =
+        -- No titlebar offset: just stack all, focused on top (fallback)
+        let outputs = map (\child -> renderTree focused barH child rect) children
+            focusIdx = case findIndex (containsWindow focused) children of
+                Just i  -> i
+                Nothing -> 0
+            n = length outputs
+            reordered = [outputs !! i | i <- [0..n-1], i /= focusIdx]
+                        ++ [outputs !! focusIdx]
+        in concat reordered
+    | otherwise =
+        -- Titlebar stacking: non-focused children show barH-height strips
+        -- at the top, focused child fills the remaining space below.
+        let focusIdx = case findIndex (containsWindow focused) children of
+                Just i  -> i
+                Nothing -> 0
+            nonFocused = [(i, c) | (i, c) <- zip [0..] children, i /= focusIdx]
+            nBar = length nonFocused
+            headerH = barH * fromIntegral nBar
+            -- Non-focused: all windows in subtree get the titlebar strip
+            -- (they overlap, but only one titlebar is visible per strip)
+            barResults =
+                [ (w, rect { rect_y = rect_y rect + barH * fromIntegral j
+                           , rect_h = barH })
+                | (j, (_, c)) <- zip [0..] nonFocused
+                , w <- treeWindows c
+                ]
+            -- Focused child fills the rest
+            focusRect = rect { rect_y = rect_y rect + headerH
+                             , rect_h = max barH (rect_h rect - headerH) }
+            focusResults = renderTree focused barH (children !! focusIdx) focusRect
+        in barResults ++ focusResults
 
 -- | Divide a rectangle proportionally among children.
 splitProportionally :: SplitDir -> [Double] -> Rectangle -> [Rectangle]

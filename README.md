@@ -99,6 +99,8 @@ The versioning policy is to just keep adding 9s to the minor version after `0.` 
 
 ## The big idea
 
+<img width="1422" height="711" alt="image" src="https://github.com/user-attachments/assets/34442c06-83de-4a0d-8fe9-b347ff65d615" />
+
 ### From X to M
 
 In 2007, Stewart and Sjanssen published *xmonad: A Tiling Window Manager* (Haskell Workshop '07), which demonstrated that a window manager could be structured as a pure function from events to window configurations, with all mutable state confined to a well-typed monad stack. The core insight was that the `X` monad — `ReaderT XConf (StateT XState IO)` — cleanly separated pure layout computation from X11herc

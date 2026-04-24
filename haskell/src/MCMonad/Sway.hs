@@ -294,6 +294,8 @@ toggleScratchpad name cmd = do
                             windows (W.shift "NSP" . W.focusWindow wr)
                         _ -> do
                             -- Elsewhere: bring to current workspace, restore saved geometry
+                            -- First hide any other visible scratchpads
+                            hideOtherScratchpads name
                             savedRects <- gets scratchpadRects
                             let rr = case Map.lookup name savedRects of
                                         Just r  -> r
@@ -311,6 +313,24 @@ toggleScratchpad name cmd = do
             -- Not registered yet, spawn and register on creation
             modify $ \s -> s { pendingScratchpad = Just name }
             spawn cmd
+
+-- | Hide all scratchpads on the current workspace except the named one.
+hideOtherScratchpads :: String -> M ()
+hideOtherScratchpads except = do
+    pads <- gets scratchpads
+    ws <- gets windowset
+    let ct = W.currentTag ws
+        visible = [ (n, wr) | (n, wr) <- Map.toList pads
+                  , n /= except
+                  , W.findTag wr ws == Just ct ]
+    mapM_ (\(n, wr) -> do
+        ws' <- gets windowset
+        case Map.lookup wr (W.floating ws') of
+            Just rr -> modify $ \s -> s
+                { scratchpadRects = Map.insert n rr (scratchpadRects s) }
+            Nothing -> return ()
+        windows (W.shift "NSP" . W.focusWindow wr)
+        ) visible
 
 -- ---------------------------------------------------------------------------
 -- Affinity-aware workspace switching

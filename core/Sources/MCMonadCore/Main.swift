@@ -8,9 +8,23 @@ private let logger = Logger(subsystem: "com.mcmonad.core", category: "Main")
 @MainActor
 final class EventBridge: SkyLightEventDelegate {
     let socketServer: SocketServer
+    /// Window IDs we have reported as created but not yet destroyed.
+    private var managedWindowIds: Set<UInt32> = []
 
     init(socketServer: SocketServer) {
         self.socketServer = socketServer
+    }
+
+    /// Check all managed windows still exist in the window server.
+    /// Fire windowDestroyed for any that have vanished.
+    func validateWindows() {
+        let stale = managedWindowIds.filter { wid in
+            SkyLightQuery.queryWindow(wid) == nil
+        }
+        for wid in stale {
+            managedWindowIds.remove(wid)
+            socketServer.send(.windowDestroyed(windowId: wid))
+        }
     }
 
     func skyLightEventObserver(
@@ -34,13 +48,16 @@ final class EventBridge: SkyLightEventDelegate {
                 guard info.hasCloseButton else { return }
 
                 observer.subscribeToWindows([windowId])
+                managedWindowIds.insert(windowId)
                 socketServer.send(.windowCreated(info))
             }
 
         case .destroyed(let windowId, _):
+            managedWindowIds.remove(windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .closed(let windowId):
+            managedWindowIds.remove(windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .frameChanged(let windowId):
@@ -50,6 +67,8 @@ final class EventBridge: SkyLightEventDelegate {
 
         case .frontAppChanged(let pid):
             fputs("BRIDGE: frontAppChanged pid=\(pid)\n", stderr)
+            // Validate managed windows — catch closes that SkyLight missed
+            validateWindows()
             socketServer.send(.frontAppChanged(pid: pid))
 
         case .titleChanged:

@@ -143,6 +143,7 @@ enum IPCEvent: Encodable, Sendable {
     case screensChanged(screens: [ScreenInfo])
     case hotkeyPressed(hotkeyId: Int)
     case mouseEnteredWindow(windowId: UInt32, pid: Int32)
+    case windowDragCompleted(windowId: UInt32, pid: Int32, frame: CGRect)
     case ready
 
     func encode(to encoder: Encoder) throws {
@@ -181,6 +182,11 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode("mouse-entered-window", forKey: .event)
             try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
+        case .windowDragCompleted(let windowId, let pid, let frame):
+            try container.encode("window-drag-completed", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
+            try container.encode(pid, forKey: .pid)
+            try container.encode(FlatRect(frame), forKey: .frame)
         case .ready:
             try container.encode("ready", forKey: .event)
         }

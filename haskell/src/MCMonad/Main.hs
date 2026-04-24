@@ -82,6 +82,7 @@ launch cfg = do
                        , scratchpads = Map.empty
                        , pendingScratchpad = Nothing
                        , windowRects = Map.empty
+                       , warpOnSwitch = mouseWarping cfg
                        }
 
     _ <- runM mconf mst0 $ do
@@ -307,9 +308,23 @@ handleEvent debug cfg hotkeyIdMap evt = do
             whenJust mref $ \wref -> unmanage wref
 
         WindowFrameChanged _wid _rect ->
-            -- A window was moved/resized externally (e.g. by the user dragging).
-            -- For now we ignore this; a future version could update floating state.
+            -- SkyLight frame-change events fire constantly (including from our
+            -- own SetFrames). Ignore them — drag completion is handled by the
+            -- explicit WindowDragCompleted event below.
             return ()
+
+        WindowDragCompleted wid pid rect -> do
+            -- User finished an Option+drag move/resize. Auto-float the window
+            -- at its new absolute position (convert to RationalRect).
+            let wr = WindowRef wid pid
+            ws <- gets windowset
+            when (W.member wr ws) $ do
+                let screenR = findScreenForWindow wr ws
+                    rx = toRational ((rect_x rect - rect_x screenR) / rect_w screenR)
+                    ry = toRational ((rect_y rect - rect_y screenR) / rect_h screenR)
+                    rw = toRational (rect_w rect / rect_w screenR)
+                    rh = toRational (rect_h rect / rect_h screenR)
+                windows (W.float wr (W.RationalRect rx ry rw rh))
 
         FrontAppChanged pid -> do
             -- User clicked a window — update StackSet focus WITHOUT sending

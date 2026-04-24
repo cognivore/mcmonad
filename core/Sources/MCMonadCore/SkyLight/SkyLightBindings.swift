@@ -216,12 +216,18 @@ final class SkyLight: @unchecked Sendable {
         let r19 = required("SLSMoveWindow", as: MoveWindowFunc.self)
         let r20 = required("SLSGetWindowBounds", as: GetWindowBoundsFunc.self)
 
-        // Notifications — all required
+        // Notifications — all required (unregister has alternate names on some macOS versions)
         let r21 = required("SLSRegisterConnectionNotifyProc", as: RegisterConnectionNotifyProcFunc.self)
-        let r22 = required("SLSUnregisterConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
+        let r22: UnregisterConnectionNotifyProcFunc? =
+            resolve("SLSUnregisterConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
+            ?? resolve("SLSRemoveConnectionNotifyProc", as: UnregisterConnectionNotifyProcFunc.self)
+        if r22 == nil { missing.append("SLS{Unregister,Remove}ConnectionNotifyProc") }
         let r23 = required("SLSRequestNotificationsForWindows", as: RequestNotificationsForWindowsFunc.self)
         let r24 = required("SLSRegisterNotifyProc", as: RegisterNotifyProcFunc.self)
-        let r25 = required("SLSUnregisterNotifyProc", as: UnregisterNotifyProcFunc.self)
+        let r25: UnregisterNotifyProcFunc? =
+            resolve("SLSUnregisterNotifyProc", as: UnregisterNotifyProcFunc.self)
+            ?? resolve("SLSRemoveNotifyProc", as: UnregisterNotifyProcFunc.self)
+        if r25 == nil { missing.append("SLS{Unregister,Remove}NotifyProc") }
 
         if !missing.isEmpty {
             fatalError("SkyLight missing required symbols: \(missing.joined(separator: ", "))")

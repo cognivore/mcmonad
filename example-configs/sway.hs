@@ -27,6 +27,7 @@ main = mcmonad $ (withSway defaultConfig
     , modMask         = optionMask  -- Mod4/Super maps to Option on macOS
     , mcWorkspaces    = map show [1 :: Int .. 20] ++ ["NSP"]
     , focusFollowsMouse = False
+    , mouseWarping    = False    -- cst disables mouse warping
     , borderWidth     = 0
     })
     { mcKeys = cstKeys }
@@ -88,16 +89,17 @@ cstKeys conf = Map.fromList $
     -- Sticky toggle (Sway's "sticky toggle")
     , ((m, kW),                    toggleSticky)
 
-    -- Launcher (Spotlight on macOS; replace with your preferred launcher)
-    , ((m, kD),                    spawn "open -a 'Spotlight'")
+    -- Launcher (Spotlight on macOS)
+    , ((m, kD),                    spawn "osascript -e 'tell application \"System Events\" to keystroke space using command down'")
 
     -- Quake-style scratchpads
     -- F12: dropdown terminal (like cst's kitty --class=dropdown)
     , ((0, kF12),                  toggleScratchpad "dropdown"
                                        (terminal conf))
     -- Mod+*: floating notes (like cst's vimFloat)
-    -- kKeypadMultiply = 0x43 (keypad asterisk)
-    , ((m, kKeypadMultiply),       toggleScratchpad "notes"
+    -- kBackslash = 0x2A: the ISO key next to Enter — produces * on French AZERTY,
+    -- # on UK, ç on Spanish, etc. This is the physical key sway calls "asterisk".
+    , ((m, kBackslash),            toggleScratchpad "notes"
                                        (terminal conf ++ " -e nvim ~/Notes"))
 
     -- Per-output workspace cycling (Sway's prev_on_output / next_on_output)

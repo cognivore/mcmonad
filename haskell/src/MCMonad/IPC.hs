@@ -138,6 +138,7 @@ data Event
     | ScreensChanged [ScreenInfo]
     | HotkeyPressed !Int
     | MouseEnteredWindow !Word32 !Int32
+    | WindowDragCompleted !Word32 !Int32 !Rectangle
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
@@ -199,6 +200,7 @@ instance Aeson.FromJSON Event where
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"
+                "window-drag-completed" -> WindowDragCompleted <$> v .: "windowId" <*> v .: "pid" <*> v .: "frame"
                 "ready"                -> pure Ready
                 other                  -> fail $ "Unknown event type: " ++ show other
             (_, Just resp) -> case resp of

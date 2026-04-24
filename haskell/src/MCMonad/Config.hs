@@ -77,6 +77,9 @@ data MConfig l = MConfig
       -- ^ Border color for the focused window (hex, e.g. "#ffffff").
     , focusFollowsMouse  :: !Bool
       -- ^ Whether focus follows the mouse pointer.
+    , mouseWarping       :: !Bool
+      -- ^ Whether to warp the mouse cursor to the focused window on
+      -- workspace\/screen changes. Sway disables this.
     , logHook            :: !(M ())
       -- ^ Action run after every state change (e.g. update a status bar).
     , startupHook        :: !(M ())
@@ -100,6 +103,7 @@ defaultConfig = MConfig
     , normalBorderColor  = "#444444"
     , focusedBorderColor = "#ffffff"
     , focusFollowsMouse  = True
+    , mouseWarping       = True
     , logHook            = return ()
     , startupHook        = return ()
     }

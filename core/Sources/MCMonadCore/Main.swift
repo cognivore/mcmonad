@@ -156,8 +156,14 @@ struct MCMonadCoreApp {
             socketServer.send(.screensChanged(screens: screens))
         }
 
-        // Focus-follows-mouse: DISABLED — CGEventTap breaks right-click menus.
-        // Needs a fundamentally different approach (not CGEventTap).
+        // Option+mouse drag: move (LMB) and resize (RMB) windows
+        let dragHandler = MouseDragHandler()
+        dragHandler.onDragCompleted = { windowId, pid, frame in
+            socketServer.send(.windowDragCompleted(
+                windowId: windowId, pid: pid, frame: frame
+            ))
+        }
+        dragHandler.start()
 
         // Start event observer
         eventObserver.start()
@@ -168,7 +174,7 @@ struct MCMonadCoreApp {
         logger.info("mcmonad-core fully initialized")
 
         // Keep references alive for the lifetime of the process
-        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge)
+        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge, dragHandler)
     }
 
     // Static storage to prevent ARC from deallocating services

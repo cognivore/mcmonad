@@ -210,6 +210,9 @@ data MState = MState
     , windowRects      :: !(Map.Map WindowRef Rectangle)
       -- ^ Last known positions of all visible windows (from the most recent
       -- layout pass). Used for directional focus navigation.
+    , warpOnSwitch     :: !Bool
+      -- ^ Whether to warp the mouse cursor to the focused window on
+      -- workspace\/screen changes. Set from config at startup.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's

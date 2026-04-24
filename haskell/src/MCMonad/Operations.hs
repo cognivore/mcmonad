@@ -29,6 +29,7 @@ module MCMonad.Operations
     , rescreen
       -- * Utilities
     , whenJust
+    , findScreenForWindow
     ) where
 
 import Control.Concurrent (forkIO)
@@ -198,19 +199,19 @@ windows f = do
     io $ sendCommand conn (SetWorkspaceIndicator indicator)
 
     -- 9. Warp mouse to center of focused window when screen/workspace changed
-    let oldScreen = W.screen (W.current old)
-        newScreen = W.screen (W.current currentWS')
-        oldTag = W.tag (W.workspace (W.current old))
-        newTag = W.tag (W.workspace (W.current currentWS'))
-    when (oldScreen /= newScreen || oldTag /= newTag) $ do
-        case newFocus of
-            Just w -> do
-                let mRect = lookup w (allRects ++ floatRects)
-                case mRect of
+    doWarp <- gets warpOnSwitch
+    when doWarp $ do
+        let oldScreen = W.screen (W.current old)
+            newScreen = W.screen (W.current currentWS')
+            oldTag = W.tag (W.workspace (W.current old))
+            newTag = W.tag (W.workspace (W.current currentWS'))
+        when (oldScreen /= newScreen || oldTag /= newTag) $
+            case newFocus of
+                Just w -> case lookup w allPositions of
                     Just (Rectangle rx ry rw rh) ->
                         io $ sendCommand conn (WarpMouse (rx + rw / 2) (ry + rh / 2))
                     Nothing -> return ()
-            Nothing -> return ()
+                Nothing -> return ()
 
     -- 10. Update mapped set
     modify $ \s -> s { mapped = S.fromList newVisible }

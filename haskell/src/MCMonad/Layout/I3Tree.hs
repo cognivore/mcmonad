@@ -299,10 +299,16 @@ adjustWeight _ _ t = t
 -- Walk up from the focused leaf to find the nearest container with matching
 -- split direction, then move the window to the adjacent position.
 -- If the target is a leaf, swap. If the target is a container, move into it.
+-- If no matching container exists, force-change the root orientation
+-- (like i3's @ws_force_orientation@).
 moveDirAt :: Eq a => a -> SplitDir -> Int -> ITree a -> ITree a
 moveDirAt focused dir delta t = case pathToWindow focused t of
     Nothing   -> t
-    Just path -> tryMove (length path - 1) path
+    Just path ->
+        let result = tryMove (length path - 1) path
+        in if result == t
+           then forceOrient focused dir delta t
+           else result
   where
     tryMove depth _
         | depth < 0 = t
@@ -317,6 +323,26 @@ moveDirAt focused dir delta t = case pathToWindow focused t of
                             (moveChild focused childIdx targetIdx delta) t
                    else tryMove (depth - 1) path'
             _ -> tryMove (depth - 1) path'
+
+-- | When no container with matching orientation exists, force-change
+-- the root orientation (i3's @ws_force_orientation@). Extracts the focused
+-- window from the tree and places it adjacent under a new root with
+-- the move direction's split.
+--
+-- @H[A, B*]@ + move down → @V[A, B*]@
+-- @H[A, B*, C]@ + move down → @V[H[A, C], B*]@
+forceOrient :: Eq a => a -> SplitDir -> Int -> ITree a -> ITree a
+forceOrient focused dir delta t@(Container (Split d) _ _)
+    | d /= dir =
+        case removeWindow focused t of
+            Nothing -> t  -- focused is the only window
+            Just t' ->
+                let (ws, cs) = if delta > 0
+                        then ([1.0, 1.0], [t', Leaf focused])
+                        else ([1.0, 1.0], [Leaf focused, t'])
+                in flatten (Container (Split dir) ws cs)
+    | otherwise = t  -- same orientation, already at edge
+forceOrient _ _ _ t = t
 
 -- | Move a window between two child positions within a container.
 --

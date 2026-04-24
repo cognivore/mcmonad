@@ -1,8 +1,8 @@
-# McMonad: Have You Ever Wondered What Would Happen if XMonad Wore Clown Shoes
+# McMonad
 
-The ultimate tiling window manager for macOS.
+## Have You Ever Wondered What Would Happen if XMonad Wore Clown Shoes
 
-v0.999
+*v0.999*
 
 ## Abstract
 

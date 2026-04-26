@@ -55,8 +55,10 @@
             '';
             installPhase = ''
               runHook preInstall
-              mkdir -p $out/bin
+              mkdir -p $out/bin $out/Resources
               cp .build/release/mcmonad-core $out/bin/
+              cp Sources/MCMonadCore/Resources/MenuBarIcon.png $out/Resources/
+              cp Sources/MCMonadCore/Resources/MenuBarIcon@2x.png $out/Resources/
               runHook postInstall
             '';
             __impureHostDeps = [

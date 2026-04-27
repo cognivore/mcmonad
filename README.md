@@ -26,7 +26,7 @@ i3-style binary-tree-of-window-splits is enabled with the confusingly-named `wit
 
 ### Switching configs
 
-`Mod-q` recompilation is wired up but **currently requires `MCMONAD_GHC` to be set** — a GHC that has the mcmonad library in its package database. If this is noise, don't worry about it. I personally don't bind `Mod-q`, instead I manually restart once a decade when I change my config.
+`Mod-q` is **not bound** by mcmonad and **you should not bind it** — on Tahoe, in-process `ghc --make` triggers a code-signing kill (see Troubleshooting). Recompile out-of-band; the GHC needs the mcmonad library in its package DB (the home-manager module sets `MCMONAD_GHC` for you; otherwise:
 
 ```bash
 # 1. Get a GHC with mcmonad
@@ -52,6 +52,8 @@ kill $(pgrep -f mcmonad)
 **"The app won't open — 'damaged or incomplete'."** (.app bundle only) `xattr -cr /Applications/McMonad.app` then try again. macOS quarantines unsigned apps.
 
 **"Windows tile but focus doesn't follow."** Check `~/Library/Logs/mcmonad-core.log`. The focus ritual involves four separate private APIs; if one fails, the log says which.
+
+**"My workspace switches sometimes go silent for a few seconds."** Don't bind `Mod-q` to `restart`. Tahoe keys Accessibility grants by `cdhash`, and `ghc --make` produces a fresh one each time, so macOS `SIGKILL`s the recompiled `mcmonad` ~125 ms in (`Launch Constraint Violation`). While the launcher respawns it, macOS's text layer eats Option+2/3/5 as ™/£/∞. Deploy via `home-manager switch`, or recompile out-of-band and `launchctl kickstart -k "gui/$(id -u)/org.nix-community.home.mcmonad"`.
 
 ---
 

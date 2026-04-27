@@ -3,8 +3,15 @@ flake: { config, lib, pkgs, ... }:
 let
   cfg = config.services.mcmonad;
   flakePkgs = flake.packages.${pkgs.stdenv.hostPlatform.system};
-  pkg = flakePkgs.default;
+  app = flakePkgs.mcmonad-app;
   homeDir = config.home.homeDirectory;
+  # macOS TCC keys Accessibility entries by binary path + cdhash. Launching
+  # directly from /nix/store/<hash>/... accumulates orphan rows in System
+  # Settings → Privacy & Security on every home-manager rebuild because the
+  # store path changes. We rsync the self-contained .app bundle to a stable
+  # user path and point launchd at that path so a single TCC entry per
+  # binary is reused across rebuilds.
+  bundlePath = "${homeDir}/Applications/MCMonad.app";
 in
 {
   options.services.mcmonad = {
@@ -28,25 +35,30 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Declarative mcmonad.hs (when configFile is set)
     home.file.".config/mcmonad/mcmonad.hs" = lib.mkIf (cfg.configFile != null) {
       text = cfg.configFile;
     };
-    # Single launchd agent that manages both processes via the launcher script.
-    # The launcher starts mcmonad-core and mcmonad, monitors both, and restarts
-    # whichever dies. The Haskell side also retries connecting to core on its own.
+
+    home.activation.installMcmonadApp =
+      lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+        run mkdir -p ${lib.escapeShellArg "${homeDir}/Applications"}
+        run ${pkgs.rsync}/bin/rsync \
+          --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
+          ${app}/Applications/MCMonad.app/ \
+          ${lib.escapeShellArg bundlePath}/
+        # The launchd plist references stable user paths, so home-manager
+        # won't reload the agent when only the bundle contents change.
+        # Kickstart so the running process picks up the new binaries.
+        run launchctl kickstart -k "gui/$(id -u)/org.nix-community.home.mcmonad" 2>/dev/null || true
+      '';
+
     launchd.agents.mcmonad = {
       enable = true;
       config = {
         ProgramArguments = [
-          "${../scripts/mcmonad-launcher}"
+          "${bundlePath}/Contents/MacOS/mcmonad-launcher"
           "--daemon"
         ];
-        EnvironmentVariables = {
-          MCMONAD_CORE_BIN = "${pkg}/bin/mcmonad-core";
-          MCMONAD_HASKELL_BIN = "${pkg}/bin/mcmonad";
-          MCMONAD_GHC = "${flakePkgs.mcmonad-ghc}/bin/ghc";
-        };
         KeepAlive = true;
         RunAtLoad = true;
         StandardOutPath = "${homeDir}/Library/Logs/mcmonad-launcher.log";

@@ -66,10 +66,16 @@ final class EventBridge: SkyLightEventDelegate {
             }
 
         case .frontAppChanged(let pid):
-            fputs("BRIDGE: frontAppChanged pid=\(pid)\n", stderr)
             // Validate managed windows — catch closes that SkyLight missed
             validateWindows()
-            socketServer.send(.frontAppChanged(pid: pid))
+            // Resolve to a precise WindowFocused via AX when possible.
+            // Falling back to FrontAppChanged keeps coverage when AX
+            // can't be queried for this app.
+            if let wid = AXFocusTracker.focusedWindow(forPid: pid) {
+                socketServer.send(.windowFocused(windowId: wid, pid: pid))
+            } else {
+                socketServer.send(.frontAppChanged(pid: pid))
+            }
 
         case .titleChanged:
             // Title changes are not forwarded over IPC in the current protocol
@@ -150,7 +156,9 @@ struct MCMonadCoreApp {
         }
         displayManager.startObserving()
 
-        // App activation via NSWorkspace (reliable, unlike SkyLight 1508)
+        // App activation via NSWorkspace (reliable, unlike SkyLight 1508).
+        // Resolve to a precise WindowFocused via AX when possible; fall
+        // back to FrontAppChanged when AX can't be queried for the app.
         let workspace = NSWorkspace.shared
         workspace.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -160,9 +168,54 @@ struct MCMonadCoreApp {
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
                     as? NSRunningApplication else { return }
             let pid = app.processIdentifier
-            fputs("NSWORKSPACE: didActivateApplication pid=\(pid)\n", stderr)
             Task { @MainActor in
-                socketServer.send(.frontAppChanged(pid: pid))
+                if let wid = AXFocusTracker.focusedWindow(forPid: pid) {
+                    socketServer.send(.windowFocused(windowId: wid, pid: pid))
+                } else {
+                    socketServer.send(.frontAppChanged(pid: pid))
+                }
+            }
+        }
+
+        // Per-app AX focused-window observers. When a multi-window app
+        // (e.g. LibreWolf) raises a different window — by user click,
+        // Cmd-`, or our own focus command — emit a precise WindowFocused
+        // event carrying the windowId. front-app-changed alone only
+        // carries a PID and cannot disambiguate two windows of the same app.
+        let focusTracker = AXFocusTracker()
+        AXFocusTracker.shared = focusTracker
+        focusTracker.onFocusedWindowChanged = { windowId, pid in
+            socketServer.send(.windowFocused(windowId: windowId, pid: pid))
+        }
+        for app in workspace.runningApplications
+            where app.activationPolicy == .regular
+        {
+            focusTracker.trackApp(pid: app.processIdentifier)
+        }
+        workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication,
+                  app.activationPolicy == .regular
+            else { return }
+            let pid = app.processIdentifier
+            Task { @MainActor in
+                AXFocusTracker.shared?.trackApp(pid: pid)
+            }
+        }
+        workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication else { return }
+            let pid = app.processIdentifier
+            Task { @MainActor in
+                AXFocusTracker.shared?.untrackApp(pid: pid)
             }
         }
 
@@ -202,7 +255,7 @@ struct MCMonadCoreApp {
         logger.info("mcmonad-core fully initialized")
 
         // Keep references alive for the lifetime of the process
-        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge, dragHandler)
+        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge, dragHandler, focusTracker)
     }
 
     // Static storage to prevent ARC from deallocating services

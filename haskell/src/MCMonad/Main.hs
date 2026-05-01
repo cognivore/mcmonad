@@ -3,7 +3,7 @@ module MCMonad.Main
     , launch
     ) where
 
-import Control.Monad (forever, when)
+import Control.Monad (forever, unless, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -328,14 +328,29 @@ handleEvent debug cfg hotkeyIdMap evt = do
                 windows (W.float wr (W.RationalRect rx ry rw rh))
 
         FrontAppChanged pid -> do
-            -- User clicked a window — update StackSet focus WITHOUT sending
-            -- FocusWindow back (macOS already focused it). Avoids feedback loop.
+            -- Swift now resolves activation to a precise WindowFocused
+            -- whenever AX is queryable for the app, so this branch only
+            -- runs when AX failed (permission denied, app not yet ready).
+            -- Best-effort fallback: if focus is already inside this app,
+            -- do nothing; otherwise pick the first window we know of.
             ws <- gets windowset
-            let mref = find (\w -> wrPid w == pid) (W.allWindows ws)
-            case mref of
-                Just wref | W.peek ws /= Just wref ->
-                    modify $ \s -> s { windowset = W.focusWindow wref (windowset s) }
-                _ -> return ()
+            let alreadyInApp = maybe False (\w -> wrPid w == pid) (W.peek ws)
+            unless alreadyInApp $ do
+                let mref = find (\w -> wrPid w == pid) (W.allWindows ws)
+                case mref of
+                    Just wref | W.peek ws /= Just wref ->
+                        modify $ \s -> s { windowset = W.focusWindow wref (windowset s) }
+                    _ -> return ()
+
+        WindowFocused wid pid -> do
+            -- Precise focus event from Swift (either kAXFocusedWindowChanged
+            -- or a synchronous AX query on app activation). Update the
+            -- StackSet without sending FocusWindow back — macOS already
+            -- focused it; echoing would feed back into the AX observer.
+            let wref = WindowRef wid pid
+            ws <- gets windowset
+            when (W.member wref ws && W.peek ws /= Just wref) $
+                modify $ \s -> s { windowset = W.focusWindow wref (windowset s) }
 
         MouseEnteredWindow wid _pid ->
             when (focusFollowsMouse cfg) $ do

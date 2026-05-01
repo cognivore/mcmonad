@@ -135,6 +135,7 @@ data Event
     | WindowDestroyed !Word32
     | WindowFrameChanged !Word32 !Rectangle
     | FrontAppChanged !Int32
+    | WindowFocused !Word32 !Int32
     | ScreensChanged [ScreenInfo]
     | HotkeyPressed !Int
     | MouseEnteredWindow !Word32 !Int32
@@ -197,6 +198,7 @@ instance Aeson.FromJSON Event where
                 "window-destroyed"     -> WindowDestroyed    <$> v .: "windowId"
                 "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
+                "window-focused"       -> WindowFocused      <$> v .: "windowId" <*> v .: "pid"
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"

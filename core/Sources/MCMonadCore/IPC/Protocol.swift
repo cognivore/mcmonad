@@ -140,6 +140,7 @@ enum IPCEvent: Encodable, Sendable {
     case windowDestroyed(windowId: UInt32)
     case windowFrameChanged(windowId: UInt32, frame: CGRect)
     case frontAppChanged(pid: Int32)
+    case windowFocused(windowId: UInt32, pid: Int32)
     case screensChanged(screens: [ScreenInfo])
     case hotkeyPressed(hotkeyId: Int)
     case mouseEnteredWindow(windowId: UInt32, pid: Int32)
@@ -171,6 +172,10 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode(FlatRect(frame), forKey: .frame)
         case .frontAppChanged(let pid):
             try container.encode("front-app-changed", forKey: .event)
+            try container.encode(pid, forKey: .pid)
+        case .windowFocused(let windowId, let pid):
+            try container.encode("window-focused", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
         case .screensChanged(let screens):
             try container.encode("screens-changed", forKey: .event)

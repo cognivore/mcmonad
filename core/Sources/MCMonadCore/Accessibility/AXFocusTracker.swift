@@ -42,10 +42,16 @@ final class AXFocusTracker {
               let observer else { return }
         let appElement = AXUIElementCreateApplication(pid)
         let refcon = UnsafeMutableRawPointer(bitPattern: Int(pid))
-        AXObserverAddNotification(
+        let addResult = AXObserverAddNotification(
             observer, appElement,
             kAXFocusedWindowChangedNotification as CFString, refcon
         )
+        guard addResult == .success else {
+            Self.logger.debug(
+                "AXObserverAddNotification failed for pid \(pid): \(addResult.rawValue)"
+            )
+            return
+        }
         CFRunLoopAddSource(
             CFRunLoopGetMain(),
             AXObserverGetRunLoopSource(observer),
@@ -56,15 +62,39 @@ final class AXFocusTracker {
     }
 
     func untrackApp(pid: pid_t) {
-        if let observer = observers.removeValue(forKey: pid) {
-            // Remove from run loop before releasing
-            CFRunLoopRemoveSource(
-                CFRunLoopGetMain(),
-                AXObserverGetRunLoopSource(observer),
-                .defaultMode
-            )
-            Self.logger.debug("Stopped tracking AX focus for pid \(pid)")
+        guard let observer = observers.removeValue(forKey: pid) else { return }
+        let appElement = AXUIElementCreateApplication(pid)
+        AXObserverRemoveNotification(
+            observer, appElement,
+            kAXFocusedWindowChangedNotification as CFString
+        )
+        CFRunLoopRemoveSource(
+            CFRunLoopGetMain(),
+            AXObserverGetRunLoopSource(observer),
+            .defaultMode
+        )
+        Self.logger.debug("Stopped tracking AX focus for pid \(pid)")
+    }
+
+    /// Synchronously query AX for the currently focused window of an app.
+    /// Returns nil when AX is unavailable for the app (permission denied,
+    /// app not yet AX-ready, no focused window).
+    static func focusedWindow(forPid pid: pid_t) -> UInt32? {
+        let appElement = AXUIElementCreateApplication(pid)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedWindowAttribute as CFString,
+            &focusedRef
+        ) == .success,
+              let focused = focusedRef
+        else { return nil }
+        let element = focused as! AXUIElement
+        var windowId: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &windowId) == .success else {
+            return nil
         }
+        return UInt32(windowId)
     }
 
     nonisolated func handleFocusChange(windowId: UInt32, pid: pid_t) {

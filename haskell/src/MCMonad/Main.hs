@@ -7,9 +7,11 @@ import Control.Monad (forever, unless, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.Text as T
 import Data.Word (Word32)
 import System.Directory (doesFileExist, removeFile)
 import System.Environment (getArgs, lookupEnv)
+import System.Exit (exitSuccess)
 import System.IO (hPutStrLn, stderr)
 import qualified XMonad.StackSet as W
 
@@ -32,6 +34,16 @@ mcmonad = launch
 launch :: MConfig Layout -> IO ()
 launch cfg = do
     args <- getArgs
+
+    -- Print the IPC protocol version and exit. Handled before any IO so
+    -- the launcher can probe a binary's protocol stamp without it
+    -- attempting to start the WM. Old binaries that don't recognise the
+    -- flag will not match the launcher's stamp file check anyway, so
+    -- the launcher just falls back to the bundled binary in that case.
+    when ("--protocol-version" `elem` args) $ do
+        putStrLn (show protocolVersion)
+        exitSuccess
+
     let resuming = "--resume" `elem` args
 
     -- 1. Connect to mcmonad-core
@@ -373,6 +385,17 @@ handleEvent debug cfg hotkeyIdMap evt = do
         Ready                   -> return ()
         QueryWindowsResponse _  -> return ()
         QueryScreensResponse _  -> return ()
+
+        IgnoredEvent name ->
+            -- IPC protocol skew: a wire message we couldn't decode.
+            -- Logged once per occurrence so the user notices, but
+            -- does not crash the loop. Most often hit when a
+            -- Mod-q-compiled binary is older than the running
+            -- mcmonad-core; the launcher's protocol-version stamp
+            -- check should normally prevent that pairing, but this
+            -- is the defence-in-depth.
+            io $ hPutStrLn stderr $
+                "mcmonad: ignoring unknown wire message: " ++ T.unpack name
 
 -- ---------------------------------------------------------------------------
 -- Helpers

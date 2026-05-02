@@ -46,6 +46,34 @@ in
           --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
           ${app}/Applications/MCMonad.app/ \
           ${lib.escapeShellArg bundlePath}/
+
+        # Recompile the user's mcmonad.hs against the freshly installed
+        # mcmonad library, so the Mod-q-compiled custom binary stays in
+        # lock-step with the bundled IPC protocol. Without this step, an
+        # additive IPC change in mcmonad would silently brick anyone who
+        # has ever pressed Mod-q: the launcher prefers the custom binary,
+        # the custom binary speaks the old protocol, and the Haskell
+        # process crash-loops on every new event the bundled core sends.
+        # On compile failure we delete the stale binary + sidecar so the
+        # launcher falls back to the bundled binary; activation does not
+        # abort — the user will see the failure on next login.
+        mcmonad_hs=${lib.escapeShellArg "${homeDir}/.config/mcmonad/mcmonad.hs"}
+        mcmonad_ghc=${lib.escapeShellArg "${bundlePath}/Contents/MacOS/mcmonad-ghc"}
+        case "$(uname -m)" in
+            arm64) mcmonad_arch=aarch64 ;;
+            *)     mcmonad_arch=$(uname -m) ;;
+        esac
+        mcmonad_bin=${lib.escapeShellArg "${homeDir}/.config/mcmonad"}/mcmonad-''${mcmonad_arch}-darwin
+        if [ -f "$mcmonad_hs" ] && [ -x "$mcmonad_ghc" ]; then
+            if "$mcmonad_ghc" --make "$mcmonad_hs" -o "$mcmonad_bin" -v0 \
+                && "$mcmonad_bin" --protocol-version > "$mcmonad_bin.proto"; then
+                :
+            else
+                echo "mcmonad: recompile failed during home-manager activation; removing stale custom binary so the launcher falls back to bundled" >&2
+                rm -f "$mcmonad_bin" "$mcmonad_bin.proto"
+            fi
+        fi
+
         # The launchd plist references stable user paths, so home-manager
         # won't reload the agent when only the bundle contents change.
         # Kickstart so the running process picks up the new binaries.

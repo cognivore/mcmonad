@@ -446,6 +446,13 @@ recompile = do
                         ["--make", src, "-o", bin, "-v0"] ""
                     case exit of
                         ExitSuccess -> do
+                            -- Stamp the binary with our protocol version. The
+                            -- launcher reads this sidecar and refuses to use
+                            -- the custom binary if its stamp doesn't match
+                            -- the bundle's protocol-version resource — that
+                            -- prevents the crash-loop when the IPC has moved
+                            -- on but the user's Mod-q-compiled binary hasn't.
+                            writeFile (bin ++ ".proto") (show protocolVersion)
                             hPutStrLn stderr "mcmonad: recompile succeeded"
                             return True
                         _ -> do
@@ -472,14 +479,35 @@ restart = do
     ok <- io recompile
     unless ok $ io $ hPutStrLn stderr "mcmonad: recompile failed, restarting with old binary"
 
-    -- 3. Determine which binary to exec
+    -- 3. Determine which binary to exec.
+    --    Use the custom binary only when its protocol-version stamp
+    --    matches ours; otherwise fall back to self (the bundled
+    --    binary). Without this check, a failed Mod-q recompile (or a
+    --    stale binary left over from an mcmonad upgrade) would exec a
+    --    binary that speaks the wrong IPC and crash-loop.
     io $ do
         customBin <- getCustomBinary
         hasCustom <- doesFileExist customBin
+        customStampOk <- if hasCustom then checkProtoStamp customBin else return False
         self <- getExecutablePath
-        let bin = if hasCustom then customBin else self
+        let bin = if hasCustom && customStampOk then customBin else self
+        when (hasCustom && not customStampOk) $
+            hPutStrLn stderr $
+                "mcmonad: custom binary " ++ customBin
+                ++ " has missing/mismatched protocol stamp; using bundled"
         hPutStrLn stderr $ "mcmonad: exec " ++ bin ++ " --resume"
         executeFile bin False ["--resume"] Nothing
+  where
+    checkProtoStamp customBin = do
+        let stamp = customBin ++ ".proto"
+        exists <- doesFileExist stamp
+        if not exists
+            then return False
+            else do
+                contents <- readFile stamp
+                case reads contents :: [(Int, String)] of
+                    [(n, _)] -> return (n == protocolVersion)
+                    _        -> return False
 
 -- ---------------------------------------------------------------------------
 -- Screens

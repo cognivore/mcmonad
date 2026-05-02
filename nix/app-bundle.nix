@@ -28,6 +28,13 @@ pkgs.stdenv.mkDerivation {
     cp ${launcherScript} "$APP/MacOS/mcmonad-launcher"
     chmod +x "$APP/MacOS/mcmonad-launcher" "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core"
 
+    # Capture the IPC protocol version from the freshly built binary
+    # (its /nix/store dylib refs still resolve at this point in the
+    # build — we haven't rewritten them yet). The launcher reads this
+    # file at startup to decide whether a Mod-q-compiled custom binary
+    # speaks a compatible protocol.
+    ${mcmonad}/bin/mcmonad --protocol-version > "$APP/Resources/protocol-version"
+
     # --- Collect all Nix dylib dependencies recursively ---
     # Walk the binary and every discovered dylib, collecting /nix/store refs
     collect_dylibs() {
@@ -260,6 +267,17 @@ DIR="\$(cd "\$(dirname "\$0")/.." && pwd)"
 exec "\$DIR/GHC/bin/ghc" -B"\$DIR/GHC/topdir" "\$@"
 GHCWRAPPER
     chmod +x "$APP/MacOS/mcmonad-ghc"
+
+    # 10. The GHC binary has rpath '@loader_path/../lib/aarch64-osx-ghc-9.10.3'
+    # baked in at build time, so from bin/ghc it looks for dylibs under
+    # Contents/GHC/lib/aarch64-osx-ghc-9.10.3. We bundle the GHC libdir as
+    # Contents/GHC/topdir/aarch64-osx-ghc-9.10.3 (because '-B topdir' is
+    # what lets ghc find settings, package.conf.d, etc). Without this
+    # symlink, `mcmonad-ghc --make` fails with "Library not loaded:
+    # @rpath/libHShaskeline...dylib" and the home-manager activation
+    # cannot recompile mcmonad.hs against a bumped library — which means
+    # every IPC-changing mcmonad upgrade silently bricks Mod-q users.
+    ln -s topdir "$GHC_BUNDLE/lib"
 
     echo "  GHC bundled successfully"
 

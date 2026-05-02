@@ -34,21 +34,38 @@ if [ -z "${MCMONAD_GHC:-}" ]; then
     fi
 fi
 
-# Prefer user-compiled custom binary over the bundled default.
-# The custom binary is produced by Mod-q (recompile) and lives at
-# ~/.config/mcmonad/mcmonad-<arch>-<os> using GHC's arch naming
-# (aarch64 for ARM, x86_64 for Intel).
+# Prefer the user-compiled custom binary over the bundled default — but
+# only when its IPC protocol stamp matches the bundle's. The custom
+# binary is produced by Mod-q (recompile) and lives at
+# ~/.config/mcmonad/mcmonad-<arch>-<os> with a sidecar
+# <bin>.proto holding its protocol version. A stamp file shipped in the
+# bundle at Contents/Resources/protocol-version holds the bundled
+# binary's version. When the two disagree (e.g. the user has a Mod-q
+# binary from before an mcmonad upgrade that bumped the IPC), we fall
+# back to the bundled binary instead of crash-looping on every event.
 UNAME_ARCH="$(uname -m)"
 case "$UNAME_ARCH" in
     arm64) GHC_ARCH="aarch64" ;;
     *)     GHC_ARCH="$UNAME_ARCH" ;;
 esac
 CUSTOM_BIN="$HOME/.config/mcmonad/mcmonad-${GHC_ARCH}-darwin"
+CUSTOM_STAMP="$CUSTOM_BIN.proto"
+BUNDLED_STAMP="$APP_DIR/Resources/protocol-version"
+
+HASKELL_BIN="$DEFAULT_HASKELL_BIN"
 if [ -x "$CUSTOM_BIN" ]; then
-    HASKELL_BIN="$CUSTOM_BIN"
-    log "Using custom binary: $CUSTOM_BIN"
-else
-    HASKELL_BIN="$DEFAULT_HASKELL_BIN"
+    if [ -f "$CUSTOM_STAMP" ] && [ -f "$BUNDLED_STAMP" ]; then
+        custom_v=$(tr -d '[:space:]' < "$CUSTOM_STAMP")
+        bundled_v=$(tr -d '[:space:]' < "$BUNDLED_STAMP")
+        if [ -n "$custom_v" ] && [ "$custom_v" = "$bundled_v" ]; then
+            HASKELL_BIN="$CUSTOM_BIN"
+            log "Using custom binary (proto v$custom_v): $CUSTOM_BIN"
+        else
+            log "Custom binary proto v${custom_v:-?} != bundled v${bundled_v:-?}; using bundled"
+        fi
+    else
+        log "Custom binary lacks protocol stamp; using bundled"
+    fi
 fi
 
 install_agent() {

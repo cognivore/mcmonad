@@ -16,6 +16,8 @@ module MCMonad.IPC
     , Event(..)
     , WindowInfo(..)
     , ScreenInfo(..)
+      -- * Protocol versioning
+    , protocolVersion
     ) where
 
 import Control.Concurrent (threadDelay)
@@ -37,6 +39,21 @@ import System.FilePath ((</>))
 import System.IO (hSetBuffering, BufferMode(..), hFlush, hPutStrLn, IOMode(..), stderr)
 
 import MCMonad.Core (Connection(..), Rectangle(..))
+
+-- ---------------------------------------------------------------------------
+-- Protocol version
+
+-- | IPC protocol version. Bump in lock-step with any wire-level change to
+-- 'Event' or 'Command' (new variants, renamed fields, removed fields).
+--
+-- The launcher reads this from the bundled binary's
+-- @Contents/Resources/protocol-version@ and from the custom binary's
+-- @<binary>.proto@ sidecar (written by 'MCMonad.Operations.recompile')
+-- and refuses to run a custom binary whose stamp does not match. That
+-- guard prevents the crash-loop that happens when a Mod-q-compiled
+-- binary lingers across an mcmonad upgrade and speaks the old protocol.
+protocolVersion :: Int
+protocolVersion = 1
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -143,6 +160,11 @@ data Event
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
+    | IgnoredEvent !Text
+      -- ^ A wire message we cannot decode as a known event or response.
+      -- Produced by the parser instead of failing, so an IPC version
+      -- skew (or a future event variant a stale binary doesn't know
+      -- about) drops a single message rather than killing the loop.
     deriving (Show, Generic)
 
 -- | Information about a window, received from the Swift daemon.
@@ -204,12 +226,12 @@ instance Aeson.FromJSON Event where
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"
                 "window-drag-completed" -> WindowDragCompleted <$> v .: "windowId" <*> v .: "pid" <*> v .: "frame"
                 "ready"                -> pure Ready
-                other                  -> fail $ "Unknown event type: " ++ show other
+                other                  -> pure (IgnoredEvent other)
             (_, Just resp) -> case resp of
                 "windows" -> QueryWindowsResponse <$> v .: "windows"
                 "screens" -> QueryScreensResponse <$> v .: "screens"
-                other     -> fail $ "Unknown response type: " ++ show other
-            _ -> fail "Message has neither 'event' nor 'response' key"
+                other     -> pure (IgnoredEvent ("response:" <> other))
+            _ -> pure (IgnoredEvent "<no event or response key>")
 
 -- ---------------------------------------------------------------------------
 -- Connection management

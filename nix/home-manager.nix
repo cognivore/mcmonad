@@ -47,6 +47,29 @@ in
           ${app}/Applications/MCMonad.app/ \
           ${lib.escapeShellArg bundlePath}/
 
+        # Re-sign the bundle with a stable code identity if one is set up
+        # in the user's login keychain. Without this, every Nix rebuild
+        # produces a binary whose adhoc Identifier embeds a fresh content
+        # hash, TCC treats it as a different binary at the same path, and
+        # the AX grant doesn't carry over — windows stop placing until you
+        # re-grant in System Settings. With a self-signed cert (CN=MCMonad)
+        # in the login keychain, the Identifier becomes the cert's CN
+        # (a fixed string) and TCC remembers the grant. If the cert isn't
+        # there, this block no-ops and the bundle keeps its adhoc signature.
+        # To opt in: Keychain Access → Certificate Assistant → Create a
+        # Certificate (Name "MCMonad", Self Signed Root, Code Signing).
+        if /usr/bin/security find-certificate -c MCMonad >/dev/null 2>&1; then
+            mcmonad_app_contents=${lib.escapeShellArg "${bundlePath}/Contents"}
+            for f in \
+                "$mcmonad_app_contents/MacOS/mcmonad-core" \
+                "$mcmonad_app_contents/MacOS/mcmonad" \
+                "$mcmonad_app_contents/Frameworks/"*.dylib; do
+                [ -e "$f" ] || continue
+                /usr/bin/codesign --force --sign MCMonad "$f" 2>/dev/null || \
+                    echo "mcmonad: codesign $f with MCMonad failed; leaving adhoc" >&2
+            done
+        fi
+
         # Recompile the user's mcmonad.hs against the freshly installed
         # mcmonad library, so the Mod-q-compiled custom binary stays in
         # lock-step with the bundled IPC protocol. Without this step, an

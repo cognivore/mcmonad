@@ -65,7 +65,17 @@ in
         esac
         mcmonad_bin=${lib.escapeShellArg "${homeDir}/.config/mcmonad"}/mcmonad-''${mcmonad_arch}-darwin
         if [ -f "$mcmonad_hs" ] && [ -x "$mcmonad_ghc" ]; then
-            if "$mcmonad_ghc" --make "$mcmonad_hs" -o "$mcmonad_bin" -v0 \
+            # Bundled GHC's settings file points at /usr/bin/clang (the
+            # macOS clang stub), which delegates to whatever DEVELOPER_DIR
+            # points at. If the activation inherits DEVELOPER_DIR from a
+            # nix dev shell or similar, clang lookup blows up with "tool
+            # 'clang' not found". Unset DEVELOPER_DIR (and SDKROOT) so the
+            # stub falls back to /Library/Developer/CommandLineTools and
+            # finds the real Xcode CLT clang. CLT is a hard dependency
+            # for the bundled GHC anyway, since GHC was rewritten to use
+            # /usr/bin tools at bundle time.
+            if env -u DEVELOPER_DIR -u SDKROOT \
+                    "$mcmonad_ghc" --make "$mcmonad_hs" -o "$mcmonad_bin" -v0 \
                 && "$mcmonad_bin" --protocol-version > "$mcmonad_bin.proto"; then
                 :
             else

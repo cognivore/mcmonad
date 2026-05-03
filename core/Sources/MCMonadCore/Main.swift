@@ -62,7 +62,11 @@ final class EventBridge: SkyLightEventDelegate {
 
         case .frameChanged(let windowId):
             if let bounds = SkyLight.shared.getWindowBounds(windowId) {
+                FrameLog.emit(source: .observed, windowId: windowId, rect: bounds)
                 socketServer.send(.windowFrameChanged(windowId: windowId, frame: bounds))
+            } else {
+                FrameLog.emit(source: .observed, windowId: windowId,
+                              result: "no-bounds")
             }
 
         case .frontAppChanged(let pid):

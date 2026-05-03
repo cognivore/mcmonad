@@ -55,12 +55,22 @@ final class CommandExecutor {
     // MARK: - Command Implementations
 
     private func executeSetFrames(_ frames: [FrameAssignment]) {
+        // Keep the legacy "CMD: set-frames count=N" line so prior log
+        // analysis tools still grep cleanly. Detailed per-assignment
+        // events come through FrameLog below.
         fputs("CMD: set-frames count=\(frames.count)\n", stderr)
+        FrameLog.emit(source: .cmdSetFramesBegin, extra: "count=\(frames.count)")
         let skylight = SkyLight.shared
 
         // Resolve AX elements once
         let resolved: [(FrameAssignment, AXUIElement)] = frames.compactMap { a in
-            AXWindowService.findAXWindow(windowId: a.windowId, pid: a.pid).map { (a, $0) }
+            if let ax = AXWindowService.findAXWindow(windowId: a.windowId, pid: a.pid) {
+                return (a, ax)
+            } else {
+                FrameLog.emit(source: .cmdAxResolveFail,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame)
+                return nil
+            }
         }
 
         skylight.disableUpdate()
@@ -69,7 +79,11 @@ final class CommandExecutor {
         for (a, ax) in resolved {
             var size = CGSize(width: a.frame.width, height: a.frame.height)
             if let v = AXValueCreate(.cgSize, &size) {
-                AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
+                let err = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
+                FrameLog.emit(source: .cmdAxSize,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              result: err == .success ? "ok" : "err",
+                              extra: "phase=1 axStatus=\(err.rawValue)")
             }
         }
 
@@ -77,7 +91,11 @@ final class CommandExecutor {
         for (a, ax) in resolved {
             var pos = CGPoint(x: a.frame.origin.x, y: a.frame.origin.y)
             if let v = AXValueCreate(.cgPoint, &pos) {
-                AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, v)
+                let err = AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, v)
+                FrameLog.emit(source: .cmdAxPos,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              result: err == .success ? "ok" : "err",
+                              extra: "phase=2 axStatus=\(err.rawValue)")
             }
         }
 
@@ -85,7 +103,11 @@ final class CommandExecutor {
         for (a, ax) in resolved {
             var size = CGSize(width: a.frame.width, height: a.frame.height)
             if let v = AXValueCreate(.cgSize, &size) {
-                AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
+                let err = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
+                FrameLog.emit(source: .cmdAxSize,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              result: err == .success ? "ok" : "err",
+                              extra: "phase=3 axStatus=\(err.rawValue)")
             }
         }
 

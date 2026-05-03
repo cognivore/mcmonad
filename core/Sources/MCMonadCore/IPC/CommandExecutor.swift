@@ -119,6 +119,43 @@ final class CommandExecutor {
         for (_, ax) in resolved {
             AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
         }
+
+        // Phase 5: deterministic readback. Independent of the SkyLight
+        // observer (which is coalesced and silenced for moves inside the
+        // disableUpdate bracket above). Tells us per assignment whether
+        // the window actually ended up where we asked.
+        for (a, _) in resolved {
+            if let actual = skylight.getWindowBounds(a.windowId) {
+                let dx = actual.origin.x - a.frame.origin.x
+                let dy = actual.origin.y - a.frame.origin.y
+                let dw = actual.width    - a.frame.width
+                let dh = actual.height   - a.frame.height
+                // 1.5px tolerance — round-trip through CGFloat / AXValue
+                // can introduce sub-pixel rounding noise.
+                let obeyed = abs(dx) < 1.5 && abs(dy) < 1.5
+                          && abs(dw) < 1.5 && abs(dh) < 1.5
+                FrameLog.emit(
+                    source: .verified,
+                    windowId: a.windowId, pid: a.pid, rect: actual,
+                    result: obeyed ? "obeyed" : "DEFIED",
+                    extra: "want=(\(fmtCoord(a.frame.origin.x)),"
+                         + "\(fmtCoord(a.frame.origin.y)),"
+                         + "\(fmtCoord(a.frame.width)),"
+                         + "\(fmtCoord(a.frame.height))) "
+                         + "delta=(\(fmtCoord(dx)),\(fmtCoord(dy)),"
+                         + "\(fmtCoord(dw)),\(fmtCoord(dh)))"
+                )
+            } else {
+                FrameLog.emit(source: .verified,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              result: "no-bounds")
+            }
+        }
+    }
+
+    private func fmtCoord(_ d: CGFloat) -> String {
+        let s = String(format: "%.1f", Double(d))
+        return s.hasSuffix(".0") ? String(s.dropLast(2)) : s
     }
 
     private func executeFocusWindow(windowId: UInt32, pid: Int32) {

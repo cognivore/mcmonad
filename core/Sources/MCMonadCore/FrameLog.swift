@@ -31,8 +31,17 @@ enum FrameLog {
         case cmdAxResolveFail
 
         // Outcome from the SkyLight observer — ground truth for what
-        // actually happened on screen, post-coalesce
+        // actually happened on screen, post-coalesce. Often silent for
+        // self-initiated moves because of disableUpdate brackets and
+        // observer coalescing — use 'verified' instead for self-moves.
         case observed                // windowMoved/windowResized fired
+
+        // Deterministic per-window readback at the end of executeSetFrames:
+        // queries SkyLight directly for the window's actual bounds and
+        // compares to commanded. Independent of the observer, so it
+        // survives disableUpdate and tells us per-assignment whether
+        // each window obeyed the move.
+        case verified
     }
 
     private static let lock = NSLock()

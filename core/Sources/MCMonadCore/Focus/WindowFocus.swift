@@ -36,23 +36,41 @@ enum WindowFocus {
         // Step 1: Activate the application via NSRunningApplication
         if let app = NSRunningApplication(processIdentifier: pid) {
             app.activate()
+            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
+                          result: "ok")
+        } else {
+            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
+                          result: "no-running-app")
         }
 
         // Step 2: Set front process with private API
         var psn = ProcessSerialNumber()
-        guard getProcessForPID(pid, &psn) == noErr else { return }
-        _ = _SLPSSetFrontProcessWithOptions(&psn, windowId, kCPSUserGenerated)
+        let psnStatus = getProcessForPID(pid, &psn)
+        guard psnStatus == noErr else {
+            FocusLog.emit(source: .cmdFocusSLPS, windowId: windowId, pid: pid,
+                          result: "getProcessForPID-failed", extra: "osStatus=\(psnStatus)")
+            return
+        }
+        let slpsStatus = _SLPSSetFrontProcessWithOptions(&psn, windowId, kCPSUserGenerated)
+        FocusLog.emit(source: .cmdFocusSLPS, windowId: windowId, pid: pid,
+                      result: slpsStatus == noErr ? "ok" : "err",
+                      extra: "osStatus=\(slpsStatus)")
 
         // Step 3: Post synthetic key-window events
         makeKeyWindow(psn: &psn, windowId: windowId)
+        FocusLog.emit(source: .cmdFocusKey, windowId: windowId, pid: pid, result: "ok")
 
         // Step 4: Raise the window via Accessibility
-        raiseWindow(pid: pid, windowId: windowId)
+        let raiseResult = raiseWindow(pid: pid, windowId: windowId)
+        FocusLog.emit(source: .cmdFocusRaise, windowId: windowId, pid: pid,
+                      result: raiseResult)
     }
 
     // MARK: - AXRaise
 
-    private static func raiseWindow(pid: pid_t, windowId: UInt32) {
+    /// Returns a short result tag for FocusLog: "ok", "ax-windows-failed",
+    /// "wid-not-found-among-N", etc. Caller logs.
+    private static func raiseWindow(pid: pid_t, windowId: UInt32) -> String {
         let appElement = AXUIElementCreateApplication(pid)
         var windowsRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -61,7 +79,7 @@ enum WindowFocus {
             &windowsRef
         ) == .success,
         let windows = windowsRef as? [AXUIElement] else {
-            return
+            return "ax-windows-failed"
         }
 
         for window in windows {
@@ -69,9 +87,10 @@ enum WindowFocus {
             if _AXUIElementGetWindow(window, &wid) == .success,
                wid == CGWindowID(windowId) {
                 AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-                return
+                return "ok"
             }
         }
+        return "wid-not-found-among-\(windows.count)"
     }
 
     // MARK: - Synthetic key-window events

@@ -66,9 +66,10 @@ final class EventBridge: SkyLightEventDelegate {
             }
 
         case .frontAppChanged(let pid):
-            fputs("BRIDGE: frontAppChanged pid=\(pid)\n", stderr)
             // Validate managed windows — catch closes that SkyLight missed
             validateWindows()
+            FocusLog.emit(source: .emitFrontAppChanged, pid: pid,
+                          extra: "via=skylightBridge")
             socketServer.send(.frontAppChanged(pid: pid))
 
         case .titleChanged:
@@ -160,8 +161,11 @@ struct MCMonadCoreApp {
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
                     as? NSRunningApplication else { return }
             let pid = app.processIdentifier
-            fputs("NSWORKSPACE: didActivateApplication pid=\(pid)\n", stderr)
+            FocusLog.emit(source: .nsWorkspaceActivation, pid: pid,
+                          extra: "appBundleId=\(app.bundleIdentifier ?? "-")")
             Task { @MainActor in
+                FocusLog.emit(source: .emitFrontAppChanged, pid: pid,
+                              extra: "via=nsWorkspaceActivation")
                 socketServer.send(.frontAppChanged(pid: pid))
             }
         }

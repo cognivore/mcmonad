@@ -285,7 +285,7 @@ private func decodeRawEvent(
     case .frontmostApplicationChanged:
         guard let pid = readInt32(from: data, length: length, offset: 0)
         else { return .malformed }
-        fputs("SKYLIGHT: frontmostApplicationChanged pid=\(pid)\n", stderr)
+        FocusLog.emit(source: .skylightFrontmost, pid: pid)
         return .event(.frontAppChanged(pid: pid))
 
     case .windowTitleChanged:

@@ -100,7 +100,7 @@ final class CommandExecutor {
     }
 
     private func executeFocusWindow(windowId: UInt32, pid: Int32) {
-        fputs("CMD: focus-window wid=\(windowId) pid=\(pid)\n", stderr)
+        FocusLog.emit(source: .cmdFocusWindow, windowId: windowId, pid: pid)
         WindowFocus.focusWindow(pid: pid, windowId: windowId)
     }
 

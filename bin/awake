@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# awake — keep a MacBook awake with the lid closed for a bounded duration,
+# then put it cleanly back to sleep.
+#
+# Disables `pmset disablesleep`, blocks idle sleep with `caffeinate -s -i`,
+# and locks the display (`pmset displaysleepnow`). Restores defaults on
+# exit (whether timed-out, Ctrl-C'd, or killed). Durations over 45 minutes
+# require --force because the laptop heats up in a closed bag.
+
+set -euo pipefail
+
+MINUTES=""
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --force) FORCE=true; shift ;;
+    -h|--help)
+      echo "Usage: awake <minutes> [--force]"
+      echo "  Keeps your MacBook awake with the lid closed for the specified duration."
+      echo "  Durations over 45 minutes require --force (heat risk in a closed bag)."
+      exit 0 ;;
+    *)
+      if [[ -z "$MINUTES" ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
+        MINUTES="$1"; shift
+      else
+        echo "Usage: awake <minutes> [--force]" >&2; exit 1
+      fi ;;
+  esac
+done
+
+if [[ -z "$MINUTES" ]]; then
+  echo "Usage: awake <minutes> [--force]" >&2
+  echo "  Keeps your MacBook awake with the lid closed for the specified duration." >&2
+  echo "  Durations over 45 minutes require --force (heat risk in a closed bag)." >&2
+  exit 1
+fi
+
+if [[ "$MINUTES" -gt 45 ]] && [[ "$FORCE" != true ]]; then
+  echo "ERROR: Duration over 45 minutes requires --force flag." >&2
+  echo "  Your laptop will get hot in a closed bag. Are you sure?" >&2
+  echo "  Usage: awake $MINUTES --force" >&2
+  exit 1
+fi
+
+echo ""
+echo "=== AWAKE PLAN ==="
+echo ""
+echo "  Duration:     $MINUTES minutes"
+echo "  Lid sleep:    DISABLED  (pmset -b disablesleep 1)"
+echo "  System sleep: BLOCKED   (caffeinate -s -i)"
+echo "  Screen:       LOCKED    (pmset displaysleepnow)"
+echo ""
+echo "After $MINUTES minutes, all settings will be restored to safe defaults."
+echo ""
+echo "NOTE: Make sure 'Require password after screen saver begins or display"
+echo "      is turned off' is enabled in System Settings > Lock Screen."
+echo ""
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "ERROR: awake must be run as root (sudo awake ...)" >&2
+  exit 1
+fi
+
+echo "Press ENTER to start. Your screen will lock and everything keeps running."
+read -r
+
+CAFF_PID=""
+
+cleanup() {
+  # Disable errexit inside the trap: pkill returns 1 when nothing matches,
+  # kill returns 1 on an already-dead pid, etc. We want every restore step
+  # to run regardless of earlier ones failing.
+  set +e
+  if [[ -n "$CAFF_PID" ]]; then
+    kill "$CAFF_PID" 2>/dev/null
+    wait "$CAFF_PID" 2>/dev/null
+  fi
+  pkill -P $$ caffeinate 2>/dev/null
+  pmset -b disablesleep 0
+  echo ""
+  echo "Restored safe defaults."
+}
+
+trap cleanup EXIT
+
+pmset -b disablesleep 1
+
+echo "Awake mode ACTIVE. Locking screen now..."
+sleep 1
+pmset displaysleepnow
+
+caffeinate -s -i -t $((MINUTES * 60)) &
+CAFF_PID=$!
+
+wait "$CAFF_PID" 2>/dev/null || true
+
+echo ""
+echo "Timer expired after $MINUTES minutes. Putting machine to sleep..."
+# `pmset sleepnow` is denied while `disablesleep=1` (IOKit returns
+# kIOReturnNotPermitted, 0xe00002e2). Restore defaults FIRST, then sleep.
+trap - EXIT
+cleanup
+pmset sleepnow

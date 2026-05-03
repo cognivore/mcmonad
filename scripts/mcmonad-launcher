@@ -120,6 +120,12 @@ run_daemon() {
         log "Shutting down"
         kill "$CORE_PID" "$HASKELL_PID" 2>/dev/null || true
         wait "$CORE_PID" "$HASKELL_PID" 2>/dev/null || true
+        # Without this exit, the trap returns to run_daemon's while
+        # loop, which sees the children dead, logs "X died, restarting"
+        # and respawns them — orphaning the daemon from launchd. Exit
+        # cleanly instead; launchd's KeepAlive=true brings the launcher
+        # back as a fresh process.
+        exit 0
     }
     trap cleanup TERM INT
 

@@ -73,6 +73,25 @@ final class CommandExecutor {
             }
         }
 
+        // Pre-move snapshot. If a window already lives at the hide
+        // position (5128, 0) before this set-frames touches it, we'll
+        // see it here — disambiguating "this set-frames bumped it"
+        // from "it was pinned before we started".
+        for (a, _) in resolved {
+            if let preBounds = skylight.getWindowBounds(a.windowId) {
+                FrameLog.emit(source: .preMove,
+                              windowId: a.windowId, pid: a.pid, rect: preBounds,
+                              extra: "want=(\(fmtCoord(a.frame.origin.x)),"
+                                   + "\(fmtCoord(a.frame.origin.y)),"
+                                   + "\(fmtCoord(a.frame.width)),"
+                                   + "\(fmtCoord(a.frame.height)))")
+            } else {
+                FrameLog.emit(source: .preMove,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              result: "no-bounds")
+            }
+        }
+
         skylight.disableUpdate()
 
         // Phase 1: Set all sizes (prevents overlaps that clamp sizes)
@@ -214,12 +233,24 @@ final class CommandExecutor {
 
         for wid in windowIds {
             if let snap = SkyLightQuery.queryWindow(wid) {
+                let target = CGRect(x: hideX, y: 0,
+                                    width: snap.frame.width, height: snap.frame.height)
+                FrameLog.emit(source: .cmdHideMove,
+                              windowId: wid, pid: snap.pid, rect: target,
+                              extra: "from=(\(fmtCoord(snap.frame.origin.x)),"
+                                   + "\(fmtCoord(snap.frame.origin.y)),"
+                                   + "\(fmtCoord(snap.frame.width)),"
+                                   + "\(fmtCoord(snap.frame.height))) hideX=\(fmtCoord(hideX))")
                 AXWindowService.setFrame(
-                    CGRect(x: hideX, y: 0, width: snap.frame.width, height: snap.frame.height),
+                    target,
                     windowId: wid,
                     pid: snap.pid,
                     currentHint: snap.frame
                 )
+            } else {
+                FrameLog.emit(source: .cmdHideMove,
+                              windowId: wid, result: "no-snap",
+                              extra: "hideX=\(fmtCoord(hideX))")
             }
         }
     }

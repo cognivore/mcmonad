@@ -22,6 +22,13 @@ enum FrameLog {
         // Inbound command from Haskell
         case cmdSetFramesBegin       // entry to executeSetFrames
 
+        // Per-assignment SkyLight read BEFORE we issue any AX writes
+        // for this set-frames. Lets us see if the window was already
+        // pinned somewhere unexpected (e.g. hide-position 5128) before
+        // we even started, vs. a position that this set-frames is
+        // about to bump it to.
+        case preMove
+
         // Per-assignment AX writes (every assignment emits 3: size/pos/size
         // across the three phases that mirror executeSetFrames)
         case cmdAxSize               // AXUIElementSetAttributeValue(kAXSize)
@@ -29,6 +36,12 @@ enum FrameLog {
 
         // Per-assignment AX element resolution failure (window not findable)
         case cmdAxResolveFail
+
+        // Per-window invocation of AXWindowService.setFrame from
+        // executeHideWindows. Tags the move that parks a window off-screen
+        // so we can correlate "wid X was hidden at seq=A" with "wid X
+        // appears pinned at the hide position from seq=A onward".
+        case cmdHideMove
 
         // Outcome from the SkyLight observer — ground truth for what
         // actually happened on screen, post-coalesce. Often silent for

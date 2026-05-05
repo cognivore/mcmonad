@@ -78,9 +78,11 @@ final class CommandExecutor {
         // see it here — disambiguating "this set-frames bumped it"
         // from "it was pinned before we started".
         for (a, _) in resolved {
+            let tHash = TitleHash.hash(windowId: a.windowId, pid: a.pid)
             if let preBounds = skylight.getWindowBounds(a.windowId) {
                 FrameLog.emit(source: .preMove,
                               windowId: a.windowId, pid: a.pid, rect: preBounds,
+                              tHash: tHash,
                               extra: "want=(\(fmtCoord(a.frame.origin.x)),"
                                    + "\(fmtCoord(a.frame.origin.y)),"
                                    + "\(fmtCoord(a.frame.width)),"
@@ -88,6 +90,7 @@ final class CommandExecutor {
             } else {
                 FrameLog.emit(source: .preMove,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              tHash: tHash,
                               result: "no-bounds")
             }
         }
@@ -101,6 +104,7 @@ final class CommandExecutor {
                 let err = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
                 FrameLog.emit(source: .cmdAxSize,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
                               extra: "phase=1 axStatus=\(err.rawValue)")
             }
@@ -113,6 +117,7 @@ final class CommandExecutor {
                 let err = AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, v)
                 FrameLog.emit(source: .cmdAxPos,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
                               extra: "phase=2 axStatus=\(err.rawValue)")
             }
@@ -125,6 +130,7 @@ final class CommandExecutor {
                 let err = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
                 FrameLog.emit(source: .cmdAxSize,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
                               extra: "phase=3 axStatus=\(err.rawValue)")
             }
@@ -144,6 +150,7 @@ final class CommandExecutor {
         // disableUpdate bracket above). Tells us per assignment whether
         // the window actually ended up where we asked.
         for (a, _) in resolved {
+            let tHash = TitleHash.hash(windowId: a.windowId, pid: a.pid)
             if let actual = skylight.getWindowBounds(a.windowId) {
                 let dx = actual.origin.x - a.frame.origin.x
                 let dy = actual.origin.y - a.frame.origin.y
@@ -156,6 +163,7 @@ final class CommandExecutor {
                 FrameLog.emit(
                     source: .verified,
                     windowId: a.windowId, pid: a.pid, rect: actual,
+                    tHash: tHash,
                     result: obeyed ? "obeyed" : "DEFIED",
                     extra: "want=(\(fmtCoord(a.frame.origin.x)),"
                          + "\(fmtCoord(a.frame.origin.y)),"
@@ -167,6 +175,7 @@ final class CommandExecutor {
             } else {
                 FrameLog.emit(source: .verified,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              tHash: tHash,
                               result: "no-bounds")
             }
         }
@@ -178,7 +187,8 @@ final class CommandExecutor {
     }
 
     private func executeFocusWindow(windowId: UInt32, pid: Int32) {
-        FocusLog.emit(source: .cmdFocusWindow, windowId: windowId, pid: pid)
+        FocusLog.emit(source: .cmdFocusWindow, windowId: windowId, pid: pid,
+                      tHash: TitleHash.hash(windowId: windowId, pid: pid))
         WindowFocus.focusWindow(pid: pid, windowId: windowId)
     }
 
@@ -237,6 +247,7 @@ final class CommandExecutor {
                                     width: snap.frame.width, height: snap.frame.height)
                 FrameLog.emit(source: .cmdHideMove,
                               windowId: wid, pid: snap.pid, rect: target,
+                              tHash: TitleHash.hash(windowId: wid, pid: snap.pid),
                               extra: "from=(\(fmtCoord(snap.frame.origin.x)),"
                                    + "\(fmtCoord(snap.frame.origin.y)),"
                                    + "\(fmtCoord(snap.frame.width)),"

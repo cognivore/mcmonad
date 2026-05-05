@@ -54,18 +54,22 @@ final class EventBridge: SkyLightEventDelegate {
 
         case .destroyed(let windowId, _):
             managedWindowIds.remove(windowId)
+            TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .closed(let windowId):
             managedWindowIds.remove(windowId)
+            TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .frameChanged(let windowId):
             if let bounds = SkyLight.shared.getWindowBounds(windowId) {
-                FrameLog.emit(source: .observed, windowId: windowId, rect: bounds)
+                FrameLog.emit(source: .observed, windowId: windowId, rect: bounds,
+                              tHash: TitleHash.hash(windowId: windowId))
                 socketServer.send(.windowFrameChanged(windowId: windowId, frame: bounds))
             } else {
                 FrameLog.emit(source: .observed, windowId: windowId,
+                              tHash: TitleHash.hash(windowId: windowId),
                               result: "no-bounds")
             }
 
@@ -76,9 +80,11 @@ final class EventBridge: SkyLightEventDelegate {
                           extra: "via=skylightBridge")
             socketServer.send(.frontAppChanged(pid: pid))
 
-        case .titleChanged:
-            // Title changes are not forwarded over IPC in the current protocol
-            break
+        case .titleChanged(let windowId):
+            // Title changes are not forwarded over IPC in the current
+            // protocol, but we drop the cached hash so the next
+            // FRAME/FOCUS line for this window picks up the new title.
+            TitleHash.invalidate(windowId: windowId)
         }
     }
 }

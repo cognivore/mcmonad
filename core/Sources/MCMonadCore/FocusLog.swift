@@ -8,11 +8,12 @@ import ApplicationServices
 /// ~/Library/Logs/mcmonad-core.log.
 ///
 /// Format:
-///   FOCUS seq=<n> src=<source> wid=<id|-> pid=<pid|-> axTrusted=<YES|NO> [result=<...>] [extra...]
+///   FOCUS seq=<n> src=<source> wid=<id|-> pid=<pid|-> axTrusted=<YES|NO> [tHash=<...>] [result=<...>] [extra...]
 ///
 /// Use `grep '^FOCUS '` on the log to extract just the focus timeline; the
 /// monotonic seq lets you order events globally even when they originate
-/// on different threads.
+/// on different threads. `tHash` (when present) is the salted, truncated
+/// SHA-256 from `TitleHash` — never a raw title.
 enum FocusLog {
     enum Source: String {
         // macOS-originated focus signals (we receive these)
@@ -47,6 +48,7 @@ enum FocusLog {
         source: Source,
         windowId: UInt32? = nil,
         pid: pid_t? = nil,
+        tHash: String? = nil,
         result: String? = nil,
         extra: String? = nil
     ) {
@@ -56,6 +58,7 @@ enum FocusLog {
         line += " wid=" + (windowId.map { String($0) } ?? "-")
         line += " pid=" + (pid.map { String($0) } ?? "-")
         line += " axTrusted=\(trusted ? "YES" : "NO")"
+        if let tHash = tHash { line += " tHash=\(tHash)" }
         if let result = result { line += " result=\(result)" }
         if let extra = extra { line += " " + extra }
         fputs(line + "\n", stderr)

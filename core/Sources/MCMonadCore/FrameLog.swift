@@ -6,17 +6,17 @@ import CoreGraphics
 /// AX position/size write, and every SkyLight-observed move/resize.
 ///
 /// Format:
-///   FRAME seq=<n> src=<source> wid=<id|-> pid=<pid|-> rect=<(x,y,w,h)|-> [result=<...>] [extra...]
+///   FRAME seq=<n> src=<source> wid=<id|-> pid=<pid|-> rect=<(x,y,w,h)|-> [tHash=<...>] [result=<...>] [extra...]
 ///
 /// The seq is monotonic across the process and independent from FocusLog's
 /// seq, so a join on (timestamp, wid) is the way to correlate the two
 /// streams.
 ///
-/// **NEVER include window titles in log output.** The user's window titles
-/// commonly contain sensitive identifiers (contract names, document
-/// content, internal project names). If a future call site needs per-window
-/// disambiguation beyond (windowId, pid), add a stable hash here — do not
-/// log raw text.
+/// **NEVER include raw window titles in log output.** The user's window
+/// titles commonly contain sensitive identifiers (contract names, document
+/// content, internal project names). For per-window disambiguation beyond
+/// (windowId, pid), pass `tHash:` — the salted, truncated SHA-256 from
+/// `TitleHash.hash(...)`. Do not log raw title text.
 enum FrameLog {
     enum Source: String {
         // Inbound command from Haskell
@@ -71,6 +71,7 @@ enum FrameLog {
         windowId: UInt32? = nil,
         pid: Int32? = nil,
         rect: CGRect? = nil,
+        tHash: String? = nil,
         result: String? = nil,
         extra: String? = nil
     ) {
@@ -83,6 +84,7 @@ enum FrameLog {
         } else {
             line += " rect=-"
         }
+        if let tHash = tHash { line += " tHash=\(tHash)" }
         if let result = result { line += " result=\(result)" }
         if let extra = extra { line += " " + extra }
         fputs(line + "\n", stderr)

@@ -3,9 +3,10 @@
 # then put it cleanly back to sleep.
 #
 # Disables `pmset disablesleep`, blocks idle sleep with `caffeinate -s -i`,
-# and locks the display (`pmset displaysleepnow`). Restores defaults on
-# exit (whether timed-out, Ctrl-C'd, or killed). Durations over 45 minutes
-# require --force because the laptop heats up in a closed bag.
+# locks the session via Ctrl+Cmd+Q (the macOS Lock Screen shortcut), and
+# turns off the backlight with `pmset displaysleepnow`. Restores defaults
+# on exit (whether timed-out, Ctrl-C'd, or killed). Durations over 45
+# minutes require --force because the laptop heats up in a closed bag.
 
 set -euo pipefail
 
@@ -49,12 +50,14 @@ echo ""
 echo "  Duration:     $MINUTES minutes"
 echo "  Lid sleep:    DISABLED  (pmset -b disablesleep 1)"
 echo "  System sleep: BLOCKED   (caffeinate -s -i)"
-echo "  Screen:       LOCKED    (pmset displaysleepnow)"
+echo "  Screen:       LOCKED    (Ctrl+Cmd+Q, then pmset displaysleepnow)"
 echo ""
 echo "After $MINUTES minutes, all settings will be restored to safe defaults."
 echo ""
-echo "NOTE: Make sure 'Require password after screen saver begins or display"
-echo "      is turned off' is enabled in System Settings > Lock Screen."
+echo "NOTE: The first run needs Accessibility permission for your terminal"
+echo "      (System Settings > Privacy & Security > Accessibility). Without"
+echo "      it, awake falls back to the screen saver, which only locks if"
+echo "      'Require password after screen saver begins' is enabled."
 echo ""
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "ERROR: awake must be run as root (sudo awake ...)" >&2
@@ -85,7 +88,27 @@ trap cleanup EXIT
 
 pmset -b disablesleep 1
 
+CONSOLE_USER="${SUDO_USER:-$(stat -f%Su /dev/console)}"
+CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+
+lock_screen() {
+  # Ctrl+Cmd+Q is macOS's real Lock Screen shortcut — it engages the
+  # loginwindow immediately, independent of "Require password after
+  # sleep" timings. `pmset displaysleepnow` only kills the backlight
+  # and does not, on its own, lock the session.
+  if launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" osascript -e \
+       'tell application "System Events" to keystroke "q" using {control down, command down}' \
+       >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "WARN: Ctrl+Cmd+Q failed — grant Accessibility to your terminal for instant lock." >&2
+  echo "      Falling back to screen saver (locks only if 'Require password' is enabled)." >&2
+  launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
+    open -a /System/Library/CoreServices/ScreenSaverEngine.app || true
+}
+
 echo "Awake mode ACTIVE. Locking screen now..."
+lock_screen
 sleep 1
 pmset displaysleepnow
 

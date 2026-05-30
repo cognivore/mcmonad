@@ -57,6 +57,7 @@ import MCMonad
 import MCMonad.Config.Keys
 import MCMonad.Compat.XMonadContrib (XMonadWrapper(..))
 import qualified XMonad.Layout.ThreeColumns as XMonad
+import XMonad.Layout (ChangeLayout(..))
 import qualified Data.Map.Strict as Map
 import Data.Bits ((.|.))
 
@@ -86,7 +87,7 @@ extraWsKeys =
 
 myKeys :: MConfig Layout -> Map.Map (Modifiers, KeyCode) (M ())
 myKeys conf =
-    Map.fromList extras `Map.union` defaultKeys conf
+    Map.fromList extras `Map.union` Map.delete (m, kSpace) (defaultKeys conf)
   where
     m = modMask conf
     extras =
@@ -112,6 +113,8 @@ myKeys conf =
 
         , ((m, kD),                    toggleScratchpad "dropdown"
                                            (terminal conf))
+
+        , ((m, kP),                    sendMessage NextLayout)
         ]
 ```
 
@@ -123,9 +126,13 @@ A few notes on the keymap:
 - `Opt+Shift+c` is intentionally **excluded** from "shift window to
   workspace c" — the default keymap binds it to "kill focused
   window", and we want to keep that.
-- `Map.fromList extras `Map.union` defaultKeys conf` puts `extras`
-  first: in `Data.Map`, the **left** map wins on conflict, so the
-  user bindings override defaults rather than the other way around.
+- `Map.fromList extras `Map.union` Map.delete (m, kSpace) (defaultKeys conf)`
+  puts `extras` first: in `Data.Map`, the **left** map wins on
+  conflict, so the user bindings override defaults rather than the
+  other way around. We also `Map.delete` the default `Opt-Space →
+  NextLayout` binding so mcmonad's Carbon hotkey grab doesn't
+  intercept Option+Space — which collides with macOS Spotlight on
+  recent versions. `Opt-p` is bound to `NextLayout` instead.
 
 ---
 
@@ -240,6 +247,7 @@ The new workspaces should respond immediately:
 | `Opt-s` on a window | Toggle "sticky" (window follows you across workspaces) |
 | `Opt-f` on a window | Toggle full-screen float / sink back to tile |
 | `Opt-d` | Toggle Ghostty dropdown scratchpad |
+| `Opt-p` | Cycle to next layout (replaces the default `Opt-Space`) |
 | `Opt-1` … `Opt-9`, `Opt-0` | Numeric workspaces still work |
 
 If a key does nothing, check `~/Library/Logs/mcmonad.log` for a

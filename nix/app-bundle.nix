@@ -282,6 +282,70 @@ GHCWRAPPER
     echo "  GHC bundled successfully"
 
     # ===================================================================
+    # Bundle dylibs needed by GHC topdir libraries
+    # ===================================================================
+    # Haskell runtime + package libs under Contents/GHC/topdir/**.dylib
+    # still carry their original /nix/store/... load commands (libffi,
+    # gmp, ncurses, libiconv, libX11 et al pulled in by xmonad-contrib).
+    # End users without /nix/store hit dyld abort the moment ghc loads
+    # one of these — which is every time Mod-q recompiles a user
+    # config. Walk the dep graph from every topdir dylib, bundle
+    # missing deps into Frameworks/, rewrite refs.
+    echo ""
+    echo "=== Bundling dylibs for GHC topdir libraries ==="
+
+    TOPDIR_DYLIBS=()
+    while IFS= read -r d; do
+      TOPDIR_DYLIBS+=("$d")
+    done < <(find "$GHC_TOPDIR" -name "*.dylib" -type f)
+    echo "  Found ''${#TOPDIR_DYLIBS[@]} topdir dylibs"
+
+    if [ ''${#TOPDIR_DYLIBS[@]} -gt 0 ]; then
+      TOPDIR_DEPS=$(collect_dylibs "''${TOPDIR_DYLIBS[@]}")
+      for dylib in $TOPDIR_DEPS; do
+        base=$(basename "$dylib")
+        if [ ! -f "$APP/Frameworks/$base" ]; then
+          echo "    Bundling (topdir): $base"
+          cp "$dylib" "$APP/Frameworks/$base"
+          chmod 755 "$APP/Frameworks/$base"
+        fi
+      done
+
+      # Rewrite refs in each topdir dylib. Depth from
+      # Contents/GHC/topdir/aarch64-osx-ghc-X.Y.Z/foo.dylib to
+      # Contents/Frameworks/ is three levels up.
+      echo "  Rewriting rpaths in topdir dylibs..."
+      for dylib in "''${TOPDIR_DYLIBS[@]}"; do
+        rewrite_refs "$dylib" "@loader_path/../../../Frameworks"
+      done
+
+      # Newly-bundled libs may themselves reference further /nix/store
+      # paths (transitive deps). Sweep Frameworks/ once more.
+      for dylib in "$APP/Frameworks/"*.dylib; do
+        base=$(basename "$dylib")
+        install_name_tool -id "@executable_path/../Frameworks/$base" "$dylib" 2>/dev/null || true
+        rewrite_refs "$dylib"
+      done
+
+      # Frameworks-to-Frameworks refs went through rewrite_refs with the
+      # default @executable_path/../Frameworks/ prefix. That resolves
+      # correctly when an executable in MacOS/ loads them — but when
+      # ghc (in GHC/bin/) loads libiconv, libiconv's own @executable_path
+      # refs point to GHC/Frameworks/ instead of Frameworks/, and dyld
+      # aborts. Rewrite inter-Frameworks refs to @loader_path/<base> so
+      # they resolve to sibling dylibs regardless of which executable
+      # initiated the load.
+      echo "  Normalizing Frameworks-internal refs to @loader_path..."
+      for dylib in "$APP/Frameworks/"*.dylib; do
+        refs=$(otool -L "$dylib" 2>/dev/null | awk 'NR>1 {print $1}' | grep '^@executable_path/\.\./Frameworks/' || true)
+        for ref in $refs; do
+          base=$(basename "$ref")
+          install_name_tool -change "$ref" "@loader_path/$base" "$dylib" 2>/dev/null || true
+        done
+      done
+    fi
+
+    # ===================================================================
     # Verify no remaining /nix/store references in load commands
     # ===================================================================
     echo ""
@@ -291,7 +355,16 @@ GHCWRAPPER
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && ALL_BINARIES+=("$tool")
     done
-    for f in "''${ALL_BINARIES[@]}" "$APP/Frameworks/"*.dylib; do
+    # Include topdir dylibs in the scan — they ship the Haskell runtime
+    # and are loaded on every recompile.
+    ALL_TARGETS=("''${ALL_BINARIES[@]}")
+    for d in "''${TOPDIR_DYLIBS[@]+"''${TOPDIR_DYLIBS[@]}"}"; do
+      ALL_TARGETS+=("$d")
+    done
+    for fw in "$APP/Frameworks/"*.dylib; do
+      ALL_TARGETS+=("$fw")
+    done
+    for f in "''${ALL_TARGETS[@]}"; do
       refs=$(otool -L "$f" 2>/dev/null | grep '/nix/store/' || true)
       if [ -n "$refs" ]; then
         echo "ERROR: $(basename "$f") still has nix store refs:"
@@ -337,6 +410,12 @@ PLIST
     cp "${resourceDir}/MenuBarIcon@2x.png" "$APP/Resources/MenuBarIcon@2x.png"
 
     # --- Ad-hoc codesign ---
+    # Every binary/dylib whose load commands we rewrote with
+    # install_name_tool needs to be re-signed, or macOS SIGKILLs the
+    # process before dyld even resolves symbols. Include topdir dylibs:
+    # they're loaded transitively by the bundled GHC during Mod-q
+    # recompilation, and rewriting their refs invalidated whatever
+    # signature Nix gave them.
     echo "Codesigning..."
     for f in "$APP/Frameworks/"*.dylib; do
       /usr/bin/codesign --force --sign - "$f"
@@ -346,6 +425,9 @@ PLIST
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && \
         /usr/bin/codesign --force --sign - "$tool"
+    done
+    for d in "''${TOPDIR_DYLIBS[@]+"''${TOPDIR_DYLIBS[@]}"}"; do
+      /usr/bin/codesign --force --sign - "$d"
     done
 
     echo "Built MCMonad.app"

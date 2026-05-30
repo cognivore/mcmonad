@@ -2,7 +2,7 @@
 
 ## Have You Ever Wondered What Would Happen if XMonad Wore Clown Shoes
 
-*v0.9999*
+*v0.99999*
 
 ## Abstract
 
@@ -95,7 +95,7 @@ A complete Ghostty configuration that works well with McMonad is also available 
 
 ### Versioning
 
-The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.9999`. Next: `0.99999`. Then `0.999999`. This is called "ClownVer".
+The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.99999`. Next: `0.999999`. Then `0.9999999`. This is called "ClownVer".
 
 ## Who made this and why?
 

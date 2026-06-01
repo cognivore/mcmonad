@@ -31,6 +31,12 @@ final class OverlayManager {
     /// menubar's debug switch).
     var onUserToggledDebug: (() -> Void)?
 
+    /// Called on the false -> true transition of `enabled`. Hook for
+    /// runtime self-tests that should only run while the user is in
+    /// debug mode (e.g. the AX <-> SkyLight bridge probe). Not fired
+    /// on subsequent applies, only on the entry edge.
+    var onEnabledTurnedOn: (() -> Void)?
+
     func setEnabled(_ on: Bool) {
         guard enabled != on else { return }
         enabled = on
@@ -38,6 +44,7 @@ final class OverlayManager {
             if let snap = lastSnapshot {
                 redraw(snap)
             }
+            onEnabledTurnedOn?()
         } else {
             tearDownAll()
         }

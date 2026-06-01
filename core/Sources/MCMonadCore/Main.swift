@@ -150,20 +150,30 @@ struct MCMonadCoreApp {
         let options = [
             "AXTrustedCheckOptionPrompt" as CFString: true as CFBoolean
         ] as CFDictionary
-        let trusted = AXIsProcessTrustedWithOptions(options)
-        if !trusted {
-            let msg = "Accessibility permission not granted. " +
-                "Grant it in System Settings > Privacy & Security > " +
-                "Accessibility, then mcmonad-core will be respawned."
-            logger.fault("\(msg, privacy: .public)")
-            fputs("mcmonad-core: \(msg)\n", stderr)
-            exit(78) // EX_CONFIG
+        if !AXIsProcessTrustedWithOptions(options) {
+            showFatalAlertAndExit(
+                title: "mcmonad cannot start: Accessibility not granted",
+                body: """
+                mcmonad-core needs Accessibility permission to enumerate \
+                windows and move/focus them. Without it the window manager \
+                cannot function — hotkeys would fire but nothing would move.
+
+                Grant the permission in System Settings > Privacy & Security \
+                > Accessibility (toggle 'mcmonad-core' to on). After granting, \
+                launchd will respawn mcmonad-core automatically.
+                """,
+                deepLinkSettings: true
+            )
         }
 
         // 2. SkyLight is required — access triggers load (fatal on failure)
         _ = SkyLight.shared
 
-        // 3. Configure as background daemon — no dock icon, no menu bar
+        // 3. Configure as background daemon — no dock icon, no menu bar.
+        // Functional checks of the AX <-> SkyLight bridge are NOT done at
+        // boot: they belong to the runtime debug mode (the Haskell-owned
+        // `debugOverlays` flag, toggled from the menubar). Wiring lives
+        // in launchServices() — see OverlayManager.onEnabledTurnedOn.
         NSApplication.shared.setActivationPolicy(.accessory)
 
         // Run the rest on MainActor
@@ -203,6 +213,13 @@ struct MCMonadCoreApp {
         }
         statusBar.onToggleDebugOverlays = { [weak socketServer] in
             socketServer?.send(.menuToggleDebug)
+        }
+
+        // When debug mode flips on (via menubar -> Haskell -> setDebugOverlays
+        // -> OverlayManager.setEnabled(true)), run the AX <-> SkyLight bridge
+        // probe so the user gets evidence the private SPI still works.
+        overlayManager.onEnabledTurnedOn = {
+            MCMonadCoreApp.probeAXSkyLightBridge()
         }
         statusBar.onFocusWindow = { [weak socketServer] wid, pid in
             socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
@@ -318,4 +335,168 @@ struct MCMonadCoreApp {
 
     // Static storage to prevent ARC from deallocating services
     nonisolated(unsafe) static var _keepAlive: Any?
+
+    // MARK: - Boot preconditions
+
+    /// Verifies the AX <-> SkyLight bridge actually works on this machine
+    /// right now. Enumerates visible top-level windows via SkyLight, then
+    /// for each one calls AXWindowService.findAXWindow (which internally
+    /// uses _AXUIElementGetWindow) to confirm the private SPI maps an
+    /// AXUIElement back to the same CGWindowID SkyLight just reported.
+    ///
+    /// Wired to fire when the user toggles debug mode on from the menubar
+    /// (which flips Haskell's `debugOverlays`, which flips
+    /// `OverlayManager.setEnabled`). Non-fatal: a failure here pops an
+    /// NSAlert with the breakdown but does not exit. The WM is already
+    /// running and the user is the one who asked for the diagnostic.
+    @MainActor
+    static func probeAXSkyLightBridge() {
+        let snapshots = SkyLightQuery.queryAllVisibleWindows()
+
+        guard !snapshots.isEmpty else {
+            logger.fault(
+                "AX<->SkyLight bridge probe found no visible top-level windows. Bridge cannot be exercised right now."
+            )
+            return
+        }
+
+        let ownPid = getpid()
+        var bridged = 0
+        var failureCounts: [String: Int] = [:]
+
+        for snap in snapshots {
+            if snap.pid == ownPid { continue }
+            if AXWindowService.findAXWindow(
+                windowId: snap.windowId,
+                pid: snap.pid
+            ) != nil {
+                bridged += 1
+                continue
+            }
+            failureCounts[classifyAXFailure(pid: snap.pid), default: 0] += 1
+        }
+
+        logger.info(
+            "AX<->SkyLight bridge probe: \(bridged)/\(snapshots.count) windows bridged"
+        )
+
+        if bridged == 0 {
+            let summary = failureCounts
+                .map { "\($0.key)=\($0.value)" }
+                .sorted()
+                .joined(separator: ", ")
+            showNonFatalAlert(
+                title: "AX <-> SkyLight bridge is broken",
+                body: """
+                mcmonad enumerated \(snapshots.count) visible windows via \
+                SkyLight but could not map any of them back to an \
+                AXUIElement. Without this mapping (private SPI \
+                _AXUIElementGetWindow), mcmonad cannot resize, focus, or \
+                close any window — every operation will silently no-op.
+
+                Failure breakdown: \(summary)
+
+                Most likely cause: Accessibility permission for mcmonad-core \
+                was revoked or its code signature changed since being \
+                granted. Re-grant it in System Settings > Privacy & \
+                Security > Accessibility. If the problem persists after a \
+                re-grant, this macOS version may have removed \
+                _AXUIElementGetWindow and mcmonad needs to be updated.
+                """
+            )
+        }
+    }
+
+    /// Inspect why findAXWindow failed for a given pid so the user gets
+    /// an actionable failure breakdown rather than a count of nils.
+    private static func classifyAXFailure(pid: pid_t) -> String {
+        let appElement = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            appElement,
+            kAXWindowsAttribute as CFString,
+            &windowsRef
+        )
+        switch result {
+        case .success: return "no-matching-wid-in-ax-windows"
+        case .cannotComplete: return "ax-cannot-complete"
+        case .apiDisabled: return "ax-api-disabled"
+        case .notImplemented: return "ax-not-implemented"
+        case .invalidUIElement: return "ax-invalid-ui-element"
+        default: return "ax-error-\(result.rawValue)"
+        }
+    }
+
+    /// Show a critical NSAlert and return without exiting. Used for
+    /// runtime diagnostic failures (e.g. AX<->SkyLight bridge probe in
+    /// debug mode).
+    @MainActor
+    private static func showNonFatalAlert(title: String, body: String) {
+        let msg = "\(title)\n\(body)"
+        logger.fault("\(msg, privacy: .public)")
+        fputs("mcmonad-core: \(msg)\n", stderr)
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = body
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Open Accessibility Settings")
+        alert.addButton(withTitle: "Dismiss")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn,
+           let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+           ) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Show a critical NSAlert with the supplied body and exit(78). Used
+    /// for unrecoverable boot-time precondition failures so the user gets
+    /// an actionable popup instead of a silent daemon that pretends to
+    /// work. Returns Never.
+    private static func showFatalAlertAndExit(
+        title: String,
+        body: String,
+        deepLinkSettings: Bool
+    ) -> Never {
+        let stderrMsg = "\(title)\n\(body)"
+        logger.fault("\(stderrMsg, privacy: .public)")
+        fputs("mcmonad-core: \(stderrMsg)\n", stderr)
+
+        // NSApp/NSAlert are MainActor-isolated. main() is the program
+        // entry point, so we are on the main thread, but the compiler
+        // doesn't know that — assumeIsolated tells it explicitly.
+        MainActor.assumeIsolated {
+            // Temporarily become a regular app so the alert can take
+            // focus. We exit immediately after, so this never conflicts
+            // with the .accessory policy on the success path.
+            let app = NSApplication.shared
+            app.setActivationPolicy(.regular)
+            app.activate(ignoringOtherApps: true)
+
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = body
+            alert.alertStyle = .critical
+
+            if deepLinkSettings {
+                alert.addButton(withTitle: "Open Accessibility Settings")
+                alert.addButton(withTitle: "Quit")
+                let response = alert.runModal()
+                if response == .alertFirstButtonReturn,
+                   let url = URL(
+                    string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                   ) {
+                    NSWorkspace.shared.open(url)
+                }
+            } else {
+                alert.addButton(withTitle: "Quit")
+                _ = alert.runModal()
+            }
+        }
+
+        exit(78) // EX_CONFIG
+    }
 }

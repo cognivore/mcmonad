@@ -2,7 +2,7 @@
 
 ## Have You Ever Wondered What Would Happen if XMonad Wore Clown Shoes
 
-*v0.99999*
+*v0.999999*
 
 ## Abstract
 
@@ -53,6 +53,8 @@ kill $(pgrep -f mcmonad)
 
 **"Windows tile but focus doesn't follow."** Check `~/Library/Logs/mcmonad-core.log`. The focus ritual involves four separate private APIs; if one fails, the log says which.
 
+**"Librewolf / Firefox windows won't shrink — swaps look like they did nothing."** Firefox-family browsers enforce an internal minimum window width in their parent process. When McMonad's layout asks Librewolf to be (say) 576 px wide via `kAXSize`, the AX call succeeds but Librewolf immediately resizes itself back to its preferred minimum. In `~/Library/Logs/mcmonad-core.log` you'll see `result=DEFIED delta=(0,0,N,0)` for these — McMonad notices, but doesn't fight back. Practical effect: in a 3-column layout on a 1728-px-wide screen, two Librewolfs swapping positions will end up overlapping in the wider half because the "going-narrow" one refuses to actually become narrow. Chrome and Ghostty don't do this; they accept any size. There is no McMonad-side fix that doesn't either (a) read `AXMinSize` and rewrite the layout to honour it, or (b) use a private NSWindow API to override the in-app resize hook. Until then: don't put more than one Librewolf window on a workspace that gives any of them less than ~800 px of width.
+
 **"My workspace switches sometimes go silent for a few seconds."** Don't bind `Mod-q` to `restart`. Tahoe keys Accessibility grants by `cdhash`, and `ghc --make` produces a fresh one each time, so macOS `SIGKILL`s the recompiled `mcmonad` ~125 ms in (`Launch Constraint Violation`). While the launcher respawns it, macOS's text layer eats Option+2/3/5 as ™/£/∞. Deploy via `home-manager switch`, or recompile out-of-band and `launchctl kickstart -k "gui/$(id -u)/org.nix-community.home.mcmonad"`.
 
 ---
@@ -95,7 +97,7 @@ A complete Ghostty configuration that works well with McMonad is also available 
 
 ### Versioning
 
-The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.99999`. Next: `0.999999`. Then `0.9999999`. This is called "ClownVer".
+The versioning policy is to just keep adding 9s to the minor version after `0.` until we find a maintainer for this. Current version: `0.999999`. Next: `0.9999999`. Then `0.99999999`. This is called "ClownVer".
 
 ## Who made this and why?
 

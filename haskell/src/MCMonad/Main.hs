@@ -18,10 +18,7 @@ import MCMonad.Config
 import MCMonad.Core
 import MCMonad.IPC
 import MCMonad.Operations
-import MCMonad.Persistence
-    ( MatchResult(..), SerialState(..)
-    , matchWindows, serialToWindowSet
-    )
+import MCMonad.Persistence (SerialState(..), serialToWindowSet)
 
 -- | Main entry point. Connect to the Swift daemon, initialise state, and
 -- run the event loop. This is what users call from their @mcmonad.hs@:
@@ -75,17 +72,19 @@ launch cfg = do
     when debug $ hPutStrLn stderr "mcmonad: debug logging enabled (MCMONAD_DEBUG)"
 
     -- 7. Try to restore from the persisted snapshot. This runs on
-    --    EVERY startup (not just --resume), so windows return to their
-    --    workspaces after a reboot or daemon restart as long as the
-    --    persistence file is intact. The --resume flag is now
-    --    vestigial; Mod-q still passes it but no longer gates this.
+    --    EVERY startup (not just --resume), so windows return to
+    --    their workspaces across any mcmonad-side restart as long
+    --    as the WindowServer is still alive (i.e. the user hasn't
+    --    logged out). After logout / reboot, identities don't
+    --    match anything and every window goes through the manage
+    --    hook — see 'MCMonad.Persistence' for the design.
     mSaved <- restoreSnapshot cfg screens existingWindows
-    let (ws0, restoredAffinity, idMap, unmatchedLives) = case mSaved of
-            Just (ws, aff, mp, leftovers) ->
-                (ws, aff, mp, leftovers)
+    let (ws0, restoredAffinity, unmatchedLives) = case mSaved of
+            Just (ws, aff, leftovers) ->
+                (ws, aff, leftovers)
             Nothing ->
                 let ws = buildInitialWindowSet cfg screens
-                in  (ws, initialAffinities ws, Map.empty, existingWindows)
+                in  (ws, initialAffinities ws, existingWindows)
 
     let mconf = MConf { connection = conn }
         mst0  = MState { windowset = ws0
@@ -98,7 +97,7 @@ launch cfg = do
                        , pendingScratchpad = Nothing
                        , windowRects = Map.empty
                        , warpOnSwitch = mouseWarping cfg
-                       , windowIdentities = idMap
+                       , lastSaveAt = Nothing
                        }
 
     _ <- runM mconf mst0 $ do
@@ -118,19 +117,25 @@ launch cfg = do
 
     return ()
 
--- | Try to restore a previous snapshot. Returns @Nothing@ when there
--- is no saved state, or when the saved state has no usable workspace
--- assignments after filtering against the config's current workspace
--- list. On success, returns the rebuilt @WindowSet@, the restored
--- affinity map, the identity map for managed windows, and the list of
--- live windows that didn't match a saved entry (those go through the
--- manage hook).
+-- | Try to restore a previous snapshot.
+--
+-- Returns the rebuilt 'WindowSet', the restored affinity map, and
+-- the list of live windows that did NOT appear in the saved state
+-- (those go through the manage hook). Returns 'Nothing' when no
+-- save file exists.
+--
+-- Identity is exact 'WindowRef' equality: a saved window survives
+-- restore iff its @(wid, pid)@ pair appears in the live window list
+-- that mcmonad-core just enumerated. This is correct for every
+-- mcmonad-side restart (Mod-q, daemon kick, launchd restart) and
+-- intentionally collapses to "fresh start" after logout / reboot,
+-- where no IDs match by construction and the manage hook does all
+-- the work.
 restoreSnapshot
     :: MConfig Layout
     -> [ScreenInfo]
     -> [WindowInfo]
-    -> IO (Maybe (WindowSet, Map.Map String ScreenId,
-                  Map.Map WindowRef StableWindowId, [WindowInfo]))
+    -> IO (Maybe (WindowSet, Map.Map String ScreenId, [WindowInfo]))
 restoreSnapshot cfg screens existingWindows = do
     mSaved <- loadStateIO
     case mSaved of
@@ -138,41 +143,49 @@ restoreSnapshot cfg screens existingWindows = do
         Just savedRaw -> do
             let validTags = Set.fromList (mcWorkspaces cfg)
                 saved     = filterToValidTags validTags savedRaw
-                result    = matchWindows saved existingWindows
                 screenTuples =
                     [ (S i, SD (siFrame si))
                     | (i, si) <- zip [0 :: Int ..] screens
                     ]
-                ws = serialToWindowSet
+                ws0 = serialToWindowSet
                         (layoutHook cfg)
                         (mcWorkspaces cfg)
                         screenTuples
-                        (mrResolved result)
+                        saved
+                liveSet = Set.fromList
+                    [ WindowRef (wiWindowId wi) (wiPid wi)
+                    | wi <- existingWindows
+                    ]
+                -- Saved windows whose (wid, pid) isn't in the live set
+                -- — these died while mcmonad was down. Drop them.
+                staleSaved = filter (`Set.notMember` liveSet) (W.allWindows ws0)
+                ws = foldr W.delete' ws0 staleSaved
+                -- Live windows we don't have in the saved set go
+                -- through the manage hook.
+                inWs wi =
+                    let wr = WindowRef (wiWindowId wi) (wiPid wi)
+                    in W.member wr ws
+                unmatched = filter (not . inWs) existingWindows
                 aff = Map.fromList
                         [ (tag, S n)
                         | (tag, n) <- ssAffinity saved
                         , Set.member tag validTags
                         ]
             hPutStrLn stderr $
-                "mcmonad: restored " ++ show (Map.size (mrIdentities result))
-                ++ " window(s); " ++ show (length (mrUnmatched result))
-                ++ " unmatched"
-            return $ Just
-                ( ws
-                , aff
-                , mrIdentities result
-                , mrUnmatched result
-                )
+                "mcmonad: restored "
+                ++ show (length (W.allWindows ws))
+                ++ " window(s); " ++ show (length staleSaved) ++ " stale; "
+                ++ show (length unmatched) ++ " new"
+            return $ Just (ws, aff, unmatched)
   where
     -- A saved snapshot may carry workspace tags that don't exist in
-    -- the current config (e.g. the user renamed a workspace). Drop
-    -- them so 'matchWindows' doesn't waste effort matching windows
-    -- the WindowSet can never include — and so 'serialToWindowSet'
-    -- doesn't silently lose their assignments.
+    -- the current config (the user renamed a workspace). Drop them
+    -- so 'serialToWindowSet' doesn't try to materialise a workspace
+    -- it can't sensibly produce.
     filterToValidTags
         :: Set.Set String
-        -> SerialState StableWindowId
-        -> SerialState StableWindowId
+        -> SerialState WindowRef
+        -> SerialState WindowRef
     filterToValidTags valid saved = saved
         { ssStacks =
             [ entry

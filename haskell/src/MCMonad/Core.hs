@@ -31,8 +31,6 @@ module MCMonad.Core
       -- * Focus resolution
     , resolveFocusedWindow
     , resolveFrontApp
-      -- * Cross-restart window identity
-    , StableWindowId(..)
     ) where
 
 import Control.Concurrent.MVar
@@ -44,8 +42,8 @@ import qualified Data.Aeson as Aeson
 import Data.Int (Int32)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
-import Data.Text (Text)
 import Data.Set (Set)
+import Data.Time.Clock (UTCTime)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word32)
 import GHC.Generics (Generic)
@@ -58,22 +56,22 @@ import qualified XMonad.StackSet as W
 -- Window identifier for macOS
 
 -- | A reference to a macOS window, identified by its CGWindowID and owning PID.
+--
+-- This is the *only* identity mcmonad uses. The CGWindowID is assigned by
+-- macOS's WindowServer and is stable for the lifetime of the WindowServer
+-- session — which spans Mod-q recompiles, mcmonad-core daemon restarts,
+-- launchd kicks, and any other restart of mcmonad's own processes. The
+-- PID is stable for the lifetime of the owning app. Together they
+-- uniquely identify a live window.
+--
+-- On logout / reboot, the WindowServer dies and the apps die with it.
+-- The windows that come back after login are *new* objects in new
+-- processes with new identities. mcmonad does not attempt to bridge
+-- across that gap; the manage hook is the sole mechanism for placing
+-- newly-created windows on workspaces.
 data WindowRef = WindowRef
     { wrWindowId :: !Word32
     , wrPid      :: !Int32
-    } deriving (Eq, Ord, Show, Read, Generic)
-
--- | A cross-restart identifier built entirely from attributes that
--- survive an app restart. Used by 'MCMonad.Persistence' to match a
--- saved snapshot against the live windows the next mcmonad startup
--- sees. See "MCMonad.Persistence" for the full design and matcher.
-data StableWindowId = StableWindowId
-    { swiBundleId     :: !(Maybe Text)
-    , swiAxIdentifier :: !(Maybe Text)
-    , swiSubrole      :: !(Maybe Text)
-    , swiTitleHash    :: !(Maybe Text)
-      -- ^ Salted SHA-256 hex of the title, computed Swift-side.
-      -- See @core\/Sources\/MCMonadCore\/IdentityHash.swift@.
     } deriving (Eq, Ord, Show, Read, Generic)
 
 instance FromJSON WindowRef where
@@ -236,12 +234,14 @@ data MState = MState
     , warpOnSwitch     :: !Bool
       -- ^ Whether to warp the mouse cursor to the focused window on
       -- workspace\/screen changes. Set from config at startup.
-    , windowIdentities :: !(Map.Map WindowRef StableWindowId)
-      -- ^ Stable cross-restart identity for each managed window.
-      -- Populated when a window is first managed (from the
-      -- 'MCMonad.IPC.WindowInfo' Swift sent), cleared on unmanage.
-      -- Consumed by 'MCMonad.Persistence.windowSetToSerial' when
-      -- writing the persistence file.
+    , lastSaveAt       :: !(Maybe UTCTime)
+      -- ^ Wall clock of the most recent 'MCMonad.Operations.saveStateIO'
+      -- call. The 'windows' transition skips its post-mutation save when
+      -- this is set and less than the throttle window has elapsed, so a
+      -- burst of focus-follows-mouse or other rapid state changes
+      -- doesn't fan out to a save per call. 'restart' bypasses the
+      -- throttle so a Mod-q reload still writes the freshest snapshot
+      -- before 'exec'.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's
@@ -312,14 +312,52 @@ updateAffinities ws existing =
 -- live here so the bug-prone PID-only path can be exercised by tests
 -- alongside the precise per-window path.
 
+-- | Windows on the current workspace's stack — and *only* the
+-- current workspace.
+--
+-- macOS-originated focus events fire for an enormous number of
+-- reasons we can't disambiguate from the user's intent: a background
+-- tab repaint, a network callback, an app deactivating as a side
+-- effect of *our own* 'FocusWindow' command. The 'NSWorkspace'
+-- frontmost-app notification fires when an app activates, including
+-- as the immediate side effect of macOS opening a new window of
+-- that app.
+--
+-- An earlier version of these helpers used 'W.allWindows', which let
+-- a hidden-workspace window claim focus and silently dragged the
+-- current screen there via 'W.focusWindow''s implicit 'view' call.
+-- The next iteration used a 'visibleWindows' helper that included
+-- the secondary screen's workspace — still wrong, because the same
+-- spurious AX events still pulled focus onto the *other* monitor
+-- (the Mod-j-cycles-out-to-the-other-screen bug; the
+-- new-Ghostty-tab-lands-on-the-wrong-screen bug, where 'resolveFrontApp'
+-- ran first on a hidden Ghostty and swapped screens before the
+-- 'windowCreated' arrived and inserted the new tab on the now-current
+-- workspace).
+--
+-- Restricting to the current workspace is the safe rule: AX can fire
+-- for whatever, we only act when the implied focus target is already
+-- on the screen the user is looking at. Cross-screen focus follows
+-- through 'MouseEnteredWindow' instead — that's bounded to actual
+-- mouse-enter events, not AX cascades.
+currentWorkspaceWindows :: W.StackSet i l a sid sd -> [a]
+currentWorkspaceWindows ws =
+    W.integrate' (W.stack (W.workspace (W.current ws)))
+
 -- | Resolve focus from a precise AX focused-window-changed event.
 --
--- Returns the updated StackSet when the target window exists and isn't
--- already focused; 'Nothing' otherwise (no-op).
+-- Returns the updated StackSet when the target window is on the
+-- *current* workspace and isn't already focused; 'Nothing' otherwise
+-- (no-op).
 --
--- This is the path that fixes the multi-window-per-app focus bug: the
--- AX observer reports the *exact* CGWindowID the user activated, so we
--- never have to guess among windows that share a PID.
+-- This is the path that fixes the multi-window-per-app focus bug
+-- within a workspace: the AX observer reports the *exact* CGWindowID
+-- the user activated, so we never have to guess among windows that
+-- share a PID on the focused workspace.
+--
+-- The current-workspace restriction (see 'currentWorkspaceWindows')
+-- means AX events never cause cross-screen swaps. Cross-screen focus
+-- is the job of 'MouseEnteredWindow'.
 --
 -- Polymorphic in the StackSet type parameters so the test suite (which
 -- uses @Int@ for the layout slot) can exercise this directly.
@@ -329,7 +367,7 @@ resolveFocusedWindow
     -> W.StackSet i l WindowRef sid sd
     -> Maybe (W.StackSet i l WindowRef sid sd)
 resolveFocusedWindow wid pid ws =
-    case find match (W.allWindows ws) of
+    case find match (currentWorkspaceWindows ws) of
         Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
         _                              -> Nothing
   where
@@ -338,14 +376,11 @@ resolveFocusedWindow wid pid ws =
 -- | Resolve focus from a PID-only front-app-changed event.
 --
 -- Returns the updated StackSet only when the user actually switched to
--- a *different* app — i.e. the currently focused window does not belong
--- to @pid@. When focus is already inside that app, we leave it alone so
--- the precise AX-driven focus inside the app survives.
---
--- This avoids the historic bug where a multi-window app (a browser
--- with several windows on one workspace, etc.) would collapse to "the
--- first window of this PID" on every front-app event, including the
--- one that fires when you click a window of the already-active app.
+-- a *different* app *and* that app has a window on the current
+-- workspace. When focus is already inside that app, we leave it
+-- alone. When the app's windows are all on other workspaces (hidden
+-- or visible-secondary), we no-op — same reason as
+-- 'resolveFocusedWindow'.
 resolveFrontApp
     :: (Eq i, Eq sid)
     => Int32
@@ -353,6 +388,6 @@ resolveFrontApp
     -> Maybe (W.StackSet i l WindowRef sid sd)
 resolveFrontApp pid ws = case W.peek ws of
     Just w | wrPid w == pid -> Nothing
-    _ -> case find ((== pid) . wrPid) (W.allWindows ws) of
+    _ -> case find ((== pid) . wrPid) (currentWorkspaceWindows ws) of
         Just wr -> Just (W.focusWindow wr ws)
         Nothing -> Nothing

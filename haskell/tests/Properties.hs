@@ -1,24 +1,21 @@
-{-# LANGUAGE OverloadedStrings #-}
 module Properties where
 
 import Test.QuickCheck
 import qualified XMonad.StackSet as W
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
-    , StableWindowId(..)
     , updateAffinities, resolveFocusedWindow, resolveFrontApp
     )
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
-    ( SerialState(..), SerStack(..), MatchResult(..)
-    , matchWindows, stableIdFor, persistenceVersion
+    ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     )
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Maybe (isNothing)
 import Data.Int (Int32)
-import qualified Data.Text as T
 import Data.Word (Word32)
 import Control.Monad (foldM)
 
@@ -329,20 +326,57 @@ brokenPidOnlyFocus pid ws =
         Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
         _                              -> Nothing
 
--- For any window in the StackSet, asking resolveFocusedWindow for it
--- results in that exact window being focused — regardless of whether
--- other windows share its PID.
+-- | Windows on the CURRENT workspace — the only set
+-- 'resolveFocusedWindow' / 'resolveFrontApp' are allowed to act on.
+-- Mirror of 'MCMonad.Core.currentWorkspaceWindows' kept here so the
+-- tests don't depend on it being exported.
+currentWorkspaceWindowsForTest :: TestStackSet -> [WindowRef]
+currentWorkspaceWindowsForTest ss =
+    W.integrate' (W.stack (W.workspace (W.current ss)))
+
+-- For any window on the *current* workspace, asking resolveFocusedWindow
+-- for it results in that exact window being focused — regardless of
+-- whether other windows share its PID. This is the within-workspace
+-- multi-window-per-app precision the AX path exists for.
 prop_focusedWindow_picks_exact :: TestStackSet -> Property
-prop_focusedWindow_picks_exact ss = case W.allWindows ss of
+prop_focusedWindow_picks_exact ss = case currentWorkspaceWindowsForTest ss of
     [] -> property True
     wins -> forAll (elements wins) $ \wr ->
         let r = resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
             focused = maybe (W.peek ss) W.peek r
         in focused === Just wr
 
+-- A focused-window event targeting a window outside the current
+-- workspace must be a no-op. This is the property that prevents
+-- macOS-originated focus signals — Chrome rendering a hidden tab,
+-- the AX side-effect cascade from mcmonad's own 'FocusWindow'
+-- commands, an app activating on the other monitor — from dragging
+-- the current screen anywhere the user didn't ask.
+prop_focusedWindow_off_workspace_is_no_op :: TestStackSet -> Property
+prop_focusedWindow_off_workspace_is_no_op ss =
+    let curWins = currentWorkspaceWindowsForTest ss
+        offWorkspace = filter (`notElem` curWins) (W.allWindows ss)
+    in case offWorkspace of
+        [] -> property True
+        wins -> forAll (elements wins) $ \wr ->
+            property $ isNothing
+                     $ resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
+
+-- resolveFocusedWindow never changes the current tag. With the
+-- current-workspace restriction this is now an absolute invariant:
+-- any focus the helper accepts is already on the current workspace,
+-- so 'W.focusWindow' is a within-stack reorder, not a 'view'.
+prop_focusedWindow_never_switches_workspace :: TestStackSet -> Property
+prop_focusedWindow_never_switches_workspace ss = case W.allWindows ss of
+    [] -> property True
+    wins -> forAll (elements wins) $ \wr ->
+        case resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss of
+            Nothing  -> property True
+            Just ss' -> W.currentTag ss' === W.currentTag ss
+
 -- resolveFocusedWindow preserves the no-duplicates invariant.
 prop_focusedWindow_invariant :: TestStackSet -> Property
-prop_focusedWindow_invariant ss = case W.allWindows ss of
+prop_focusedWindow_invariant ss = case currentWorkspaceWindowsForTest ss of
     [] -> property True
     wins -> forAll (elements wins) $ \wr ->
         property $ maybe True invariant
@@ -384,77 +418,63 @@ prop_frontApp_noop_within ss = case W.peek ss of
     Nothing -> property True
     Just wr -> property $ isNothing (resolveFrontApp (wrPid wr) ss)
 
--- resolveFrontApp switches focus when the user crossed app boundaries.
-prop_frontApp_switches_across :: TestStackSet -> Property
-prop_frontApp_switches_across ss = case W.peek ss of
+-- resolveFrontApp switches focus when the user crossed app boundaries
+-- *within the current workspace*. PID-only events for apps whose
+-- windows are all on other workspaces (hidden or visible-secondary)
+-- must NOT switch workspaces — that's the new-window-lands-on-the-
+-- wrong-screen and Mod-j-leaks-to-the-other-monitor regression
+-- sentinel.
+prop_frontApp_switches_within_workspace :: TestStackSet -> Property
+prop_frontApp_switches_within_workspace ss = case W.peek ss of
     Nothing -> property True
     Just wr ->
-        let otherPids = L.nub
-                      $ filter (/= wrPid wr)
-                      $ map wrPid (W.allWindows ss)
-        in case otherPids of
+        let curPids = L.nub
+                    $ filter (/= wrPid wr)
+                    $ map wrPid (currentWorkspaceWindowsForTest ss)
+        in case curPids of
             [] -> property True
             (p:_) -> case resolveFrontApp p ss of
                 Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
-                Nothing  -> property False  -- a window of pid p exists; must switch
+                Nothing  -> property False  -- a current-workspace window of pid p exists; must switch
+
+-- resolveFrontApp never changes the current tag.
+prop_frontApp_never_switches_workspace :: TestStackSet -> Property
+prop_frontApp_never_switches_workspace ss =
+    let pids = L.nub $ map wrPid (W.allWindows ss)
+    in case pids of
+        [] -> property True
+        _  -> forAll (elements pids) $ \p ->
+            case resolveFrontApp p ss of
+                Nothing  -> property True
+                Just ss' -> W.currentTag ss' === W.currentTag ss
 
 
--- === CROSS-RESTART IDENTITY (MCMonad.Persistence) ===
+-- === PERSISTENCE ROUND-TRIP (MCMonad.Persistence) ===
 --
--- Properties for the three-tier 'matchWindows' assignment. The
--- saved snapshot's CGWindowIDs are stale; matching has to look only
--- at the stable identity components carried by the matched
--- WindowInfo.
+-- Identity is exact 'WindowRef' equality. The properties below
+-- exercise the three classes of behaviour at restore time:
+--
+--   1. Saved windows that are in the live list stay where they
+--      were (round-trip).
+--   2. Saved windows NOT in the live list are dropped (stale).
+--   3. Live windows NOT in the saved set are returned to the
+--      caller for the manage hook (new).
+--
+-- The matcher / tier / fingerprint machinery that used to live in
+-- this module is gone — see commit `<TBD>` for the rationale. The
+-- properties below replace seven previous ones with three because
+-- there's nothing else worth asserting.
 
--- | A small dictionary of bundle ids / subroles / titles to keep
--- generated 'StableWindowId's overlapping often enough that the
--- matcher actually gets exercised.
-genBundle :: Gen (Maybe T.Text)
-genBundle = oneof
-    [ pure Nothing
-    , Just <$> elements
-        [ "com.app.alpha", "com.app.beta", "com.app.gamma" ]
-    ]
-
-genSubrole :: Gen (Maybe T.Text)
-genSubrole = oneof
-    [ pure Nothing
-    , Just <$> elements [ "AXStandardWindow", "AXDialog", "AXSystemDialog" ]
-    ]
-
-genAxIdentifier :: Gen (Maybe T.Text)
-genAxIdentifier = oneof
-    [ pure Nothing
-    , pure Nothing  -- weight nil higher (most apps don't set it)
-    , Just <$> elements [ "main", "settings", "downloads" ]
-    ]
-
-genTitleHash :: Gen (Maybe T.Text)
-genTitleHash = oneof
-    [ pure Nothing
-    , Just <$> elements [ "aabbccdd11223344", "deadbeefcafebabe", "0000111122223333" ]
-    ]
-
-instance Arbitrary StableWindowId where
-    arbitrary = StableWindowId
-        <$> genBundle
-        <*> genAxIdentifier
-        <*> genSubrole
-        <*> genTitleHash
-
--- | Build a 'WindowInfo' that, when fed through 'stableIdFor', yields
--- the given 'StableWindowId'. The other 'WindowInfo' fields are
--- irrelevant to the matcher and use bland defaults.
-windowInfoFor :: Word32 -> Int32 -> StableWindowId -> WindowInfo
-windowInfoFor wid pid sid = WindowInfo
+-- | A tiny WindowInfo with bland defaults — only wid and pid matter
+-- to the persistence layer.
+mkWindowInfo :: Word32 -> Int32 -> WindowInfo
+mkWindowInfo wid pid = WindowInfo
     { wiWindowId            = wid
     , wiPid                 = pid
     , wiTitle               = Nothing
     , wiAppName             = Nothing
-    , wiBundleId            = swiBundleId sid
-    , wiSubrole             = swiSubrole sid
-    , wiAxIdentifier        = swiAxIdentifier sid
-    , wiIdentityHash        = swiTitleHash sid
+    , wiBundleId            = Nothing
+    , wiSubrole             = Nothing
     , wiIsDialog            = False
     , wiIsFixedSize         = False
     , wiHasCloseButton      = True
@@ -462,197 +482,196 @@ windowInfoFor wid pid sid = WindowInfo
     , wiFrame               = Rectangle 0 0 100 100
     }
 
--- | A saved snapshot + a live window list, where the lives are a
--- shuffled, freshly-wid'd version of the saved entries plus some
--- extras of arbitrary identity. The expected matches are: every saved
--- entry maps to exactly one live window.
-data RoundTripCase = RoundTripCase
-    { rtSaved   :: SerialState StableWindowId
-    , rtLives   :: [WindowInfo]
-    , rtSavedIds :: [StableWindowId]  -- in workspace traversal order
+-- | A two-workspace, two-screen SerialState carrying explicit
+-- WindowRefs, plus a live list of WindowInfos. Used for the three
+-- persistence properties below.
+--
+-- Saved layout:
+--   workspace "L" on screen 0, focus = wrL1, down = [wrL2]
+--   workspace "R" on screen 1, focus = wrR1
+--
+-- Live windows are a (possibly partial, possibly extended) subset:
+--   * 'kept'      — saved refs the user has had since save.
+--   * 'newRefs'   — fresh refs that should fall through to manage hook.
+genPersistCase :: Gen ([WindowRef], [WindowRef], [WindowRef])
+genPersistCase = do
+    let mkRef n = WindowRef n 100
+    -- Three saved refs (wrL1 + wrL2 on "L", wrR1 on "R").
+    let savedRefs = [mkRef 1, mkRef 2, mkRef 3]
+    -- Decide which subset of saved survives ("still live").
+    keep <- sublistOf savedRefs
+    -- Extra live refs that aren't saved.
+    extras <- listOf (do
+        n <- choose (100 :: Word32, 200)
+        return (WindowRef n 200))
+    return (savedRefs, keep, extras)
+
+buildSavedState :: [WindowRef] -> SerialState WindowRef
+buildSavedState [wrL1, wrL2, wrR1] = SerialState
+    { ssVersion    = persistenceVersion
+    , ssStacks     = [ ("L", Just (SerStack wrL1 [] [wrL2]))
+                     , ("R", Just (SerStack wrR1 [] []))
+                     ]
+    , ssCurrentTag = "L"
+    , ssFloating   = []
+    , ssAffinity   = [("L", 0), ("R", 1)]
     }
-    deriving Show
+buildSavedState _ = error "buildSavedState: expected 3 saved refs"
 
-instance Arbitrary RoundTripCase where
-    arbitrary = do
-        savedIds <- listOf1 arbitrary
-        extras   <- listOf arbitrary :: Gen [StableWindowId]
-        -- Build the saved snapshot: one workspace, all on one stack.
-        let savedStack = case savedIds of
-                (f:rest) -> Just (SerStack f [] rest)
-                []       -> Nothing
-            saved = SerialState
-                { ssVersion    = persistenceVersion
-                , ssStacks     = [("ws", savedStack)]
-                , ssCurrentTag = "ws"
-                , ssFloating   = []
-                , ssAffinity   = [("ws", 0)]
-                }
-        -- Live windows: one for each saved id (new wid), plus extras
-        -- with disjoint wid range. Lives are shuffled so the matcher
-        -- can't rely on input order alone.
-        let savedLives =
-                [ windowInfoFor (1000 + fromIntegral i) 100 sid
-                | (i, sid) <- zip [0 :: Int ..] savedIds
-                ]
-            extraLives =
-                [ windowInfoFor (5000 + fromIntegral i) 200 sid
-                | (i, sid) <- zip [0 :: Int ..] extras
-                ]
-            allLives = savedLives ++ extraLives
-        shuffledLives <- shuffle allLives
-        return (RoundTripCase saved shuffledLives savedIds)
+twoScreens :: [(ScreenId, ScreenDetail)]
+twoScreens =
+    [ (S 0, SD (Rectangle 0 0 1000 1000))
+    , (S 1, SD (Rectangle 1000 0 1000 1000))
+    ]
 
--- Every saved id has its own mirror in lives (built by the generator),
--- so every saved id must match at tier 1, and every match must be to
--- the exact mirror. This is the strongest possible round-trip
--- guarantee: the matcher loses no identity information when both
--- sides have it.
-prop_matcher_round_trip :: RoundTripCase -> Property
-prop_matcher_round_trip (RoundTripCase saved lives savedIds) =
-    let result = matchWindows saved lives
-        matched = Map.toList (mrIdentities result)
-    in counterexample (show result) $
-       length matched === length savedIds
-       .&&. conjoin
-            [ counterexample
-                ("for match " ++ show (ref, sid))
-                (case L.find
-                        (\wi -> wrWindowId ref == wiWindowId wi
-                             && wrPid ref == wiPid wi) lives of
-                    Just wi -> stableIdFor wi === sid
-                    Nothing -> counterexample "matched ref absent from lives" (property False))
-            | (ref, sid) <- matched
-            ]
+twoTags :: [String]
+twoTags = ["L", "R"]
 
--- |matched| + |unmatched| == |lives|, and the matched lives are
--- disjoint from mrUnmatched.
-prop_matcher_partition :: RoundTripCase -> Property
-prop_matcher_partition (RoundTripCase saved lives _) =
-    let result = matchWindows saved lives
-        matchedWids =
-            [ wid | wid <- Map.keys (mrIdentities result) ]
-        unmatchedWids =
-            [ WindowRef (wiWindowId wi) (wiPid wi)
-            | wi <- mrUnmatched result
-            ]
-    in (length matchedWids + length unmatchedWids === length lives)
-       .&&. L.intersect matchedWids unmatchedWids === []
+-- After restore, the WindowSet contains exactly the saved refs that
+-- are still live. Refs in 'kept' must be present; saved refs NOT in
+-- 'kept' (i.e. stale) must be absent.
+prop_persistence_round_trip :: Property
+prop_persistence_round_trip = forAll genPersistCase $ \(savedRefs, kept, extras) ->
+    let saved = buildSavedState savedRefs
+        lives = [ mkWindowInfo (wrWindowId r) (wrPid r) | r <- kept ++ extras ]
+        ws0 :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
+        liveSet = Set.fromList [WindowRef (wiWindowId wi) (wiPid wi) | wi <- lives]
+        stale = filter (`Set.notMember` liveSet) (W.allWindows ws0)
+        ws = foldr W.delete' ws0 stale
+        present = W.allWindows ws
+        staleRefs = filter (`notElem` kept) savedRefs
+    in counterexample ("kept=" ++ show kept ++ " stale=" ++ show staleRefs
+                        ++ " present=" ++ show present) $
+       all (`elem` present)    kept
+       .&&. all (`notElem` present) staleRefs
 
--- Determinism: matching the same saved snapshot against the same lives
--- yields the same result.
-prop_matcher_deterministic :: RoundTripCase -> Property
-prop_matcher_deterministic (RoundTripCase saved lives _) =
-    let a = matchWindows saved lives
-        b = matchWindows saved lives
-    in (mrIdentities a === mrIdentities b)
-       .&&. (map (\wi -> wiWindowId wi) (mrUnmatched a)
-             === map (\wi -> wiWindowId wi) (mrUnmatched b))
+-- The unmatched list is exactly the live refs that don't appear in
+-- the (reconciled) WindowSet — i.e. windows not covered by saved
+-- state. These are the ones that go through the manage hook.
+prop_persistence_unmatched_are_new :: Property
+prop_persistence_unmatched_are_new = forAll genPersistCase $ \(savedRefs, kept, extras) ->
+    let saved = buildSavedState savedRefs
+        lives = [ mkWindowInfo (wrWindowId r) (wrPid r) | r <- kept ++ extras ]
+        ws0 :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
+        liveSet = Set.fromList [WindowRef (wiWindowId wi) (wiPid wi) | wi <- lives]
+        stale = filter (`Set.notMember` liveSet) (W.allWindows ws0)
+        ws = foldr W.delete' ws0 stale
+        inWs wi = let wr = WindowRef (wiWindowId wi) (wiPid wi) in W.member wr ws
+        unmatched = filter (not . inWs) lives
+        expectedNew = [ WindowRef (wiWindowId wi) (wiPid wi) | wi <- unmatched ]
+    in counterexample ("extras=" ++ show extras ++ " unmatched=" ++ show expectedNew) $
+       map (\wr -> (wrWindowId wr, wrPid wr)) expectedNew
+       === map (\wr -> (wrWindowId wr, wrPid wr)) extras
 
--- Class-tier handling: N class-equal saved entries (same bundleId +
--- subrole, no axId, no titleHash) get matched to N class-equal lives
--- in deterministic order. Important for browser-like apps where every
--- window has the same identity attributes.
-prop_matcher_class_tier_multi :: Positive Int -> Property
-prop_matcher_class_tier_multi (Positive nRaw) =
-    let n = 1 + (nRaw `mod` 6)   -- 1..6
-        classOnly = StableWindowId
-            { swiBundleId     = Just "com.app.browser"
-            , swiAxIdentifier = Nothing
-            , swiSubrole      = Just "AXStandardWindow"
-            , swiTitleHash    = Nothing
-            }
-        savedIds = replicate n classOnly
-        savedStack = Just (SerStack (head savedIds) [] (tail savedIds))
+-- Round-trip preservation: saved windows that survive land on the
+-- workspace they were saved to (not somewhere else).
+prop_persistence_workspace_preserved :: Property
+prop_persistence_workspace_preserved = forAll genPersistCase $ \(savedRefs, kept, _extras) ->
+    let saved = buildSavedState savedRefs
+        ws0 :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
+        liveSet = Set.fromList kept
+        stale = filter (`Set.notMember` liveSet) (W.allWindows ws0)
+        ws = foldr W.delete' ws0 stale
+        -- Expected: "L" holds wrL1 and/or wrL2; "R" holds wrR1.
+        [wrL1, wrL2, wrR1] = savedRefs
+        windowsOn tag = case lookup tag [(W.tag w, W.integrate' (W.stack w))
+                                          | w <- W.workspaces ws] of
+            Just xs -> xs
+            Nothing -> []
+        lWins = windowsOn "L"
+        rWins = windowsOn "R"
+    in conjoin
+        [ counterexample ("wrL1 on L? kept=" ++ show kept)
+            ((wrL1 `elem` kept) === (wrL1 `elem` lWins))
+        , counterexample ("wrL2 on L? kept=" ++ show kept)
+            ((wrL2 `elem` kept) === (wrL2 `elem` lWins))
+        , counterexample ("wrR1 on R? kept=" ++ show kept)
+            ((wrR1 `elem` kept) === (wrR1 `elem` rWins))
+        ]
+
+-- === serialToWindowSet RESPECTS ssAffinity ===
+--
+-- The regression sentinel for the Mod-w/Mod-e wrong-screen bug. The
+-- pre-fix rebuilder put 'ssCurrentTag' on screen 0 and the remaining
+-- workspaces on screens 1+ in config order, ignoring 'ssAffinity'.
+-- On a two-monitor setup this swapped which workspace each monitor
+-- held whenever 'ssCurrentTag' had been on screen 1 at save time.
+
+-- Two screens, two workspaces with explicit affinity to opposite
+-- screens — the rebuilder must place each on its saved screen,
+-- regardless of which one is the saved current.
+prop_serialToWindowSet_respects_affinity_two_screens :: Bool -> Property
+prop_serialToWindowSet_respects_affinity_two_screens currentIsLeft =
+    let tagL = "L"
+        tagR = "R"
+        allTags = [tagL, tagR]
+        screens = [ (S 0, SD (Rectangle 0 0 1000 1000))
+                  , (S 1, SD (Rectangle 1000 0 1000 1000))
+                  ]
         saved = SerialState
             { ssVersion    = persistenceVersion
-            , ssStacks     = [("ws", savedStack)]
-            , ssCurrentTag = "ws"
+            , ssStacks     = [(tagL, Nothing), (tagR, Nothing)]
+            , ssCurrentTag = if currentIsLeft then tagL else tagR
             , ssFloating   = []
-            , ssAffinity   = [("ws", 0)]
+            , ssAffinity   = [(tagL, 0), (tagR, 1)]
             }
-        -- Lives have unique-but-meaningless titleHashes; class still matches.
-        lives =
-            [ (windowInfoFor (1000 + fromIntegral i) 42 classOnly)
-                { wiIdentityHash = Just (T.pack ("hash-" ++ show i)) }
-            | i <- [0 .. n - 1]
-            ]
-        result = matchWindows saved lives
-    in counterexample (show result) $
-       Map.size (mrIdentities result) === n
-       .&&. null (mrUnmatched result)
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+        tagOn n = listToMaybe
+                $ [ W.tag (W.workspace s)
+                  | s <- W.current ws : W.visible ws
+                  , W.screen s == S n
+                  ]
+    in counterexample (show ws) $
+       (tagOn 0 === Just tagL) .&&. (tagOn 1 === Just tagR)
+  where
+    listToMaybe [] = Nothing
+    listToMaybe (x:_) = Just x
 
--- Tier precedence: a fully-equal candidate is preferred over a
--- class-equal candidate, even if the class-equal one appears earlier
--- in the live list.
-prop_matcher_tier_precedence :: Property
-prop_matcher_tier_precedence =
-    let target = StableWindowId
-            { swiBundleId     = Just "com.app.alpha"
-            , swiAxIdentifier = Just "main"
-            , swiSubrole      = Just "AXStandardWindow"
-            , swiTitleHash    = Just "exactmatch"
-            }
-        sameClass = StableWindowId  -- matches at tier 3 only
-            { swiBundleId     = Just "com.app.alpha"
-            , swiAxIdentifier = Just "main"
-            , swiSubrole      = Just "AXStandardWindow"
-            , swiTitleHash    = Just "differenthash"
-            }
+-- Whichever workspace was saved as current must be the current one
+-- after restore (the screen it lands on is whichever one its
+-- ssAffinity says).
+prop_serialToWindowSet_preserves_current_tag :: Bool -> Property
+prop_serialToWindowSet_preserves_current_tag currentIsLeft =
+    let tagL = "L"
+        tagR = "R"
+        allTags = [tagL, tagR]
+        screens = [ (S 0, SD (Rectangle 0 0 1000 1000))
+                  , (S 1, SD (Rectangle 1000 0 1000 1000))
+                  ]
+        cur = if currentIsLeft then tagL else tagR
         saved = SerialState
             { ssVersion    = persistenceVersion
-            , ssStacks     = [("ws", Just (SerStack target [] []))]
-            , ssCurrentTag = "ws"
+            , ssStacks     = [(tagL, Nothing), (tagR, Nothing)]
+            , ssCurrentTag = cur
             , ssFloating   = []
-            , ssAffinity   = []
+            , ssAffinity   = [(tagL, 0), (tagR, 1)]
             }
-        -- The exact match is SECOND in the live list. A naive
-        -- first-class-match-wins matcher would pick the wrong one;
-        -- the tiered matcher must prefer the exact match.
-        lives =
-            [ windowInfoFor 100 1 sameClass
-            , windowInfoFor 200 1 target
-            ]
-        result = matchWindows saved lives
-        matchedWid = case Map.toList (mrIdentities result) of
-            [(WindowRef wid _, _)] -> Just wid
-            _                      -> Nothing
-    in matchedWid === Just 200
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+    in W.currentTag ws === cur
 
--- A saved id that has no compatible live at any tier produces no
--- match. The corresponding entry vanishes from mrResolved.
-prop_matcher_unmatched_saved_disappears :: Property
-prop_matcher_unmatched_saved_disappears =
-    let savedId = StableWindowId
-            { swiBundleId     = Just "com.app.nonexistent"
-            , swiAxIdentifier = Just "unique"
-            , swiSubrole      = Just "AXDialog"
-            , swiTitleHash    = Just "zzzz"
-            }
+-- When 'ssAffinity' is empty (e.g. a save from an older format or a
+-- single-screen session), the rebuilder must still produce something
+-- sensible: the saved current tag goes on the first screen, the rest
+-- in config order.
+prop_serialToWindowSet_no_affinity_falls_back :: Property
+prop_serialToWindowSet_no_affinity_falls_back =
+    let allTags = ["a", "b", "c"]
+        screens = [(S 0, SD (Rectangle 0 0 1000 1000))]
         saved = SerialState
             { ssVersion    = persistenceVersion
-            , ssStacks     = [("ws", Just (SerStack savedId [] []))]
-            , ssCurrentTag = "ws"
-            , ssFloating   = [(savedId, (0, 0, 1, 1))]
-            , ssAffinity   = []
+            , ssStacks     = []
+            , ssCurrentTag = "b"
+            , ssFloating   = []
+            , ssAffinity   = []        -- no affinity hints
             }
-        lives = [windowInfoFor 1 1 (StableWindowId
-            { swiBundleId     = Just "com.app.completelydifferent"
-            , swiAxIdentifier = Nothing
-            , swiSubrole      = Just "AXStandardWindow"
-            , swiTitleHash    = Nothing
-            })]
-        result = matchWindows saved lives
-        resolved = mrResolved result
-    in (Map.size (mrIdentities result) === 0)
-       .&&. (lookup "ws" (ssStacks resolved) === Just Nothing)
-       .&&. (ssFloating resolved === [])
-
--- persistenceVersion is preserved through matching.
-prop_matcher_preserves_version :: RoundTripCase -> Property
-prop_matcher_preserves_version (RoundTripCase saved lives _) =
-    ssVersion (mrResolved (matchWindows saved lives))
-        === ssVersion saved
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+    in W.currentTag ws === "b"
 
 -- Collect all properties
 allProperties :: [(String, Property)]
@@ -707,18 +726,22 @@ allProperties =
     , ("viewOnScreen places workspace", property prop_viewOnScreen_places_workspace)
     -- Focus resolution (multi-window-per-app focus fix)
     , ("focusedWindow picks exact",                  property prop_focusedWindow_picks_exact)
+    , ("focusedWindow off-workspace is no-op",       property prop_focusedWindow_off_workspace_is_no_op)
+    , ("focusedWindow never switches workspace",     property prop_focusedWindow_never_switches_workspace)
     , ("focusedWindow invariant",                    property prop_focusedWindow_invariant)
     , ("focusedWindow unknown is no-op",             property prop_focusedWindow_unknown_noop)
     , ("focusedWindow distinguishes shared-PID",     property prop_focusedWindow_distinguishes_shared_pid)
     , ("broken PID-only is indistinguishable",       property prop_brokenPidOnly_indistinguishable)
     , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
-    , ("frontApp switches across apps",              property prop_frontApp_switches_across)
+    , ("frontApp switches within workspace",         property prop_frontApp_switches_within_workspace)
+    , ("frontApp never switches workspace",          property prop_frontApp_never_switches_workspace)
     -- Cross-restart identity matcher
-    , ("matcher round-trip",                          property prop_matcher_round_trip)
-    , ("matcher partitions lives",                    property prop_matcher_partition)
-    , ("matcher is deterministic",                    property prop_matcher_deterministic)
-    , ("matcher class tier handles N candidates",     property prop_matcher_class_tier_multi)
-    , ("matcher prefers exact over class",            property prop_matcher_tier_precedence)
-    , ("matcher drops unmatched saved entries",       property prop_matcher_unmatched_saved_disappears)
-    , ("matcher preserves persistenceVersion",        property prop_matcher_preserves_version)
+    -- Persistence round-trip (WindowRef identity)
+    , ("persistence: kept saved survives, stale dropped", property prop_persistence_round_trip)
+    , ("persistence: live-not-saved becomes 'new'",       property prop_persistence_unmatched_are_new)
+    , ("persistence: surviving windows stay on workspace",property prop_persistence_workspace_preserved)
+    -- serialToWindowSet restoring per-screen workspace assignment
+    , ("serialToWindowSet respects ssAffinity",       property prop_serialToWindowSet_respects_affinity_two_screens)
+    , ("serialToWindowSet preserves current tag",     property prop_serialToWindowSet_preserves_current_tag)
+    , ("serialToWindowSet no affinity falls back",    property prop_serialToWindowSet_no_affinity_falls_back)
     ]

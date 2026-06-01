@@ -86,12 +86,13 @@ module MCMonad.Persistence
     , matchWindows
     ) where
 
+import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import qualified XMonad.StackSet as W
 
 import MCMonad.Core
-    ( WindowRef(..), ScreenId(..), ScreenDetail(..), WindowSet, Layout
+    ( WindowRef(..), ScreenId(..), ScreenDetail(..), WindowSet
     , StableWindowId(..)
     )
 import MCMonad.IPC (WindowInfo(..))
@@ -214,11 +215,11 @@ windowSetToSerial ws aff idMap = SerialState
 -- 'SerialState' that has already been resolved to live 'WindowRef's,
 -- the current screen configuration, and the config's layout.
 serialToWindowSet
-    :: Layout WindowRef                    -- ^ from @config.layoutHook@
+    :: l                                   -- ^ from @config.layoutHook@ — opaque to the rebuilder
     -> [String]                            -- ^ all workspace tags from config
     -> [(ScreenId, ScreenDetail)]          -- ^ live screen geometry
     -> SerialState WindowRef
-    -> WindowSet
+    -> W.StackSet String l WindowRef ScreenId ScreenDetail
 serialToWindowSet layout allTags screens saved =
     W.StackSet
         { W.current  = currentSc
@@ -235,24 +236,68 @@ serialToWindowSet layout allTags screens saved =
         Just (Just s) -> Just (W.Stack (ssFocus s) (ssUp s) (ssDown s))
         _             -> Nothing
 
-    -- Put the saved current tag on the first screen; remaining visible
-    -- screens get tags in saved order; the rest are hidden.
-    cur = ssCurrentTag saved
-    rest = filter (/= cur) allTags
-    ordered = if cur `elem` allTags then cur : rest else allTags
-
-    (visTags, hidTags) = splitAt (max 1 (length screens)) ordered
-
-    currentSc = case (visTags, screens) of
-        (tag:_, (sid, sd):_) -> W.Screen (mkWorkspace tag) sid sd
-        _ -> error "MCMonad.Persistence.serialToWindowSet: no screens"
-
-    visibleScs =
-        [ W.Screen (mkWorkspace tag) sid sd
-        | (tag, (sid, sd)) <- zip (drop 1 visTags) (drop 1 screens)
+    -- Pre-built affinity lookup: ScreenId index → tag at save time.
+    -- Drop entries whose tag is no longer in the config (renamed,
+    -- removed) so we don't try to assign a tag that 'mkWorkspace'
+    -- couldn't sensibly produce.
+    affByScreen :: Map.Map Int String
+    affByScreen = Map.fromList
+        [ (sid, tag)
+        | (tag, sid) <- ssAffinity saved
+        , tag `elem` allTags
         ]
+    affTags = Map.elems affByScreen
 
-    hiddenWSs = map mkWorkspace hidTags
+    -- Tags that affinity didn't claim, with 'ssCurrentTag' moved to the
+    -- front when it's still unclaimed. The reorder preserves the
+    -- pre-fix behaviour for files with empty affinity (older format,
+    -- fresh restore) — 'ssCurrentTag' lands on the first unassigned
+    -- screen — while still respecting affinity when it's there.
+    poolInit =
+        let unused = filter (`notElem` affTags) allTags
+            cur    = ssCurrentTag saved
+        in if cur `elem` unused
+            then cur : filter (/= cur) unused
+            else unused
+
+    -- For each present screen, in ScreenId order, pick the tag that
+    -- had affinity for that index at save time. Fall back to the next
+    -- tag from 'poolInit' if no affinity entry exists (e.g. screen
+    -- added since save, or the saved file pre-dates the affinity
+    -- field).
+    --
+    -- Without this, the previous version unconditionally put
+    -- 'ssCurrentTag' on screen 0 and remaining workspaces on
+    -- screens 1+ in config order. On a two-monitor setup that
+    -- swapped which workspace each monitor held whenever
+    -- 'ssCurrentTag' had been on screen 1 at save time, and
+    -- Mod-w/Mod-e (focus screen 0 / 1) landed on the wrong workspace.
+    (assignments, leftover) = foldl' assignOne ([], poolInit) screens
+      where
+        assignOne (acc, pool) (sid@(S i), sd) =
+            case Map.lookup i affByScreen of
+                Just tag -> (acc ++ [(sid, sd, tag)], pool)
+                Nothing  -> case pool of
+                    (t:rest') -> (acc ++ [(sid, sd, t)], rest')
+                    []        -> error
+                        "MCMonad.Persistence.serialToWindowSet: \
+                        \fewer config workspaces than screens"
+
+    -- The current screen is the one whose chosen tag matches the
+    -- saved 'ssCurrentTag'. If 'ssCurrentTag' doesn't appear in any
+    -- assignment (renamed-away workspace, or screen count decreased),
+    -- fall back to the first assignment.
+    mkScreen (sid, sd, tag) = W.Screen (mkWorkspace tag) sid sd
+    (currentSc, visibleScs) =
+        case break (\(_, _, t) -> t == ssCurrentTag saved) assignments of
+            (before, curr:after) ->
+                (mkScreen curr, map mkScreen (before ++ after))
+            (_, []) -> case assignments of
+                (a:rest') -> (mkScreen a, map mkScreen rest')
+                []        -> error
+                    "MCMonad.Persistence.serialToWindowSet: no screens"
+
+    hiddenWSs = map mkWorkspace leftover
 
 -- ---------------------------------------------------------------------------
 -- Matcher

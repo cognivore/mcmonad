@@ -12,6 +12,7 @@ import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
     ( SerialState(..), SerStack(..), MatchResult(..)
     , matchWindows, stableIdFor, persistenceVersion
+    , serialToWindowSet
     )
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
@@ -721,6 +722,87 @@ prop_matcher_preserves_version (RoundTripCase saved lives _) =
     ssVersion (mrResolved (matchWindows saved lives))
         === ssVersion saved
 
+-- === serialToWindowSet RESPECTS ssAffinity ===
+--
+-- The regression sentinel for the Mod-w/Mod-e wrong-screen bug. The
+-- pre-fix rebuilder put 'ssCurrentTag' on screen 0 and the remaining
+-- workspaces on screens 1+ in config order, ignoring 'ssAffinity'.
+-- On a two-monitor setup this swapped which workspace each monitor
+-- held whenever 'ssCurrentTag' had been on screen 1 at save time.
+
+-- Two screens, two workspaces with explicit affinity to opposite
+-- screens — the rebuilder must place each on its saved screen,
+-- regardless of which one is the saved current.
+prop_serialToWindowSet_respects_affinity_two_screens :: Bool -> Property
+prop_serialToWindowSet_respects_affinity_two_screens currentIsLeft =
+    let tagL = "L"
+        tagR = "R"
+        allTags = [tagL, tagR]
+        screens = [ (S 0, SD (Rectangle 0 0 1000 1000))
+                  , (S 1, SD (Rectangle 1000 0 1000 1000))
+                  ]
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = [(tagL, Nothing), (tagR, Nothing)]
+            , ssCurrentTag = if currentIsLeft then tagL else tagR
+            , ssFloating   = []
+            , ssAffinity   = [(tagL, 0), (tagR, 1)]
+            }
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+        tagOn n = listToMaybe
+                $ [ W.tag (W.workspace s)
+                  | s <- W.current ws : W.visible ws
+                  , W.screen s == S n
+                  ]
+    in counterexample (show ws) $
+       (tagOn 0 === Just tagL) .&&. (tagOn 1 === Just tagR)
+  where
+    listToMaybe [] = Nothing
+    listToMaybe (x:_) = Just x
+
+-- Whichever workspace was saved as current must be the current one
+-- after restore (the screen it lands on is whichever one its
+-- ssAffinity says).
+prop_serialToWindowSet_preserves_current_tag :: Bool -> Property
+prop_serialToWindowSet_preserves_current_tag currentIsLeft =
+    let tagL = "L"
+        tagR = "R"
+        allTags = [tagL, tagR]
+        screens = [ (S 0, SD (Rectangle 0 0 1000 1000))
+                  , (S 1, SD (Rectangle 1000 0 1000 1000))
+                  ]
+        cur = if currentIsLeft then tagL else tagR
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = [(tagL, Nothing), (tagR, Nothing)]
+            , ssCurrentTag = cur
+            , ssFloating   = []
+            , ssAffinity   = [(tagL, 0), (tagR, 1)]
+            }
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+    in W.currentTag ws === cur
+
+-- When 'ssAffinity' is empty (e.g. a save from an older format or a
+-- single-screen session), the rebuilder must still produce something
+-- sensible: the saved current tag goes on the first screen, the rest
+-- in config order.
+prop_serialToWindowSet_no_affinity_falls_back :: Property
+prop_serialToWindowSet_no_affinity_falls_back =
+    let allTags = ["a", "b", "c"]
+        screens = [(S 0, SD (Rectangle 0 0 1000 1000))]
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = []
+            , ssCurrentTag = "b"
+            , ssFloating   = []
+            , ssAffinity   = []        -- no affinity hints
+            }
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+    in W.currentTag ws === "b"
+
 -- Collect all properties
 allProperties :: [(String, Property)]
 allProperties =
@@ -791,4 +873,8 @@ allProperties =
     , ("matcher prefers exact over class",            property prop_matcher_tier_precedence)
     , ("matcher drops unmatched saved entries",       property prop_matcher_unmatched_saved_disappears)
     , ("matcher preserves persistenceVersion",        property prop_matcher_preserves_version)
+    -- serialToWindowSet restoring per-screen workspace assignment
+    , ("serialToWindowSet respects ssAffinity",       property prop_serialToWindowSet_respects_affinity_two_screens)
+    , ("serialToWindowSet preserves current tag",     property prop_serialToWindowSet_preserves_current_tag)
+    , ("serialToWindowSet no affinity falls back",    property prop_serialToWindowSet_no_affinity_falls_back)
     ]

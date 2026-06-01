@@ -321,35 +321,52 @@ updateAffinities ws existing =
 -- live here so the bug-prone PID-only path can be exercised by tests
 -- alongside the precise per-window path.
 
--- | Windows currently visible on a screen (current workspace plus any
--- workspace on a visible secondary screen). Excludes hidden workspaces
--- — this is the set the user can actually look at right now.
+-- | Windows on the current workspace's stack — and *only* the
+-- current workspace.
 --
--- macOS-originated focus events (AX 'kAXFocusedWindowChangedNotification',
--- SkyLight 1508 frontmost-app, 'NSWorkspace.didActivateApplicationNotification')
--- fire for windows that mcmonad has hidden — Chrome rendering a background
--- tab, Librewolf callbacks, Electron polling. Allowing those events to
--- match against 'W.allWindows' is a bug: 'W.focusWindow' on a hidden
--- window calls 'view' on its workspace, silently dragging the current
--- screen onto a workspace the user didn't ask to see. With 'visibleWindows'
--- as the lookup set, macOS can fire as much as it likes — we only act on
--- windows that are already on-screen.
-visibleWindows :: W.StackSet i l a sid sd -> [a]
-visibleWindows ws =
-    concatMap (W.integrate' . W.stack . W.workspace)
-              (W.current ws : W.visible ws)
+-- macOS-originated focus events fire for an enormous number of
+-- reasons we can't disambiguate from the user's intent: a background
+-- tab repaint, a network callback, an app deactivating as a side
+-- effect of *our own* 'FocusWindow' command. The 'NSWorkspace'
+-- frontmost-app notification fires when an app activates, including
+-- as the immediate side effect of macOS opening a new window of
+-- that app.
+--
+-- An earlier version of these helpers used 'W.allWindows', which let
+-- a hidden-workspace window claim focus and silently dragged the
+-- current screen there via 'W.focusWindow''s implicit 'view' call.
+-- The next iteration used a 'visibleWindows' helper that included
+-- the secondary screen's workspace — still wrong, because the same
+-- spurious AX events still pulled focus onto the *other* monitor
+-- (the Mod-j-cycles-out-to-the-other-screen bug; the
+-- new-Ghostty-tab-lands-on-the-wrong-screen bug, where 'resolveFrontApp'
+-- ran first on a hidden Ghostty and swapped screens before the
+-- 'windowCreated' arrived and inserted the new tab on the now-current
+-- workspace).
+--
+-- Restricting to the current workspace is the safe rule: AX can fire
+-- for whatever, we only act when the implied focus target is already
+-- on the screen the user is looking at. Cross-screen focus follows
+-- through 'MouseEnteredWindow' instead — that's bounded to actual
+-- mouse-enter events, not AX cascades.
+currentWorkspaceWindows :: W.StackSet i l a sid sd -> [a]
+currentWorkspaceWindows ws =
+    W.integrate' (W.stack (W.workspace (W.current ws)))
 
 -- | Resolve focus from a precise AX focused-window-changed event.
 --
--- Returns the updated StackSet when the target window is currently
--- visible and isn't already focused; 'Nothing' otherwise (no-op).
+-- Returns the updated StackSet when the target window is on the
+-- *current* workspace and isn't already focused; 'Nothing' otherwise
+-- (no-op).
 --
--- This is the path that fixes the multi-window-per-app focus bug: the
--- AX observer reports the *exact* CGWindowID the user activated, so we
--- never have to guess among windows that share a PID.
+-- This is the path that fixes the multi-window-per-app focus bug
+-- within a workspace: the AX observer reports the *exact* CGWindowID
+-- the user activated, so we never have to guess among windows that
+-- share a PID on the focused workspace.
 --
--- The visibility restriction prevents macOS-driven background activity
--- from triggering workspace switches — see 'visibleWindows'.
+-- The current-workspace restriction (see 'currentWorkspaceWindows')
+-- means AX events never cause cross-screen swaps. Cross-screen focus
+-- is the job of 'MouseEnteredWindow'.
 --
 -- Polymorphic in the StackSet type parameters so the test suite (which
 -- uses @Int@ for the layout slot) can exercise this directly.
@@ -359,7 +376,7 @@ resolveFocusedWindow
     -> W.StackSet i l WindowRef sid sd
     -> Maybe (W.StackSet i l WindowRef sid sd)
 resolveFocusedWindow wid pid ws =
-    case find match (visibleWindows ws) of
+    case find match (currentWorkspaceWindows ws) of
         Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
         _                              -> Nothing
   where
@@ -368,18 +385,11 @@ resolveFocusedWindow wid pid ws =
 -- | Resolve focus from a PID-only front-app-changed event.
 --
 -- Returns the updated StackSet only when the user actually switched to
--- a *different* app — i.e. the currently focused window does not belong
--- to @pid@. When focus is already inside that app, we leave it alone so
--- the precise AX-driven focus inside the app survives.
---
--- The visibility restriction prevents macOS-side activation of an app
--- whose only windows are on hidden workspaces from dragging the user
--- onto one of those workspaces — see 'visibleWindows'.
---
--- This avoids the historic bug where a multi-window app (a browser
--- with several windows on one workspace, etc.) would collapse to "the
--- first window of this PID" on every front-app event, including the
--- one that fires when you click a window of the already-active app.
+-- a *different* app *and* that app has a window on the current
+-- workspace. When focus is already inside that app, we leave it
+-- alone. When the app's windows are all on other workspaces (hidden
+-- or visible-secondary), we no-op — same reason as
+-- 'resolveFocusedWindow'.
 resolveFrontApp
     :: (Eq i, Eq sid)
     => Int32
@@ -387,6 +397,6 @@ resolveFrontApp
     -> Maybe (W.StackSet i l WindowRef sid sd)
 resolveFrontApp pid ws = case W.peek ws of
     Just w | wrPid w == pid -> Nothing
-    _ -> case find ((== pid) . wrPid) (visibleWindows ws) of
+    _ -> case find ((== pid) . wrPid) (currentWorkspaceWindows ws) of
         Just wr -> Just (W.focusWindow wr ws)
         Nothing -> Nothing

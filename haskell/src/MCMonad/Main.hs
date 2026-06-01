@@ -344,9 +344,12 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- it is the only signal that distinguishes between multiple
             -- windows of the same PID. Do NOT echo a FocusWindow back to
             -- Swift — macOS already focused it; we'd just feedback-loop.
+            -- Push a fresh OverlaySnapshot so the debug overlay's blue
+            -- focused-label moves to the newly-focused window.
             ws <- gets windowset
-            whenJust (resolveFocusedWindow wid pid ws) $ \ws' ->
+            whenJust (resolveFocusedWindow wid pid ws) $ \ws' -> do
                 modify $ \s -> s { windowset = ws' }
+                pushOverlaySnapshot
 
         FrontAppChanged pid -> do
             -- App-level activation (NSWorkspace / SkyLight 1508). Carries
@@ -354,9 +357,11 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- *across* apps. Within an app, the precise AX-driven
             -- FocusedWindowChanged is authoritative — letting this path
             -- run would clobber it with "first window of this PID".
+            -- Push the overlay snapshot for the same reason as above.
             ws <- gets windowset
-            whenJust (resolveFrontApp pid ws) $ \ws' ->
+            whenJust (resolveFrontApp pid ws) $ \ws' -> do
                 modify $ \s -> s { windowset = ws' }
+                pushOverlaySnapshot
 
         MouseEnteredWindow wid _pid ->
             when (focusFollowsMouse cfg) $ do

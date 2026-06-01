@@ -7,6 +7,7 @@ module MCMonad.Operations
     , unmanage
       -- * Overlay snapshot
     , buildOverlaySnapshot
+    , pushOverlaySnapshot
       -- * Layout messages
     , sendMessage
     , sendMessageWithNoRefresh
@@ -325,6 +326,18 @@ buildOverlaySnapshot = do
         , osScreens          = screens
         , osHiddenWorkspaces = hidden
         }
+
+-- | Build a snapshot of the current state and push it to mcmonad-core
+-- as a single 'SetOverlayState' command. Use this from focus-event
+-- handlers that update 'windowset' via 'modify' (and therefore bypass
+-- 'windows', which is the regular snapshot push site at step 10b):
+-- without it, the debug overlay's blue focused-label and the menubar
+-- workspace tree stay stuck on the previous focus.
+pushOverlaySnapshot :: M ()
+pushOverlaySnapshot = do
+    snap <- buildOverlaySnapshot
+    conn <- asks connection
+    io $ sendCommand conn (SetOverlayState snap)
 
 -- | Build the per-window entries for one workspace.
 workspaceWindows

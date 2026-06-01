@@ -53,6 +53,36 @@ final class AXFocusTracker {
         )
         observers[pid] = observer
         Self.logger.debug("Tracking AX focus for pid \(pid)")
+
+        // Subscribing to kAXFocusedWindowChangedNotification only delivers
+        // *changes*, not the current state. Query the focused window now so
+        // apps that were already focused when we started tracking — e.g. the
+        // active window at mcmonad-core launch, or a browser whose first
+        // window was opened before we registered the observer — get a
+        // focusedWindowChanged event immediately. Without this, focus inside
+        // such apps would stay wrong until the user clicks again.
+        if let wid = Self.currentFocusedWindowId(appElement: appElement) {
+            onFocusedWindowChanged?(wid, pid)
+        }
+    }
+
+    /// Read the currently-focused window of an app and return its CGWindowID,
+    /// or nil if AX can't resolve it (permission missing, no focused window,
+    /// or the focused element doesn't have a window id).
+    private static func currentFocusedWindowId(appElement: AXUIElement) -> UInt32? {
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                appElement,
+                kAXFocusedWindowAttribute as CFString,
+                &focusedRef
+              ) == .success,
+              let focused = focusedRef,
+              CFGetTypeID(focused) == AXUIElementGetTypeID()
+        else { return nil }
+        let element = unsafeDowncast(focused as AnyObject, to: AXUIElement.self)
+        var wid: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &wid) == .success else { return nil }
+        return UInt32(wid)
     }
 
     func untrackApp(pid: pid_t) {

@@ -53,7 +53,7 @@ import MCMonad.Core (Connection(..), Rectangle(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 1
+protocolVersion = 2
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -152,6 +152,7 @@ data Event
     | WindowDestroyed !Word32
     | WindowFrameChanged !Word32 !Rectangle
     | FrontAppChanged !Int32
+    | FocusedWindowChanged !Word32 !Int32
     | ScreensChanged [ScreenInfo]
     | HotkeyPressed !Int
     | MouseEnteredWindow !Word32 !Int32
@@ -219,6 +220,7 @@ instance Aeson.FromJSON Event where
                 "window-destroyed"     -> WindowDestroyed    <$> v .: "windowId"
                 "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
+                "focused-window-changed" -> FocusedWindowChanged <$> v .: "windowId" <*> v .: "pid"
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"

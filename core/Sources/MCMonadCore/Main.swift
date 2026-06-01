@@ -8,11 +8,47 @@ private let logger = Logger(subsystem: "com.mcmonad.core", category: "Main")
 @MainActor
 final class EventBridge: SkyLightEventDelegate {
     let socketServer: SocketServer
+    let focusTracker: AXFocusTracker
     /// Window IDs we have reported as created but not yet destroyed.
     private var managedWindowIds: Set<UInt32> = []
+    /// Reverse map for destroy/close events (which only carry wid).
+    private var windowIdToPid: [UInt32: pid_t] = [:]
+    /// Per-PID set of currently-managed window ids. Drives trackApp/
+    /// untrackApp so the AX observer for an app exists exactly when at
+    /// least one of its windows is managed.
+    private var pidWindowIds: [pid_t: Set<UInt32>] = [:]
 
-    init(socketServer: SocketServer) {
+    init(socketServer: SocketServer, focusTracker: AXFocusTracker) {
         self.socketServer = socketServer
+        self.focusTracker = focusTracker
+    }
+
+    /// Register a managed window. Starts AX focus tracking for the PID on
+    /// the first window of that PID.
+    private func addManagedWindow(windowId: UInt32, pid: pid_t) {
+        managedWindowIds.insert(windowId)
+        windowIdToPid[windowId] = pid
+        let wasEmpty = (pidWindowIds[pid]?.isEmpty ?? true)
+        pidWindowIds[pid, default: []].insert(windowId)
+        if wasEmpty {
+            focusTracker.trackApp(pid: pid)
+        }
+    }
+
+    /// Unregister a managed window. Stops AX focus tracking for the PID
+    /// once the last window of that PID is gone.
+    private func removeManagedWindow(windowId: UInt32) {
+        managedWindowIds.remove(windowId)
+        guard let pid = windowIdToPid.removeValue(forKey: windowId) else { return }
+        if var wids = pidWindowIds[pid] {
+            wids.remove(windowId)
+            if wids.isEmpty {
+                pidWindowIds.removeValue(forKey: pid)
+                focusTracker.untrackApp(pid: pid)
+            } else {
+                pidWindowIds[pid] = wids
+            }
+        }
     }
 
     /// Check all managed windows still exist in the window server.
@@ -22,7 +58,7 @@ final class EventBridge: SkyLightEventDelegate {
             SkyLightQuery.queryWindow(wid) == nil
         }
         for wid in stale {
-            managedWindowIds.remove(wid)
+            removeManagedWindow(windowId: wid)
             socketServer.send(.windowDestroyed(windowId: wid))
         }
     }
@@ -48,17 +84,17 @@ final class EventBridge: SkyLightEventDelegate {
                 guard info.hasCloseButton else { return }
 
                 observer.subscribeToWindows([windowId])
-                managedWindowIds.insert(windowId)
+                addManagedWindow(windowId: windowId, pid: snap.pid)
                 socketServer.send(.windowCreated(info))
             }
 
         case .destroyed(let windowId, _):
-            managedWindowIds.remove(windowId)
+            removeManagedWindow(windowId: windowId)
             TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .closed(let windowId):
-            managedWindowIds.remove(windowId)
+            removeManagedWindow(windowId: windowId)
             TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
@@ -145,8 +181,22 @@ struct MCMonadCoreApp {
             executor.execute(command)
         }
 
+        // Wire AXFocusTracker — gives us per-window focus events from AX,
+        // which carry the actual focused windowId (unlike SkyLight 1508 and
+        // NSWorkspace activation, which only know the app PID). Without
+        // this, multi-window apps (browsers, etc.) collapse to "focus the
+        // first window of this PID" when the user clicks any of them.
+        let focusTracker = AXFocusTracker()
+        AXFocusTracker.shared = focusTracker
+        focusTracker.onFocusedWindowChanged = { [weak socketServer] windowId, pid in
+            FocusLog.emit(source: .emitFocusedWindowChanged,
+                          windowId: windowId, pid: pid,
+                          extra: "via=axFocusedWindowChanged")
+            socketServer?.send(.focusedWindowChanged(windowId: windowId, pid: pid))
+        }
+
         // Wire SkyLightEventObserver (singleton, delegate-based) to socket
-        let eventBridge = EventBridge(socketServer: socketServer)
+        let eventBridge = EventBridge(socketServer: socketServer, focusTracker: focusTracker)
         let eventObserver = SkyLightEventObserver.shared
         eventObserver.delegate = eventBridge
 

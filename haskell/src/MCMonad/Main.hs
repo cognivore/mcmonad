@@ -339,15 +339,24 @@ handleEvent debug cfg hotkeyIdMap evt = do
                     rh = toRational (rect_h rect / rect_h screenR)
                 windows (W.float wr (W.RationalRect rx ry rw rh))
 
-        FrontAppChanged pid -> do
-            -- User clicked a window — update StackSet focus WITHOUT sending
-            -- FocusWindow back (macOS already focused it). Avoids feedback loop.
+        FocusedWindowChanged wid pid -> do
+            -- AX reported the exact focused window of an app. Trust this:
+            -- it is the only signal that distinguishes between multiple
+            -- windows of the same PID. Do NOT echo a FocusWindow back to
+            -- Swift — macOS already focused it; we'd just feedback-loop.
             ws <- gets windowset
-            let mref = find (\w -> wrPid w == pid) (W.allWindows ws)
-            case mref of
-                Just wref | W.peek ws /= Just wref ->
-                    modify $ \s -> s { windowset = W.focusWindow wref (windowset s) }
-                _ -> return ()
+            whenJust (resolveFocusedWindow wid pid ws) $ \ws' ->
+                modify $ \s -> s { windowset = ws' }
+
+        FrontAppChanged pid -> do
+            -- App-level activation (NSWorkspace / SkyLight 1508). Carries
+            -- no windowId, so we only act when the user actually switched
+            -- *across* apps. Within an app, the precise AX-driven
+            -- FocusedWindowChanged is authoritative — letting this path
+            -- run would clobber it with "first window of this PID".
+            ws <- gets windowset
+            whenJust (resolveFrontApp pid ws) $ \ws' ->
+                modify $ \s -> s { windowset = ws' }
 
         MouseEnteredWindow wid _pid ->
             when (focusFollowsMouse cfg) $ do

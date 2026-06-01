@@ -2,10 +2,15 @@ module Properties where
 
 import Test.QuickCheck
 import qualified XMonad.StackSet as W
-import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..), updateAffinities)
+import MCMonad.Core
+    ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
+    , updateAffinities, resolveFocusedWindow, resolveFrontApp
+    )
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isNothing)
+import Data.Int (Int32)
 import Control.Monad (foldM)
 
 -- Simplified layout for testing (no need for real LayoutClass)
@@ -273,6 +278,117 @@ prop_viewOnScreen_places_workspace ss =
                 let ss' = viewOnScreen sid tag ss
                 in W.currentTag ss' == tag
 
+-- === FOCUS RESOLUTION (resolveFocusedWindow / resolveFrontApp) ===
+--
+-- These properties guard the multi-window-per-app focus fix. The historic
+-- bug was that on every FrontAppChanged event, focus would jump to
+-- @find ((== pid) . wrPid) (W.allWindows ws)@ — i.e. the first window
+-- with that PID — which made multi-window apps (browsers, etc.)
+-- indistinguishable when the user clicked any of their windows.
+
+-- | A StackSet containing two distinct windows that share a PID, with a
+-- handle to both. Used to demonstrate the bug and verify the fix.
+data SharedPidWindows = SharedPidWindows
+    { spsStackSet :: TestStackSet
+    , spsW1       :: WindowRef
+    , spsW2       :: WindowRef
+    }
+    deriving Show
+
+instance Arbitrary SharedPidWindows where
+    arbitrary = do
+        baseSS <- arbitrary
+        let usedWids = map wrWindowId (W.allWindows baseSS)
+        pid <- choose (1, 1000)
+        -- Use a wid range disjoint from baseSS's generator to avoid the
+        -- "insertUp of a duplicate is a no-op" trap in W.StackSet.
+        wid1 <- choose (20001, 30000) `suchThat` (`notElem` usedWids)
+        wid2 <- choose (20001, 30000) `suchThat`
+                  (\w -> w /= wid1 && w `notElem` usedWids)
+        let w1 = WindowRef wid1 pid
+            w2 = WindowRef wid2 pid
+            tag = W.currentTag baseSS
+            withW1 = W.insertUp w1 (W.view tag baseSS)
+            withBoth = W.insertUp w2 withW1
+        return (SharedPidWindows withBoth w1 w2)
+
+-- | The historic (broken) PID-only focus logic. Kept here only so the
+-- bug-reproduction property has something to test against.
+brokenPidOnlyFocus :: Int32 -> TestStackSet -> Maybe TestStackSet
+brokenPidOnlyFocus pid ws =
+    case L.find ((== pid) . wrPid) (W.allWindows ws) of
+        Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
+        _                              -> Nothing
+
+-- For any window in the StackSet, asking resolveFocusedWindow for it
+-- results in that exact window being focused — regardless of whether
+-- other windows share its PID.
+prop_focusedWindow_picks_exact :: TestStackSet -> Property
+prop_focusedWindow_picks_exact ss = case W.allWindows ss of
+    [] -> property True
+    wins -> forAll (elements wins) $ \wr ->
+        let r = resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
+            focused = maybe (W.peek ss) W.peek r
+        in focused === Just wr
+
+-- resolveFocusedWindow preserves the no-duplicates invariant.
+prop_focusedWindow_invariant :: TestStackSet -> Property
+prop_focusedWindow_invariant ss = case W.allWindows ss of
+    [] -> property True
+    wins -> forAll (elements wins) $ \wr ->
+        property $ maybe True invariant
+                 $ resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
+
+-- An unknown (wid, pid) is a no-op. Wid is outside both the base
+-- generator range (1..10000) and the SharedPidWindows range (20001..30000).
+prop_focusedWindow_unknown_noop :: TestStackSet -> Bool
+prop_focusedWindow_unknown_noop ss =
+    isNothing (resolveFocusedWindow 4294967290 (-12345) ss)
+
+-- THE BUG REPRO. With two windows sharing a PID, resolveFocusedWindow
+-- distinguishes between them: asking for w1 focuses w1, asking for w2
+-- focuses w2.
+prop_focusedWindow_distinguishes_shared_pid :: SharedPidWindows -> Property
+prop_focusedWindow_distinguishes_shared_pid (SharedPidWindows ss w1 w2) =
+    let r1 = resolveFocusedWindow (wrWindowId w1) (wrPid w1) ss
+        r2 = resolveFocusedWindow (wrWindowId w2) (wrPid w2) ss
+        focused1 = maybe (W.peek ss) W.peek r1
+        focused2 = maybe (W.peek ss) W.peek r2
+    in (focused1 === Just w1) .&&. (focused2 === Just w2)
+
+-- The companion "broken logic is broken" property: with two windows
+-- sharing a PID, the historic PID-only lookup is INDISTINGUISHABLE
+-- between them — it always lands on the same window regardless of
+-- which the caller meant. This is the failure mode the fix removes.
+prop_brokenPidOnly_indistinguishable :: SharedPidWindows -> Property
+prop_brokenPidOnly_indistinguishable (SharedPidWindows ss w1 w2) =
+    let r1 = brokenPidOnlyFocus (wrPid w1) ss
+        r2 = brokenPidOnlyFocus (wrPid w2) ss
+        focused1 = maybe (W.peek ss) W.peek r1
+        focused2 = maybe (W.peek ss) W.peek r2
+    in focused1 === focused2
+
+-- resolveFrontApp is a no-op when focus is already in that PID — the
+-- precise AX-driven focus inside the app must survive.
+prop_frontApp_noop_within :: TestStackSet -> Property
+prop_frontApp_noop_within ss = case W.peek ss of
+    Nothing -> property True
+    Just wr -> property $ isNothing (resolveFrontApp (wrPid wr) ss)
+
+-- resolveFrontApp switches focus when the user crossed app boundaries.
+prop_frontApp_switches_across :: TestStackSet -> Property
+prop_frontApp_switches_across ss = case W.peek ss of
+    Nothing -> property True
+    Just wr ->
+        let otherPids = L.nub
+                      $ filter (/= wrPid wr)
+                      $ map wrPid (W.allWindows ss)
+        in case otherPids of
+            [] -> property True
+            (p:_) -> case resolveFrontApp p ss of
+                Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
+                Nothing  -> property False  -- a window of pid p exists; must switch
+
 -- Collect all properties
 allProperties :: [(String, Property)]
 allProperties =
@@ -324,4 +440,12 @@ allProperties =
     , ("updateAffinities preserves hidden", property prop_updateAffinities_preserves_hidden)
     , ("viewOnScreen invariant",  property prop_viewOnScreen_invariant)
     , ("viewOnScreen places workspace", property prop_viewOnScreen_places_workspace)
+    -- Focus resolution (multi-window-per-app focus fix)
+    , ("focusedWindow picks exact",                  property prop_focusedWindow_picks_exact)
+    , ("focusedWindow invariant",                    property prop_focusedWindow_invariant)
+    , ("focusedWindow unknown is no-op",             property prop_focusedWindow_unknown_noop)
+    , ("focusedWindow distinguishes shared-PID",     property prop_focusedWindow_distinguishes_shared_pid)
+    , ("broken PID-only is indistinguishable",       property prop_brokenPidOnly_indistinguishable)
+    , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
+    , ("frontApp switches across apps",              property prop_frontApp_switches_across)
     ]

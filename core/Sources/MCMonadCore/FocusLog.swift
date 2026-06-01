@@ -31,6 +31,7 @@ enum FocusLog {
 
         // Outgoing events from Swift to Haskell
         case emitFrontAppChanged       // socketServer.send(.frontAppChanged(...))
+        case emitFocusedWindowChanged  // socketServer.send(.focusedWindowChanged(...))
     }
 
     private static let lock = NSLock()

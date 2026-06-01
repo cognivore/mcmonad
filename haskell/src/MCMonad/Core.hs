@@ -28,6 +28,9 @@ module MCMonad.Core
     , Connection(..)
       -- * Affinity
     , updateAffinities
+      -- * Focus resolution
+    , resolveFocusedWindow
+    , resolveFrontApp
     ) where
 
 import Control.Concurrent.MVar
@@ -37,6 +40,7 @@ import Control.Monad.State.Strict
 import Data.Aeson (FromJSON(..), ToJSON(..), (.=), (.:))
 import qualified Data.Aeson as Aeson
 import Data.Int (Int32)
+import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import Data.Typeable (Typeable, cast)
@@ -276,3 +280,57 @@ updateAffinities ws existing =
         [ (W.tag (W.workspace scr), W.screen scr)
         | scr <- W.current ws : W.visible ws
         ]
+
+-- ---------------------------------------------------------------------------
+-- Focus resolution
+--
+-- These pure helpers translate a focus-change *signal* from Swift (either
+-- a precise AX-derived (wid, pid) or a PID-only NSWorkspace/SkyLight
+-- frontmost-app change) into a state transition on the 'WindowSet'. They
+-- live here so the bug-prone PID-only path can be exercised by tests
+-- alongside the precise per-window path.
+
+-- | Resolve focus from a precise AX focused-window-changed event.
+--
+-- Returns the updated StackSet when the target window exists and isn't
+-- already focused; 'Nothing' otherwise (no-op).
+--
+-- This is the path that fixes the multi-window-per-app focus bug: the
+-- AX observer reports the *exact* CGWindowID the user activated, so we
+-- never have to guess among windows that share a PID.
+--
+-- Polymorphic in the StackSet type parameters so the test suite (which
+-- uses @Int@ for the layout slot) can exercise this directly.
+resolveFocusedWindow
+    :: (Eq i, Eq sid)
+    => Word32 -> Int32
+    -> W.StackSet i l WindowRef sid sd
+    -> Maybe (W.StackSet i l WindowRef sid sd)
+resolveFocusedWindow wid pid ws =
+    case find match (W.allWindows ws) of
+        Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
+        _                              -> Nothing
+  where
+    match w = wrWindowId w == wid && wrPid w == pid
+
+-- | Resolve focus from a PID-only front-app-changed event.
+--
+-- Returns the updated StackSet only when the user actually switched to
+-- a *different* app — i.e. the currently focused window does not belong
+-- to @pid@. When focus is already inside that app, we leave it alone so
+-- the precise AX-driven focus inside the app survives.
+--
+-- This avoids the historic bug where a multi-window app (a browser
+-- with several windows on one workspace, etc.) would collapse to "the
+-- first window of this PID" on every front-app event, including the
+-- one that fires when you click a window of the already-active app.
+resolveFrontApp
+    :: (Eq i, Eq sid)
+    => Int32
+    -> W.StackSet i l WindowRef sid sd
+    -> Maybe (W.StackSet i l WindowRef sid sd)
+resolveFrontApp pid ws = case W.peek ws of
+    Just w | wrPid w == pid -> Nothing
+    _ -> case find ((== pid) . wrPid) (W.allWindows ws) of
+        Just wr -> Just (W.focusWindow wr ws)
+        Nothing -> Nothing

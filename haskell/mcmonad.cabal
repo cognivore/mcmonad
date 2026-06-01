@@ -15,6 +15,7 @@ library
     MCMonad.Layout.I3Tree
     MCMonad.ManageHook
     MCMonad.Operations
+    MCMonad.Persistence
     MCMonad.Main
     MCMonad.IPC
     MCMonad.Config
@@ -60,4 +61,5 @@ test-suite properties
     mcmonad,
     xmonad,
     QuickCheck >= 2.14,
-    containers
+    containers,
+    text

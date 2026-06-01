@@ -53,7 +53,7 @@ import MCMonad.Core (Connection(..), Rectangle(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 2
+protocolVersion = 3
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -175,6 +175,15 @@ data WindowInfo = WindowInfo
     , wiAppName             :: !(Maybe Text)
     , wiBundleId            :: !(Maybe Text)
     , wiSubrole             :: !(Maybe Text)
+    , wiAxIdentifier        :: !(Maybe Text)
+      -- ^ kAXIdentifierAttribute when present. Strongest stable
+      -- identity signal for windows whose app sets one (rare, but
+      -- when present, definitive).
+    , wiIdentityHash        :: !(Maybe Text)
+      -- ^ Salted SHA-256 of the title, computed Swift-side with a
+      -- persistent per-user salt. Used only by the cross-restart
+      -- 'StableWindowId' matcher in 'MCMonad.Persistence' — Haskell
+      -- itself never sees the raw title in any persisted file.
     , wiIsDialog            :: !Bool
     , wiIsFixedSize         :: !Bool
     , wiHasCloseButton      :: !Bool
@@ -196,6 +205,8 @@ instance Aeson.FromJSON WindowInfo where
         <*> v .:? "appName"
         <*> v .:? "bundleId"
         <*> v .:? "subrole"
+        <*> v .:? "axIdentifier"
+        <*> v .:? "identityHash"
         <*> v .:? "isDialog"    .!= False
         <*> v .:? "isFixedSize" .!= False
         <*> v .:? "hasCloseButton"      .!= True

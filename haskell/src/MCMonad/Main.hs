@@ -9,7 +9,6 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Word (Word32)
-import System.Directory (doesFileExist, removeFile)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitSuccess)
 import System.IO (hPutStrLn, stderr)
@@ -18,8 +17,11 @@ import qualified XMonad.StackSet as W
 import MCMonad.Config
 import MCMonad.Core
 import MCMonad.IPC
-import MCMonad.ManageHook (ManageHook)
 import MCMonad.Operations
+import MCMonad.Persistence
+    ( MatchResult(..), SerialState(..)
+    , matchWindows, serialToWindowSet
+    )
 
 -- | Main entry point. Connect to the Swift daemon, initialise state, and
 -- run the event loop. This is what users call from their @mcmonad.hs@:
@@ -44,8 +46,6 @@ launch cfg = do
         putStrLn (show protocolVersion)
         exitSuccess
 
-    let resuming = "--resume" `elem` args
-
     -- 1. Connect to mcmonad-core
     conn <- connectToCore
 
@@ -56,12 +56,7 @@ launch cfg = do
     sendCommand conn QueryScreens
     screens <- waitForScreens conn
 
-    -- 4. Build the initial StackSet (fresh or from saved state)
-    (ws0, mSavedState) <- if resuming
-        then loadSavedState cfg screens
-        else return (buildInitialWindowSet cfg screens, Nothing)
-
-    -- 5. Build the hotkey map and register hotkeys
+    -- 4. Build the hotkey map and register hotkeys
     let keyMap    = mcKeys cfg cfg
         keyList   = Map.toAscList keyMap
         hotkeySpecs = zipWith (\i ((mods, kc), _) -> HotkeySpec i kc mods)
@@ -71,19 +66,26 @@ launch cfg = do
                       $ zipWith (\i (_, action) -> (i, action)) [0 ..] keyList
     sendCommand conn (RegisterHotkeys hotkeySpecs)
 
-    -- 6. Query existing windows
+    -- 5. Query existing windows
     sendCommand conn QueryWindows
     existingWindows <- waitForWindows conn
 
-    -- 7. Check debug mode
+    -- 6. Check debug mode
     debug <- maybe False (const True) <$> lookupEnv "MCMONAD_DEBUG"
     when debug $ hPutStrLn stderr "mcmonad: debug logging enabled (MCMONAD_DEBUG)"
 
-    -- 8. Run the M monad
-    -- Restore affinities from saved state, or seed from initial screen layout
-    let restoredAffinity = case mSavedState of
-            Just saved -> Map.fromList [(tag, S n) | (tag, n) <- rsAffinity saved]
-            Nothing    -> initialAffinities ws0
+    -- 7. Try to restore from the persisted snapshot. This runs on
+    --    EVERY startup (not just --resume), so windows return to their
+    --    workspaces after a reboot or daemon restart as long as the
+    --    persistence file is intact. The --resume flag is now
+    --    vestigial; Mod-q still passes it but no longer gates this.
+    mSaved <- restoreSnapshot cfg screens existingWindows
+    let (ws0, restoredAffinity, idMap, unmatchedLives) = case mSaved of
+            Just (ws, aff, mp, leftovers) ->
+                (ws, aff, mp, leftovers)
+            Nothing ->
+                let ws = buildInitialWindowSet cfg screens
+                in  (ws, initialAffinities ws, Map.empty, existingWindows)
 
     let mconf = MConf { connection = conn }
         mst0  = MState { windowset = ws0
@@ -96,23 +98,19 @@ launch cfg = do
                        , pendingScratchpad = Nothing
                        , windowRects = Map.empty
                        , warpOnSwitch = mouseWarping cfg
+                       , windowIdentities = idMap
                        }
 
     _ <- runM mconf mst0 $ do
-        case mSavedState of
-            Just saved -> do
-                -- Resuming: reconcile saved state with live windows.
-                -- Windows that still exist stay in their saved workspace;
-                -- windows that are gone get removed; new windows get managed.
-                reconcileState saved existingWindows (manageHook cfg)
-                windows id
-            Nothing -> do
-                -- Fresh start: manage all existing windows.
-                let hook = manageHook cfg
-                mapM_ (\wi -> manageSilent wi hook) existingWindows
-                windows id
+        -- Live windows that didn't match a saved entry go through the
+        -- usual manage hook (default workspace placement, ManageHook
+        -- rules, etc.). On a fresh start that's every window; on a
+        -- restore it's just the windows that opened since save.
+        let hook = manageHook cfg
+        mapM_ (\wi -> manageSilent wi hook) unmatchedLives
+        windows id
 
-        -- Run the startup hook (even on resume — user may want it)
+        -- Run the startup hook (every launch — user may want it)
         userCodeDef () (startupHook cfg)
 
         -- Enter the event loop
@@ -120,105 +118,76 @@ launch cfg = do
 
     return ()
 
--- | Load saved state from disk. Returns a StackSet rebuilt from the saved
--- state (using the config's layout hook) and the raw 'RestartState' for
--- reconciliation with live windows.
-loadSavedState :: MConfig Layout -> [ScreenInfo]
-               -> IO (WindowSet, Maybe RestartState)
-loadSavedState cfg screens = do
-    sf <- getStateFile
-    exists <- doesFileExist sf
-    if not exists
-        then do
-            hPutStrLn stderr "mcmonad: --resume but no state file, fresh start"
-            return (buildInitialWindowSet cfg screens, Nothing)
-        else do
-            contents <- readFile sf
-            case reads contents of
-                [(saved, _)] -> do
-                    hPutStrLn stderr "mcmonad: restoring saved state"
-                    removeFile sf
-                    let ws = rebuildWindowSet cfg screens saved
-                    return (ws, Just saved)
-                _ -> do
-                    hPutStrLn stderr "mcmonad: failed to parse state file, fresh start"
-                    removeFile sf
-                    return (buildInitialWindowSet cfg screens, Nothing)
-
--- | Rebuild a 'WindowSet' from saved state, the config's layout hook,
--- and current screen geometry.
-rebuildWindowSet :: MConfig Layout -> [ScreenInfo] -> RestartState -> WindowSet
-rebuildWindowSet cfg screens saved =
-    W.StackSet
-        { W.current  = currentSc
-        , W.visible  = visibleScs
-        , W.hidden   = hiddenWSs
-        , W.floating = Map.fromList
-              [ (w, W.RationalRect rx ry rw rh)
-              | (w, (rx, ry, rw, rh)) <- rsFloating saved
-              ]
-        }
+-- | Try to restore a previous snapshot. Returns @Nothing@ when there
+-- is no saved state, or when the saved state has no usable workspace
+-- assignments after filtering against the config's current workspace
+-- list. On success, returns the rebuilt @WindowSet@, the restored
+-- affinity map, the identity map for managed windows, and the list of
+-- live windows that didn't match a saved entry (those go through the
+-- manage hook).
+restoreSnapshot
+    :: MConfig Layout
+    -> [ScreenInfo]
+    -> [WindowInfo]
+    -> IO (Maybe (WindowSet, Map.Map String ScreenId,
+                  Map.Map WindowRef StableWindowId, [WindowInfo]))
+restoreSnapshot cfg screens existingWindows = do
+    mSaved <- loadStateIO
+    case mSaved of
+        Nothing -> return Nothing
+        Just savedRaw -> do
+            let validTags = Set.fromList (mcWorkspaces cfg)
+                saved     = filterToValidTags validTags savedRaw
+                result    = matchWindows saved existingWindows
+                screenTuples =
+                    [ (S i, SD (siFrame si))
+                    | (i, si) <- zip [0 :: Int ..] screens
+                    ]
+                ws = serialToWindowSet
+                        (layoutHook cfg)
+                        (mcWorkspaces cfg)
+                        screenTuples
+                        (mrResolved result)
+                aff = Map.fromList
+                        [ (tag, S n)
+                        | (tag, n) <- ssAffinity saved
+                        , Set.member tag validTags
+                        ]
+            hPutStrLn stderr $
+                "mcmonad: restored " ++ show (Map.size (mrIdentities result))
+                ++ " window(s); " ++ show (length (mrUnmatched result))
+                ++ " unmatched"
+            return $ Just
+                ( ws
+                , aff
+                , mrIdentities result
+                , mrUnmatched result
+                )
   where
-    layout' = layoutHook cfg
-    screenList = zip [0 :: Int ..] screens
-
-    -- Rebuild workspace stacks from saved state, using saved tags
-    savedMap = Map.fromList (rsStacks saved)
-
-    -- All workspace tags from config (saved state may have different tags
-    -- if config changed, but we use config as authoritative for the set of
-    -- workspaces)
-    allTags = mcWorkspaces cfg
-
-    mkWorkspace tag =
-        let mStack = case Map.lookup tag savedMap of
-                Just (Just (SerStack f u d)) -> Just (W.Stack f u d)
-                _ -> Nothing
-        in W.Workspace tag layout' mStack
-
-    -- Pair screens with workspaces, preferring the saved current tag
-    -- for the first screen
-    (visibleTags, hiddenTags) = splitAt (max 1 (length screenList)) orderedTags
-    orderedTags = let cur = rsCurrentTag saved
-                      rest = filter (/= cur) allTags
-                  in if cur `elem` allTags then cur : rest else allTags
-
-    currentSc = case (visibleTags, screenList) of
-        (tag:_, (sid, si):_) ->
-            W.Screen (mkWorkspace tag) (S sid) (SD (siFrame si))
-        _ -> error "mcmonad: no workspaces or no screens"
-
-    visibleScs =
-        [ W.Screen (mkWorkspace tag) (S sid) (SD (siFrame si))
-        | (tag, (sid, si)) <- zip (drop 1 visibleTags) (drop 1 screenList)
-        ]
-
-    hiddenWSs = map mkWorkspace hiddenTags
-
--- | Reconcile saved state with live windows. Remove windows that no longer
--- exist, and manage new windows that appeared during the restart.
-reconcileState :: RestartState -> [WindowInfo] -> ManageHook -> M ()
-reconcileState _saved liveWindows hook = do
-    ws <- gets windowset
-
-    -- Windows we know about from saved state
-    let savedWindows = W.allWindows ws
-    -- Windows that actually exist right now
-        liveRefs = [ WindowRef (wiWindowId wi) (wiPid wi) | wi <- liveWindows ]
-
-    -- Remove windows that no longer exist
-    let gone = filter (`notElem` liveRefs) savedWindows
-    mapM_ (\w -> modify $ \s -> s { windowset = W.delete' w (windowset s) }) gone
-    when (not (null gone)) $
-        io $ hPutStrLn stderr $ "mcmonad: removed " ++ show (length gone) ++ " stale windows"
-
-    -- Manage new windows that appeared during restart
-    let newWindows = filter (\wi ->
-            let wr = WindowRef (wiWindowId wi) (wiPid wi)
-            in wr `notElem` savedWindows) liveWindows
-    mapM_ (\wi -> manageSilent wi hook) newWindows
-    when (not (null newWindows)) $
-        io $ hPutStrLn stderr $ "mcmonad: managed " ++ show (length newWindows) ++ " new windows"
+    -- A saved snapshot may carry workspace tags that don't exist in
+    -- the current config (e.g. the user renamed a workspace). Drop
+    -- them so 'matchWindows' doesn't waste effort matching windows
+    -- the WindowSet can never include — and so 'serialToWindowSet'
+    -- doesn't silently lose their assignments.
+    filterToValidTags
+        :: Set.Set String
+        -> SerialState StableWindowId
+        -> SerialState StableWindowId
+    filterToValidTags valid saved = saved
+        { ssStacks =
+            [ entry
+            | entry@(tag, _) <- ssStacks saved
+            , Set.member tag valid
+            ]
+        , ssCurrentTag =
+            if Set.member (ssCurrentTag saved) valid
+                then ssCurrentTag saved
+                else case [ t | (t, _) <- ssStacks saved, Set.member t valid ] of
+                    (t:_) -> t
+                    []    -> ssCurrentTag saved   -- empty WindowSet anyway
+        , ssAffinity =
+            [ pair | pair@(tag, _) <- ssAffinity saved, Set.member tag valid ]
+        }
 
 -- ---------------------------------------------------------------------------
 -- Initialisation helpers

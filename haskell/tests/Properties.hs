@@ -1,16 +1,25 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Properties where
 
 import Test.QuickCheck
 import qualified XMonad.StackSet as W
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
+    , StableWindowId(..)
     , updateAffinities, resolveFocusedWindow, resolveFrontApp
+    )
+import MCMonad.IPC (WindowInfo(..))
+import MCMonad.Persistence
+    ( SerialState(..), SerStack(..), MatchResult(..)
+    , matchWindows, stableIdFor, persistenceVersion
     )
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import Data.Int (Int32)
+import qualified Data.Text as T
+import Data.Word (Word32)
 import Control.Monad (foldM)
 
 -- Simplified layout for testing (no need for real LayoutClass)
@@ -389,6 +398,262 @@ prop_frontApp_switches_across ss = case W.peek ss of
                 Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
                 Nothing  -> property False  -- a window of pid p exists; must switch
 
+
+-- === CROSS-RESTART IDENTITY (MCMonad.Persistence) ===
+--
+-- Properties for the three-tier 'matchWindows' assignment. The
+-- saved snapshot's CGWindowIDs are stale; matching has to look only
+-- at the stable identity components carried by the matched
+-- WindowInfo.
+
+-- | A small dictionary of bundle ids / subroles / titles to keep
+-- generated 'StableWindowId's overlapping often enough that the
+-- matcher actually gets exercised.
+genBundle :: Gen (Maybe T.Text)
+genBundle = oneof
+    [ pure Nothing
+    , Just <$> elements
+        [ "com.app.alpha", "com.app.beta", "com.app.gamma" ]
+    ]
+
+genSubrole :: Gen (Maybe T.Text)
+genSubrole = oneof
+    [ pure Nothing
+    , Just <$> elements [ "AXStandardWindow", "AXDialog", "AXSystemDialog" ]
+    ]
+
+genAxIdentifier :: Gen (Maybe T.Text)
+genAxIdentifier = oneof
+    [ pure Nothing
+    , pure Nothing  -- weight nil higher (most apps don't set it)
+    , Just <$> elements [ "main", "settings", "downloads" ]
+    ]
+
+genTitleHash :: Gen (Maybe T.Text)
+genTitleHash = oneof
+    [ pure Nothing
+    , Just <$> elements [ "aabbccdd11223344", "deadbeefcafebabe", "0000111122223333" ]
+    ]
+
+instance Arbitrary StableWindowId where
+    arbitrary = StableWindowId
+        <$> genBundle
+        <*> genAxIdentifier
+        <*> genSubrole
+        <*> genTitleHash
+
+-- | Build a 'WindowInfo' that, when fed through 'stableIdFor', yields
+-- the given 'StableWindowId'. The other 'WindowInfo' fields are
+-- irrelevant to the matcher and use bland defaults.
+windowInfoFor :: Word32 -> Int32 -> StableWindowId -> WindowInfo
+windowInfoFor wid pid sid = WindowInfo
+    { wiWindowId            = wid
+    , wiPid                 = pid
+    , wiTitle               = Nothing
+    , wiAppName             = Nothing
+    , wiBundleId            = swiBundleId sid
+    , wiSubrole             = swiSubrole sid
+    , wiAxIdentifier        = swiAxIdentifier sid
+    , wiIdentityHash        = swiTitleHash sid
+    , wiIsDialog            = False
+    , wiIsFixedSize         = False
+    , wiHasCloseButton      = True
+    , wiHasFullscreenButton = True
+    , wiFrame               = Rectangle 0 0 100 100
+    }
+
+-- | A saved snapshot + a live window list, where the lives are a
+-- shuffled, freshly-wid'd version of the saved entries plus some
+-- extras of arbitrary identity. The expected matches are: every saved
+-- entry maps to exactly one live window.
+data RoundTripCase = RoundTripCase
+    { rtSaved   :: SerialState StableWindowId
+    , rtLives   :: [WindowInfo]
+    , rtSavedIds :: [StableWindowId]  -- in workspace traversal order
+    }
+    deriving Show
+
+instance Arbitrary RoundTripCase where
+    arbitrary = do
+        savedIds <- listOf1 arbitrary
+        extras   <- listOf arbitrary :: Gen [StableWindowId]
+        -- Build the saved snapshot: one workspace, all on one stack.
+        let savedStack = case savedIds of
+                (f:rest) -> Just (SerStack f [] rest)
+                []       -> Nothing
+            saved = SerialState
+                { ssVersion    = persistenceVersion
+                , ssStacks     = [("ws", savedStack)]
+                , ssCurrentTag = "ws"
+                , ssFloating   = []
+                , ssAffinity   = [("ws", 0)]
+                }
+        -- Live windows: one for each saved id (new wid), plus extras
+        -- with disjoint wid range. Lives are shuffled so the matcher
+        -- can't rely on input order alone.
+        let savedLives =
+                [ windowInfoFor (1000 + fromIntegral i) 100 sid
+                | (i, sid) <- zip [0 :: Int ..] savedIds
+                ]
+            extraLives =
+                [ windowInfoFor (5000 + fromIntegral i) 200 sid
+                | (i, sid) <- zip [0 :: Int ..] extras
+                ]
+            allLives = savedLives ++ extraLives
+        shuffledLives <- shuffle allLives
+        return (RoundTripCase saved shuffledLives savedIds)
+
+-- Every saved id has its own mirror in lives (built by the generator),
+-- so every saved id must match at tier 1, and every match must be to
+-- the exact mirror. This is the strongest possible round-trip
+-- guarantee: the matcher loses no identity information when both
+-- sides have it.
+prop_matcher_round_trip :: RoundTripCase -> Property
+prop_matcher_round_trip (RoundTripCase saved lives savedIds) =
+    let result = matchWindows saved lives
+        matched = Map.toList (mrIdentities result)
+    in counterexample (show result) $
+       length matched === length savedIds
+       .&&. conjoin
+            [ counterexample
+                ("for match " ++ show (ref, sid))
+                (case L.find
+                        (\wi -> wrWindowId ref == wiWindowId wi
+                             && wrPid ref == wiPid wi) lives of
+                    Just wi -> stableIdFor wi === sid
+                    Nothing -> counterexample "matched ref absent from lives" (property False))
+            | (ref, sid) <- matched
+            ]
+
+-- |matched| + |unmatched| == |lives|, and the matched lives are
+-- disjoint from mrUnmatched.
+prop_matcher_partition :: RoundTripCase -> Property
+prop_matcher_partition (RoundTripCase saved lives _) =
+    let result = matchWindows saved lives
+        matchedWids =
+            [ wid | wid <- Map.keys (mrIdentities result) ]
+        unmatchedWids =
+            [ WindowRef (wiWindowId wi) (wiPid wi)
+            | wi <- mrUnmatched result
+            ]
+    in (length matchedWids + length unmatchedWids === length lives)
+       .&&. L.intersect matchedWids unmatchedWids === []
+
+-- Determinism: matching the same saved snapshot against the same lives
+-- yields the same result.
+prop_matcher_deterministic :: RoundTripCase -> Property
+prop_matcher_deterministic (RoundTripCase saved lives _) =
+    let a = matchWindows saved lives
+        b = matchWindows saved lives
+    in (mrIdentities a === mrIdentities b)
+       .&&. (map (\wi -> wiWindowId wi) (mrUnmatched a)
+             === map (\wi -> wiWindowId wi) (mrUnmatched b))
+
+-- Class-tier handling: N class-equal saved entries (same bundleId +
+-- subrole, no axId, no titleHash) get matched to N class-equal lives
+-- in deterministic order. Important for browser-like apps where every
+-- window has the same identity attributes.
+prop_matcher_class_tier_multi :: Positive Int -> Property
+prop_matcher_class_tier_multi (Positive nRaw) =
+    let n = 1 + (nRaw `mod` 6)   -- 1..6
+        classOnly = StableWindowId
+            { swiBundleId     = Just "com.app.browser"
+            , swiAxIdentifier = Nothing
+            , swiSubrole      = Just "AXStandardWindow"
+            , swiTitleHash    = Nothing
+            }
+        savedIds = replicate n classOnly
+        savedStack = Just (SerStack (head savedIds) [] (tail savedIds))
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = [("ws", savedStack)]
+            , ssCurrentTag = "ws"
+            , ssFloating   = []
+            , ssAffinity   = [("ws", 0)]
+            }
+        -- Lives have unique-but-meaningless titleHashes; class still matches.
+        lives =
+            [ (windowInfoFor (1000 + fromIntegral i) 42 classOnly)
+                { wiIdentityHash = Just (T.pack ("hash-" ++ show i)) }
+            | i <- [0 .. n - 1]
+            ]
+        result = matchWindows saved lives
+    in counterexample (show result) $
+       Map.size (mrIdentities result) === n
+       .&&. null (mrUnmatched result)
+
+-- Tier precedence: a fully-equal candidate is preferred over a
+-- class-equal candidate, even if the class-equal one appears earlier
+-- in the live list.
+prop_matcher_tier_precedence :: Property
+prop_matcher_tier_precedence =
+    let target = StableWindowId
+            { swiBundleId     = Just "com.app.alpha"
+            , swiAxIdentifier = Just "main"
+            , swiSubrole      = Just "AXStandardWindow"
+            , swiTitleHash    = Just "exactmatch"
+            }
+        sameClass = StableWindowId  -- matches at tier 3 only
+            { swiBundleId     = Just "com.app.alpha"
+            , swiAxIdentifier = Just "main"
+            , swiSubrole      = Just "AXStandardWindow"
+            , swiTitleHash    = Just "differenthash"
+            }
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = [("ws", Just (SerStack target [] []))]
+            , ssCurrentTag = "ws"
+            , ssFloating   = []
+            , ssAffinity   = []
+            }
+        -- The exact match is SECOND in the live list. A naive
+        -- first-class-match-wins matcher would pick the wrong one;
+        -- the tiered matcher must prefer the exact match.
+        lives =
+            [ windowInfoFor 100 1 sameClass
+            , windowInfoFor 200 1 target
+            ]
+        result = matchWindows saved lives
+        matchedWid = case Map.toList (mrIdentities result) of
+            [(WindowRef wid _, _)] -> Just wid
+            _                      -> Nothing
+    in matchedWid === Just 200
+
+-- A saved id that has no compatible live at any tier produces no
+-- match. The corresponding entry vanishes from mrResolved.
+prop_matcher_unmatched_saved_disappears :: Property
+prop_matcher_unmatched_saved_disappears =
+    let savedId = StableWindowId
+            { swiBundleId     = Just "com.app.nonexistent"
+            , swiAxIdentifier = Just "unique"
+            , swiSubrole      = Just "AXDialog"
+            , swiTitleHash    = Just "zzzz"
+            }
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = [("ws", Just (SerStack savedId [] []))]
+            , ssCurrentTag = "ws"
+            , ssFloating   = [(savedId, (0, 0, 1, 1))]
+            , ssAffinity   = []
+            }
+        lives = [windowInfoFor 1 1 (StableWindowId
+            { swiBundleId     = Just "com.app.completelydifferent"
+            , swiAxIdentifier = Nothing
+            , swiSubrole      = Just "AXStandardWindow"
+            , swiTitleHash    = Nothing
+            })]
+        result = matchWindows saved lives
+        resolved = mrResolved result
+    in (Map.size (mrIdentities result) === 0)
+       .&&. (lookup "ws" (ssStacks resolved) === Just Nothing)
+       .&&. (ssFloating resolved === [])
+
+-- persistenceVersion is preserved through matching.
+prop_matcher_preserves_version :: RoundTripCase -> Property
+prop_matcher_preserves_version (RoundTripCase saved lives _) =
+    ssVersion (mrResolved (matchWindows saved lives))
+        === ssVersion saved
+
 -- Collect all properties
 allProperties :: [(String, Property)]
 allProperties =
@@ -448,4 +713,12 @@ allProperties =
     , ("broken PID-only is indistinguishable",       property prop_brokenPidOnly_indistinguishable)
     , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
     , ("frontApp switches across apps",              property prop_frontApp_switches_across)
+    -- Cross-restart identity matcher
+    , ("matcher round-trip",                          property prop_matcher_round_trip)
+    , ("matcher partitions lives",                    property prop_matcher_partition)
+    , ("matcher is deterministic",                    property prop_matcher_deterministic)
+    , ("matcher class tier handles N candidates",     property prop_matcher_class_tier_multi)
+    , ("matcher prefers exact over class",            property prop_matcher_tier_precedence)
+    , ("matcher drops unmatched saved entries",       property prop_matcher_unmatched_saved_disappears)
+    , ("matcher preserves persistenceVersion",        property prop_matcher_preserves_version)
     ]

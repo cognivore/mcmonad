@@ -33,7 +33,8 @@ enum AXWindowService {
 
         let appElement = AXUIElementCreateApplication(pid)
 
-        // Batch-fetch window attributes
+        // Batch-fetch window attributes. Order matches the indices used
+        // in `attr(...)` below; do not reorder without updating those.
         let attributeNames: [CFString] = [
             kAXRoleAttribute as CFString,
             kAXSubroleAttribute as CFString,
@@ -43,6 +44,7 @@ enum AXWindowService {
             kAXPositionAttribute as CFString,
             kAXSizeAttribute as CFString,
             kAXZoomButtonAttribute as CFString,
+            kAXIdentifierAttribute as CFString,
         ]
 
         var valuesRef: CFArray?
@@ -55,7 +57,7 @@ enum AXWindowService {
 
         guard batchResult == .success,
               let values = valuesRef as? [Any?],
-              values.count >= 8
+              values.count >= 9
         else {
             logger.debug("Failed to batch-fetch AX attributes for wid=\(windowId)")
             return nil
@@ -111,6 +113,18 @@ enum AXWindowService {
         let isFixedSize = !hasZoomButton
             && subrole != (kAXStandardWindowSubrole as String)
 
+        // AXIdentifier — a stable, app-author-supplied opaque string for
+        // windows that have one (e.g. "main-window", "preferences"). Most
+        // apps do not set this. When present, it's the strongest signal
+        // for "this is the same window we saw last run".
+        let axIdentifier = attr(8) as? String
+
+        // Identity hash — salted SHA-256 of the title with a persistent
+        // per-user salt. Used Haskell-side to match across mcmonad
+        // restarts without leaking the raw title to the persistence
+        // file.
+        let identityHash = IdentityHash.hash(title: title)
+
         // App name and bundle ID
         var appName: String?
         var bundleId: String?
@@ -138,6 +152,8 @@ enum AXWindowService {
             appName: appName,
             bundleId: bundleId,
             subrole: subrole,
+            axIdentifier: axIdentifier,
+            identityHash: identityHash,
             isDialog: isDialog,
             isFixedSize: isFixedSize,
             hasCloseButton: hasCloseButton,

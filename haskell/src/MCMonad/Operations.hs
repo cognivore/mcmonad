@@ -18,10 +18,9 @@ module MCMonad.Operations
       -- * Restart
     , restart
     , recompile
-      -- * State serialization
-    , RestartState(..)
-    , SerStack(..)
-    , serializeState
+      -- * State persistence
+    , saveStateIO
+    , loadStateIO
     , getConfigDir
     , getStateFile
       -- * Screens
@@ -33,6 +32,7 @@ module MCMonad.Operations
     ) where
 
 import Control.Concurrent (forkIO)
+import Control.Exception (IOException, catch)
 import Control.Monad (forM, void, unless, when)
 import Data.List (find)
 import Data.Monoid (Endo(..))
@@ -44,6 +44,7 @@ import System.Exit (ExitCode(..))
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.Info (arch, os)
+import qualified System.Posix.Files as Posix
 import System.Posix.Process (executeFile)
 import System.Process (createProcess, shell, readProcessWithExitCode, CreateProcess(..))
 import qualified XMonad.StackSet as W
@@ -51,6 +52,9 @@ import qualified XMonad.StackSet as W
 import MCMonad.Core
 import MCMonad.IPC
 import MCMonad.ManageHook (ManageHook, runManageHook)
+import MCMonad.Persistence
+    ( SerialState(..), stableIdFor, persistenceVersion, windowSetToSerial
+    )
 
 -- ---------------------------------------------------------------------------
 -- The windows function
@@ -216,6 +220,16 @@ windows f = do
     -- 10. Update mapped set
     modify $ \s -> s { mapped = S.fromList newVisible }
 
+    -- 11. Persist state so a later restart can restore it.
+    --     Synchronous, but the file is small (a few KB) and atomic
+    --     writes are fast on local disks; errors are caught and
+    --     logged inside saveStateIO so a transient disk hiccup never
+    --     reaches the event loop.
+    ws' <- gets windowset
+    aff' <- gets affinity
+    idMap <- gets windowIdentities
+    io $ saveStateIO ws' aff' idMap
+
 -- | All windows visible on any screen (current + visible), including
 -- floating windows.
 allVisibleWindows :: WindowSet -> [WindowRef]
@@ -260,12 +274,18 @@ findScreenForWindow w ws =
 
 -- | Manage a new window: run the manage hook, insert it into the current
 -- workspace, and apply any hook-specified transformations (float, shift, etc.).
+--
+-- Also records the window's 'StableWindowId' in 'windowIdentities' so the
+-- next 'saveStateIO' can persist it. The mapping survives until 'unmanage'.
 manage :: WindowInfo -> ManageHook -> M ()
 manage wi hook = do
     let wr = WindowRef (wiWindowId wi) (wiPid wi)
     -- Don't manage if already managed
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
+        modify $ \s -> s
+            { windowIdentities = M.insert wr (stableIdFor wi) (windowIdentities s)
+            }
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
         windows (transform . W.insertUp wr)
 
@@ -277,17 +297,21 @@ manageSilent wi hook = do
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
-        modify $ \s -> s { windowset = transform (W.insertUp wr (windowset s)) }
+        modify $ \s -> s
+            { windowset = transform (W.insertUp wr (windowset s))
+            , windowIdentities = M.insert wr (stableIdFor wi) (windowIdentities s)
+            }
 
 -- | Remove a window from management. Called when a window is destroyed.
 unmanage :: WindowRef -> M ()
 unmanage w = do
     ws <- gets windowset
     when (W.member w ws) $ do
-        -- Clean from sticky and scratchpads before removing
+        -- Clean from sticky, scratchpads, and the identity map before removing
         modify $ \s -> s
             { sticky = S.delete w (sticky s)
             , scratchpads = M.filter (/= w) (scratchpads s)
+            , windowIdentities = M.delete w (windowIdentities s)
             }
         windows (W.delete' w)
 
@@ -361,42 +385,70 @@ spawn cmd = io $ void $ forkIO $ void $
         }
 
 -- ---------------------------------------------------------------------------
--- Restart
+-- State persistence
 
--- | Serialisable snapshot of the WindowSet for transparent restart.
--- Layout state is not preserved — layouts reset to the config default.
-data RestartState = RestartState
-    { rsStacks     :: [(String, Maybe SerStack)]
-      -- ^ (workspace tag, stack zipper)
-    , rsCurrentTag :: String
-      -- ^ Tag of the focused workspace
-    , rsFloating   :: [(WindowRef, (Rational, Rational, Rational, Rational))]
-      -- ^ Floating window positions as (x, y, w, h) rationals
-    , rsAffinity   :: [(String, Int)]
-      -- ^ Serialised affinity map (workspace tag, screen index)
-    } deriving (Show, Read)
+-- | Atomically write the current 'WindowSet' (plus affinity and the
+-- per-window identity map) to @~\/.config\/mcmonad\/mcmonad.state@.
+--
+-- This is called automatically by 'windows' on every state mutation,
+-- so an unexpected death of the Haskell process (logout, reboot, OOM,
+-- launchd kill) doesn't lose more than the most recent unsaved
+-- transition. It is also called explicitly by 'restart' immediately
+-- before @exec@.
+--
+-- Write is atomic via tempfile + rename. File mode is 0600 so the
+-- (salted) title hashes inside aren't readable by other local users.
+-- Errors are logged but never raised — a transient write failure
+-- must not crash the window manager.
+saveStateIO
+    :: WindowSet
+    -> M.Map String ScreenId
+    -> M.Map WindowRef StableWindowId
+    -> IO ()
+saveStateIO ws aff idMap = do
+    let snapshot = windowSetToSerial ws aff idMap
+    sf <- getStateFile
+    let tmp = sf ++ ".tmp"
+    (do writeFile tmp (show snapshot)
+        Posix.setFileMode tmp 0o600
+        Posix.rename tmp sf)
+        `catch` \e ->
+            hPutStrLn stderr $ "mcmonad: state save failed: " ++ show (e :: IOException)
 
--- | Serialisable version of a Stack zipper.
-data SerStack = SerStack
-    { ssFocus :: WindowRef
-    , ssUp    :: [WindowRef]
-    , ssDown  :: [WindowRef]
-    } deriving (Show, Read)
-
--- | Extract a 'RestartState' from the current 'WindowSet' and affinity map.
-serializeState :: WindowSet -> M.Map String ScreenId -> RestartState
-serializeState ws aff = RestartState
-    { rsStacks     = map serWsp allWsps
-    , rsCurrentTag = W.tag (W.workspace (W.current ws))
-    , rsFloating   = [ (w, (rx, ry, rw, rh))
-                     | (w, W.RationalRect rx ry rw rh) <- M.toList (W.floating ws)
-                     ]
-    , rsAffinity   = [(tag, n) | (tag, S n) <- M.toList aff]
-    }
-  where
-    allWsps = map W.workspace (W.current ws : W.visible ws) ++ W.hidden ws
-    serWsp wsp = (W.tag wsp, serStack <$> W.stack wsp)
-    serStack (W.Stack f u d) = SerStack f u d
+-- | Read the saved state from disk, if any. Returns 'Nothing' when:
+--
+--   * the file doesn't exist (first-ever run on this user);
+--   * the file fails to parse (older format, hand-edited, corrupt);
+--   * the @ssVersion@ field doesn't match 'persistenceVersion'.
+--
+-- In the failure cases, the stale file is moved aside to
+-- @mcmonad.state.bak@ so the next 'saveStateIO' doesn't overwrite
+-- what might be the only copy the user has — they can recover it
+-- manually if they want.
+loadStateIO :: IO (Maybe (SerialState StableWindowId))
+loadStateIO = do
+    sf <- getStateFile
+    exists <- doesFileExist sf
+    if not exists
+        then return Nothing
+        else (do
+            contents <- readFile sf
+            case reads contents of
+                [(saved, _)]
+                    | ssVersion saved == persistenceVersion -> do
+                        hPutStrLn stderr $
+                            "mcmonad: loaded saved state from " ++ sf
+                        return (Just saved)
+                _ -> do
+                    hPutStrLn stderr $
+                        "mcmonad: saved state at " ++ sf
+                        ++ " is unreadable or has wrong version; moving to .bak"
+                    Posix.rename sf (sf ++ ".bak")
+                    return Nothing)
+            `catch` \e -> do
+                hPutStrLn stderr $
+                    "mcmonad: state load failed: " ++ show (e :: IOException)
+                return Nothing
 
 -- | The mcmonad config directory: @~\/.config\/mcmonad@.
 getConfigDir :: IO FilePath
@@ -462,17 +514,22 @@ recompile = do
 -- | Recompile and restart the Haskell process.  The Swift daemon stays
 -- running and the new process reconnects.
 --
--- 1. Serialise 'WindowSet' state to disk
+-- 1. Serialise 'WindowSet' + 'StableWindowId' state to disk
 -- 2. Recompile @~\/.config\/mcmonad\/mcmonad.hs@ (if it exists)
 -- 3. @exec@ the new binary (or self) with @--resume@
+--
+-- The @--resume@ flag is kept for backwards compatibility but is now
+-- vestigial: every mcmonad startup checks for the saved state file and
+-- restores from it when present, regardless of how it was launched.
 restart :: M ()
 restart = do
     -- 1. Serialise state
     ws <- gets windowset
     aff <- gets affinity
+    idMap <- gets windowIdentities
     io $ do
         sf <- getStateFile
-        writeFile sf (show (serializeState ws aff))
+        saveStateIO ws aff idMap
         hPutStrLn stderr $ "mcmonad: state written to " ++ sf
 
     -- 2. Recompile

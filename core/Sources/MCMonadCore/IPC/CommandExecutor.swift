@@ -13,6 +13,13 @@ final class CommandExecutor {
     let socketServer: SocketServer
     let statusBarController: StatusBarController
 
+    /// Callback invoked with the list of windows produced by
+    /// 'executeQueryWindows'. The owner uses it to enrol existing
+    /// windows in subsystems that ordinarily only fire on
+    /// SkyLight-observed creation (notably AXFocusTracker). Set
+    /// from Main once the EventBridge that handles it is built.
+    var onExistingWindowsEnumerated: (([WindowInfo]) -> Void)?
+
     private let encoder = JSONEncoder()
 
     init(
@@ -202,6 +209,12 @@ final class CommandExecutor {
             }
             // If AX can't read the window, skip it — don't fabricate data
         }
+
+        // Notify the owner BEFORE sending the response so the
+        // EventBridge can register these windows (and start AX
+        // focus tracking for their pids) by the time Haskell starts
+        // emitting commands that depend on focus events.
+        onExistingWindowsEnumerated?(windowInfos)
 
         let response = QueryWindowsResponse(windows: windowInfos)
         do {

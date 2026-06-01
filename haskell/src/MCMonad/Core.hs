@@ -31,8 +31,6 @@ module MCMonad.Core
       -- * Focus resolution
     , resolveFocusedWindow
     , resolveFrontApp
-      -- * Cross-restart window identity
-    , StableWindowId(..)
     ) where
 
 import Control.Concurrent.MVar
@@ -44,7 +42,6 @@ import qualified Data.Aeson as Aeson
 import Data.Int (Int32)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
-import Data.Text (Text)
 import Data.Set (Set)
 import Data.Time.Clock (UTCTime)
 import Data.Typeable (Typeable, cast)
@@ -59,22 +56,22 @@ import qualified XMonad.StackSet as W
 -- Window identifier for macOS
 
 -- | A reference to a macOS window, identified by its CGWindowID and owning PID.
+--
+-- This is the *only* identity mcmonad uses. The CGWindowID is assigned by
+-- macOS's WindowServer and is stable for the lifetime of the WindowServer
+-- session — which spans Mod-q recompiles, mcmonad-core daemon restarts,
+-- launchd kicks, and any other restart of mcmonad's own processes. The
+-- PID is stable for the lifetime of the owning app. Together they
+-- uniquely identify a live window.
+--
+-- On logout / reboot, the WindowServer dies and the apps die with it.
+-- The windows that come back after login are *new* objects in new
+-- processes with new identities. mcmonad does not attempt to bridge
+-- across that gap; the manage hook is the sole mechanism for placing
+-- newly-created windows on workspaces.
 data WindowRef = WindowRef
     { wrWindowId :: !Word32
     , wrPid      :: !Int32
-    } deriving (Eq, Ord, Show, Read, Generic)
-
--- | A cross-restart identifier built entirely from attributes that
--- survive an app restart. Used by 'MCMonad.Persistence' to match a
--- saved snapshot against the live windows the next mcmonad startup
--- sees. See "MCMonad.Persistence" for the full design and matcher.
-data StableWindowId = StableWindowId
-    { swiBundleId     :: !(Maybe Text)
-    , swiAxIdentifier :: !(Maybe Text)
-    , swiSubrole      :: !(Maybe Text)
-    , swiTitleHash    :: !(Maybe Text)
-      -- ^ Salted SHA-256 hex of the title, computed Swift-side.
-      -- See @core\/Sources\/MCMonadCore\/IdentityHash.swift@.
     } deriving (Eq, Ord, Show, Read, Generic)
 
 instance FromJSON WindowRef where
@@ -237,12 +234,6 @@ data MState = MState
     , warpOnSwitch     :: !Bool
       -- ^ Whether to warp the mouse cursor to the focused window on
       -- workspace\/screen changes. Set from config at startup.
-    , windowIdentities :: !(Map.Map WindowRef StableWindowId)
-      -- ^ Stable cross-restart identity for each managed window.
-      -- Populated when a window is first managed (from the
-      -- 'MCMonad.IPC.WindowInfo' Swift sent), cleared on unmanage.
-      -- Consumed by 'MCMonad.Persistence.windowSetToSerial' when
-      -- writing the persistence file.
     , lastSaveAt       :: !(Maybe UTCTime)
       -- ^ Wall clock of the most recent 'MCMonad.Operations.saveStateIO'
       -- call. The 'windows' transition skips its post-mutation save when

@@ -32,12 +32,6 @@ struct WindowInfo: Sendable {
     let appName: String?
     let bundleId: String?
     let subrole: String?
-    let axIdentifier: String?
-    /// Salted SHA-256 of the title with a persistent per-user salt.
-    /// Used Haskell-side as a stable component of a cross-restart
-    /// window identity. nil when the window had no title at all;
-    /// the `IdentityHash.none` sentinel when the title was empty.
-    let identityHash: String?
     let isDialog: Bool
     let isFixedSize: Bool
     let hasCloseButton: Bool
@@ -48,7 +42,6 @@ struct WindowInfo: Sendable {
 extension WindowInfo: Codable {
     private enum CodingKeys: String, CodingKey {
         case windowId, pid, title, appName, bundleId, subrole
-        case axIdentifier, identityHash
         case isDialog, isFixedSize, hasCloseButton, hasFullscreenButton, frame
     }
 
@@ -60,8 +53,6 @@ extension WindowInfo: Codable {
         appName = try c.decodeIfPresent(String.self, forKey: .appName)
         bundleId = try c.decodeIfPresent(String.self, forKey: .bundleId)
         subrole = try c.decodeIfPresent(String.self, forKey: .subrole)
-        axIdentifier = try c.decodeIfPresent(String.self, forKey: .axIdentifier)
-        identityHash = try c.decodeIfPresent(String.self, forKey: .identityHash)
         isDialog = try c.decode(Bool.self, forKey: .isDialog)
         isFixedSize = try c.decode(Bool.self, forKey: .isFixedSize)
         hasCloseButton = try c.decode(Bool.self, forKey: .hasCloseButton)
@@ -77,8 +68,6 @@ extension WindowInfo: Codable {
         try c.encode(appName, forKey: .appName)
         try c.encode(bundleId, forKey: .bundleId)
         try c.encode(subrole, forKey: .subrole)
-        try c.encode(axIdentifier, forKey: .axIdentifier)
-        try c.encode(identityHash, forKey: .identityHash)
         try c.encode(isDialog, forKey: .isDialog)
         try c.encode(isFixedSize, forKey: .isFixedSize)
         try c.encode(hasCloseButton, forKey: .hasCloseButton)
@@ -169,8 +158,6 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode(info.appName, forKey: .appName)
             try container.encode(info.bundleId, forKey: .bundleId)
             try container.encode(info.subrole, forKey: .subrole)
-            try container.encode(info.axIdentifier, forKey: .axIdentifier)
-            try container.encode(info.identityHash, forKey: .identityHash)
             try container.encode(info.isDialog, forKey: .isDialog)
             try container.encode(info.isFixedSize, forKey: .isFixedSize)
             try container.encode(info.hasCloseButton, forKey: .hasCloseButton)
@@ -307,8 +294,6 @@ private struct DynamicCodingKey: CodingKey {
     static let appName = DynamicCodingKey(stringValue: "appName")!
     static let bundleId = DynamicCodingKey(stringValue: "bundleId")!
     static let subrole = DynamicCodingKey(stringValue: "subrole")!
-    static let axIdentifier = DynamicCodingKey(stringValue: "axIdentifier")!
-    static let identityHash = DynamicCodingKey(stringValue: "identityHash")!
     static let isDialog = DynamicCodingKey(stringValue: "isDialog")!
     static let isFixedSize = DynamicCodingKey(stringValue: "isFixedSize")!
     static let hasCloseButton = DynamicCodingKey(stringValue: "hasCloseButton")!

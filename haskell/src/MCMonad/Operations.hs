@@ -54,7 +54,7 @@ import MCMonad.Core
 import MCMonad.IPC
 import MCMonad.ManageHook (ManageHook, runManageHook)
 import MCMonad.Persistence
-    ( SerialState(..), stableIdFor, persistenceVersion, windowSetToSerial
+    ( SerialState(..), persistenceVersion, windowSetToSerial
     )
 
 -- ---------------------------------------------------------------------------
@@ -236,9 +236,8 @@ windows f = do
     when shouldSave $ do
         ws' <- gets windowset
         aff' <- gets affinity
-        idMap <- gets windowIdentities
         modify $ \s -> s { lastSaveAt = Just now }
-        io $ saveStateIO ws' aff' idMap
+        io $ saveStateIO ws' aff'
 
 -- | Maximum frequency for 'windows'-driven persistence writes. The
 -- 'restart' path bypasses this — the final snapshot before Mod-q's
@@ -290,18 +289,12 @@ findScreenForWindow w ws =
 
 -- | Manage a new window: run the manage hook, insert it into the current
 -- workspace, and apply any hook-specified transformations (float, shift, etc.).
---
--- Also records the window's 'StableWindowId' in 'windowIdentities' so the
--- next 'saveStateIO' can persist it. The mapping survives until 'unmanage'.
 manage :: WindowInfo -> ManageHook -> M ()
 manage wi hook = do
     let wr = WindowRef (wiWindowId wi) (wiPid wi)
     -- Don't manage if already managed
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
-        modify $ \s -> s
-            { windowIdentities = M.insert wr (stableIdFor wi) (windowIdentities s)
-            }
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
         windows (transform . W.insertUp wr)
 
@@ -314,20 +307,17 @@ manageSilent wi hook = do
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
         modify $ \s -> s
-            { windowset = transform (W.insertUp wr (windowset s))
-            , windowIdentities = M.insert wr (stableIdFor wi) (windowIdentities s)
-            }
+            { windowset = transform (W.insertUp wr (windowset s)) }
 
 -- | Remove a window from management. Called when a window is destroyed.
 unmanage :: WindowRef -> M ()
 unmanage w = do
     ws <- gets windowset
     when (W.member w ws) $ do
-        -- Clean from sticky, scratchpads, and the identity map before removing
+        -- Clean from sticky and scratchpads before removing
         modify $ \s -> s
             { sticky = S.delete w (sticky s)
             , scratchpads = M.filter (/= w) (scratchpads s)
-            , windowIdentities = M.delete w (windowIdentities s)
             }
         windows (W.delete' w)
 
@@ -403,26 +393,20 @@ spawn cmd = io $ void $ forkIO $ void $
 -- ---------------------------------------------------------------------------
 -- State persistence
 
--- | Atomically write the current 'WindowSet' (plus affinity and the
--- per-window identity map) to @~\/.config\/mcmonad\/mcmonad.state@.
+-- | Atomically write the current 'WindowSet' (plus affinity) to
+-- @~\/.config\/mcmonad\/mcmonad.state@.
 --
--- This is called automatically by 'windows' on every state mutation,
--- so an unexpected death of the Haskell process (logout, reboot, OOM,
--- launchd kill) doesn't lose more than the most recent unsaved
--- transition. It is also called explicitly by 'restart' immediately
--- before @exec@.
---
--- Write is atomic via tempfile + rename. File mode is 0600 so the
--- (salted) title hashes inside aren't readable by other local users.
--- Errors are logged but never raised — a transient write failure
--- must not crash the window manager.
+-- Called automatically by 'windows' (throttled — see
+-- 'saveThrottleSeconds') and explicitly by 'restart' before @exec@.
+-- Write is atomic via tempfile + rename. File mode is 0600.
+-- Errors are logged but never raised; a transient disk hiccup must
+-- not crash the WM.
 saveStateIO
     :: WindowSet
     -> M.Map String ScreenId
-    -> M.Map WindowRef StableWindowId
     -> IO ()
-saveStateIO ws aff idMap = do
-    let snapshot = windowSetToSerial ws aff idMap
+saveStateIO ws aff = do
+    let snapshot = windowSetToSerial ws aff
     sf <- getStateFile
     let tmp = sf ++ ".tmp"
     (do writeFile tmp (show snapshot)
@@ -441,7 +425,7 @@ saveStateIO ws aff idMap = do
 -- @mcmonad.state.bak@ so the next 'saveStateIO' doesn't overwrite
 -- what might be the only copy the user has — they can recover it
 -- manually if they want.
-loadStateIO :: IO (Maybe (SerialState StableWindowId))
+loadStateIO :: IO (Maybe (SerialState WindowRef))
 loadStateIO = do
     sf <- getStateFile
     exists <- doesFileExist sf
@@ -542,10 +526,9 @@ restart = do
     -- 1. Serialise state
     ws <- gets windowset
     aff <- gets affinity
-    idMap <- gets windowIdentities
     io $ do
         sf <- getStateFile
-        saveStateIO ws aff idMap
+        saveStateIO ws aff
         hPutStrLn stderr $ "mcmonad: state written to " ++ sf
 
     -- 2. Recompile

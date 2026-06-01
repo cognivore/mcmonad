@@ -23,6 +23,17 @@ final class EventBridge: SkyLightEventDelegate {
         self.focusTracker = focusTracker
     }
 
+    /// Bootstrap entry for windows that already existed when mcmonad-core
+    /// started — every window that didn't come through a SkyLight
+    /// 'created' event in this process. Without this, AX focus events
+    /// never fire for those apps after a daemon restart and the
+    /// cross-window focus-precision fix degrades to its PID-only
+    /// fallback. Called by 'CommandExecutor.executeQueryWindows' just
+    /// before the response is sent to Haskell.
+    func bootstrapExistingWindow(windowId: UInt32, pid: pid_t) {
+        addManagedWindow(windowId: windowId, pid: pid)
+    }
+
     /// Register a managed window. Starts AX focus tracking for the PID on
     /// the first window of that PID.
     private func addManagedWindow(windowId: UInt32, pid: pid_t) {
@@ -199,6 +210,17 @@ struct MCMonadCoreApp {
         let eventBridge = EventBridge(socketServer: socketServer, focusTracker: focusTracker)
         let eventObserver = SkyLightEventObserver.shared
         eventObserver.delegate = eventBridge
+
+        // Bootstrap existing-at-startup windows into the event bridge so
+        // their pids enrol AXFocusTracker. SkyLight 'created' only fires
+        // for windows born after the observer started, so a daemon
+        // restart needs this fallback path through QueryWindows.
+        executor.onExistingWindowsEnumerated = { [weak eventBridge] windowInfos in
+            guard let eventBridge else { return }
+            for info in windowInfos {
+                eventBridge.bootstrapExistingWindow(windowId: info.windowId, pid: info.pid)
+            }
+        }
 
         // Wire hotkey callbacks to socket events
         hotkeyManager.onHotkeyPressed = { hotkeyId in

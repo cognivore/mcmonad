@@ -46,6 +46,7 @@ import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Set (Set)
+import Data.Time.Clock (UTCTime)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word32)
 import GHC.Generics (Generic)
@@ -242,6 +243,14 @@ data MState = MState
       -- 'MCMonad.IPC.WindowInfo' Swift sent), cleared on unmanage.
       -- Consumed by 'MCMonad.Persistence.windowSetToSerial' when
       -- writing the persistence file.
+    , lastSaveAt       :: !(Maybe UTCTime)
+      -- ^ Wall clock of the most recent 'MCMonad.Operations.saveStateIO'
+      -- call. The 'windows' transition skips its post-mutation save when
+      -- this is set and less than the throttle window has elapsed, so a
+      -- burst of focus-follows-mouse or other rapid state changes
+      -- doesn't fan out to a save per call. 'restart' bypasses the
+      -- throttle so a Mod-q reload still writes the freshest snapshot
+      -- before 'exec'.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's

@@ -38,6 +38,7 @@ import Data.List (find)
 import Data.Monoid (Endo(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
+import Data.Time.Clock (NominalDiffTime, diffUTCTime, getCurrentTime)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
@@ -221,14 +222,29 @@ windows f = do
     modify $ \s -> s { mapped = S.fromList newVisible }
 
     -- 11. Persist state so a later restart can restore it.
-    --     Synchronous, but the file is small (a few KB) and atomic
-    --     writes are fast on local disks; errors are caught and
-    --     logged inside saveStateIO so a transient disk hiccup never
-    --     reaches the event loop.
-    ws' <- gets windowset
-    aff' <- gets affinity
-    idMap <- gets windowIdentities
-    io $ saveStateIO ws' aff' idMap
+    --     Throttled to once per 'saveThrottleSeconds': bursts of
+    --     focus-follows-mouse or rapid keypresses shouldn't fan
+    --     out to a disk write per call. 'restart' bypasses this
+    --     by calling 'saveStateIO' directly before 'exec'.
+    --     Errors inside saveStateIO are caught and logged, so a
+    --     transient disk hiccup never reaches the event loop.
+    now <- io getCurrentTime
+    last' <- gets lastSaveAt
+    let shouldSave = case last' of
+            Nothing -> True
+            Just t  -> diffUTCTime now t >= saveThrottleSeconds
+    when shouldSave $ do
+        ws' <- gets windowset
+        aff' <- gets affinity
+        idMap <- gets windowIdentities
+        modify $ \s -> s { lastSaveAt = Just now }
+        io $ saveStateIO ws' aff' idMap
+
+-- | Maximum frequency for 'windows'-driven persistence writes. The
+-- 'restart' path bypasses this — the final snapshot before Mod-q's
+-- 'exec' is always written immediately.
+saveThrottleSeconds :: NominalDiffTime
+saveThrottleSeconds = 0.25
 
 -- | All windows visible on any screen (current + visible), including
 -- floating windows.

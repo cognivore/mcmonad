@@ -99,6 +99,7 @@ launch cfg = do
                        , windowRects = Map.empty
                        , warpOnSwitch = mouseWarping cfg
                        , windowIdentities = idMap
+                       , lastSaveAt = Nothing
                        }
 
     _ <- runM mconf mst0 $ do

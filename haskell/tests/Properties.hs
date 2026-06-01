@@ -329,20 +329,70 @@ brokenPidOnlyFocus pid ws =
         Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
         _                              -> Nothing
 
--- For any window in the StackSet, asking resolveFocusedWindow for it
--- results in that exact window being focused — regardless of whether
--- other windows share its PID.
+-- | Windows on the current and visible workspaces — the set
+-- 'resolveFocusedWindow' / 'resolveFrontApp' are allowed to act on.
+-- Mirror of 'MCMonad.Core.visibleWindows' kept here so the tests
+-- don't depend on it being exported.
+visibleWindowsForTest :: TestStackSet -> [WindowRef]
+visibleWindowsForTest ss =
+    concatMap (W.integrate' . W.stack . W.workspace)
+              (W.current ss : W.visible ss)
+
+-- For any *visible* window, asking resolveFocusedWindow for it results
+-- in that exact window being focused — regardless of whether other
+-- windows share its PID.
 prop_focusedWindow_picks_exact :: TestStackSet -> Property
-prop_focusedWindow_picks_exact ss = case W.allWindows ss of
+prop_focusedWindow_picks_exact ss = case visibleWindowsForTest ss of
     [] -> property True
     wins -> forAll (elements wins) $ \wr ->
         let r = resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
             focused = maybe (W.peek ss) W.peek r
         in focused === Just wr
 
+-- A focused-window event targeting a window on a HIDDEN workspace must
+-- be a no-op. This is the property that prevents background AX
+-- activity (Chrome rendering a hidden tab, Librewolf network callbacks,
+-- Electron polling) from silently dragging the current screen onto a
+-- workspace the user didn't ask for.
+prop_focusedWindow_hidden_is_no_op :: TestStackSet -> Property
+prop_focusedWindow_hidden_is_no_op ss =
+    let hiddenWins = concatMap (W.integrate' . W.stack) (W.hidden ss)
+        visWins   = visibleWindowsForTest ss
+        -- Only meaningful when the hidden window isn't also visible (a
+        -- StackSet invariant says it can't be, but the generator
+        -- nominally allows duplicates — be defensive).
+        purelyHidden = filter (`notElem` visWins) hiddenWins
+    in case purelyHidden of
+        [] -> property True
+        wins -> forAll (elements wins) $ \wr ->
+            property $ isNothing
+                     $ resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
+
+-- resolveFocusedWindow never lands the current screen on a workspace
+-- that was hidden before the call. This is the regression sentinel
+-- for the flicker bug: the previous version used 'W.allWindows', so a
+-- focus event for a hidden window pulled the current screen onto that
+-- workspace via 'W.focusWindow''s implicit 'view' call. Note that
+-- swapping current with a *visible-secondary* screen IS allowed —
+-- that's the multi-monitor "click a window on the other monitor"
+-- case, and xmonad implements it as a current-tag swap.
+prop_focusedWindow_never_lands_on_hidden :: TestStackSet -> Property
+prop_focusedWindow_never_lands_on_hidden ss = case W.allWindows ss of
+    [] -> property True
+    wins -> forAll (elements wins) $ \wr ->
+        case resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss of
+            Nothing  -> property True
+            Just ss' ->
+                let visibleBefore = W.currentTag ss
+                                  : map (W.tag . W.workspace) (W.visible ss)
+                in counterexample
+                    ("landed on " ++ show (W.currentTag ss')
+                     ++ " from visible " ++ show visibleBefore)
+                    (property (W.currentTag ss' `elem` visibleBefore))
+
 -- resolveFocusedWindow preserves the no-duplicates invariant.
 prop_focusedWindow_invariant :: TestStackSet -> Property
-prop_focusedWindow_invariant ss = case W.allWindows ss of
+prop_focusedWindow_invariant ss = case visibleWindowsForTest ss of
     [] -> property True
     wins -> forAll (elements wins) $ \wr ->
         property $ maybe True invariant
@@ -384,19 +434,36 @@ prop_frontApp_noop_within ss = case W.peek ss of
     Nothing -> property True
     Just wr -> property $ isNothing (resolveFrontApp (wrPid wr) ss)
 
--- resolveFrontApp switches focus when the user crossed app boundaries.
+-- resolveFrontApp switches focus when the user crossed app boundaries
+-- and the target app has a *visible* window. (PID-only events for
+-- apps whose windows are all hidden must NOT switch workspaces.)
 prop_frontApp_switches_across :: TestStackSet -> Property
 prop_frontApp_switches_across ss = case W.peek ss of
     Nothing -> property True
     Just wr ->
-        let otherPids = L.nub
-                      $ filter (/= wrPid wr)
-                      $ map wrPid (W.allWindows ss)
-        in case otherPids of
+        let visPids = L.nub
+                    $ filter (/= wrPid wr)
+                    $ map wrPid (visibleWindowsForTest ss)
+        in case visPids of
             [] -> property True
             (p:_) -> case resolveFrontApp p ss of
                 Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
-                Nothing  -> property False  -- a window of pid p exists; must switch
+                Nothing  -> property False  -- a visible window of pid p exists; must switch
+
+-- resolveFrontApp must not land the current screen on a hidden
+-- workspace either — same hidden-app regression sentinel.
+prop_frontApp_never_lands_on_hidden :: TestStackSet -> Property
+prop_frontApp_never_lands_on_hidden ss =
+    let pids = L.nub $ map wrPid (W.allWindows ss)
+    in case pids of
+        [] -> property True
+        _  -> forAll (elements pids) $ \p ->
+            case resolveFrontApp p ss of
+                Nothing  -> property True
+                Just ss' ->
+                    let visibleBefore = W.currentTag ss
+                                      : map (W.tag . W.workspace) (W.visible ss)
+                    in property (W.currentTag ss' `elem` visibleBefore)
 
 
 -- === CROSS-RESTART IDENTITY (MCMonad.Persistence) ===
@@ -707,12 +774,15 @@ allProperties =
     , ("viewOnScreen places workspace", property prop_viewOnScreen_places_workspace)
     -- Focus resolution (multi-window-per-app focus fix)
     , ("focusedWindow picks exact",                  property prop_focusedWindow_picks_exact)
+    , ("focusedWindow hidden is no-op",              property prop_focusedWindow_hidden_is_no_op)
+    , ("focusedWindow never lands on hidden",        property prop_focusedWindow_never_lands_on_hidden)
     , ("focusedWindow invariant",                    property prop_focusedWindow_invariant)
     , ("focusedWindow unknown is no-op",             property prop_focusedWindow_unknown_noop)
     , ("focusedWindow distinguishes shared-PID",     property prop_focusedWindow_distinguishes_shared_pid)
     , ("broken PID-only is indistinguishable",       property prop_brokenPidOnly_indistinguishable)
     , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
     , ("frontApp switches across apps",              property prop_frontApp_switches_across)
+    , ("frontApp never lands on hidden",             property prop_frontApp_never_lands_on_hidden)
     -- Cross-restart identity matcher
     , ("matcher round-trip",                          property prop_matcher_round_trip)
     , ("matcher partitions lives",                    property prop_matcher_partition)

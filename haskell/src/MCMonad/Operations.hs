@@ -5,6 +5,8 @@ module MCMonad.Operations
     , manage
     , manageSilent
     , unmanage
+      -- * Overlay snapshot
+    , buildOverlaySnapshot
       -- * Layout messages
     , sendMessage
     , sendMessageWithNoRefresh
@@ -221,6 +223,15 @@ windows f = do
     -- 10. Update mapped set
     modify $ \s -> s { mapped = S.fromList newVisible }
 
+    -- 10b. Push overlay/menu snapshot to mcmonad-core. Carries the
+    --      full workspace tree (visible + hidden), each window's
+    --      metadata, the focus indicator, and the current debug
+    --      overlay flag. mcmonad-core caches it for the menubar
+    --      dropdown and — if debug is on — repaints the overlay
+    --      from it.
+    snap <- buildOverlaySnapshot
+    io $ sendCommand conn (SetOverlayState snap)
+
     -- 11. Persist state so a later restart can restore it.
     --     Throttled to once per 'saveThrottleSeconds': bursts of
     --     focus-follows-mouse or rapid keypresses shouldn't fan
@@ -273,6 +284,75 @@ resolveFloating ws =
               }
     ]
 
+-- ---------------------------------------------------------------------------
+-- Overlay / menubar snapshot
+--
+-- Snapshot of the WindowSet pushed to mcmonad-core on every 'windows'
+-- call. The core daemon caches it for the menubar workspace tree and,
+-- when 'debugOverlays' is on, repaints the per-screen overlay layer
+-- from it.
+
+-- | Build a fresh 'OverlaySnapshot' from the current 'MState'. Pure
+-- with respect to IPC — emits no commands; the caller decides where
+-- to send the result.
+--
+-- Note: window titles and other AX metadata live in 'windowMetadata'.
+-- They cross the IPC boundary as plaintext here because the consumer
+-- is on the user's own screen (menu rendering, overlay rendering).
+-- We do not log them to disk; that path runs through
+-- mcmonad-core's salted 'TitleHash'.
+buildOverlaySnapshot :: M OverlaySnapshot
+buildOverlaySnapshot = do
+    ws    <- gets windowset
+    meta  <- gets windowMetadata
+    rects <- gets windowRects
+    dbg   <- gets debugOverlays
+    let focused = W.peek ws
+        mkScreen scr = OverlayScreenEntry
+            { oseScreenId     = let S s = W.screen scr in s
+            , oseFrame        = screenRect (W.screenDetail scr)
+            , oseWorkspaceTag = W.tag (W.workspace scr)
+            , oseWindows      = workspaceWindows ws meta rects focused (W.workspace scr)
+            }
+        mkHidden wsp = OverlayHiddenWorkspace
+            { ohwTag     = W.tag wsp
+            , ohwWindows = workspaceWindows ws meta rects focused wsp
+            }
+        screens = map mkScreen (W.current ws : W.visible ws)
+        hidden  = map mkHidden (W.hidden ws)
+    return OverlaySnapshot
+        { osDebugOverlays    = dbg
+        , osScreens          = screens
+        , osHiddenWorkspaces = hidden
+        }
+
+-- | Build the per-window entries for one workspace.
+workspaceWindows
+    :: WindowSet
+    -> M.Map WindowRef WindowMetadata
+    -> M.Map WindowRef Rectangle
+    -> Maybe WindowRef
+    -> WindowSpace
+    -> [OverlayWindowEntry]
+workspaceWindows ws meta rects focused wsp =
+    [ OverlayWindowEntry
+        { oweWindowId     = wrWindowId w
+        , owePid          = wrPid w
+        , oweAppName      = wmAppName  =<< M.lookup w meta
+        , oweTitle        = wmTitle    =<< M.lookup w meta
+        , oweBundleId     = wmBundleId =<< M.lookup w meta
+        , oweWorkspaceTag = Just tag
+        , oweFrame        = M.findWithDefault zeroRect w rects
+        , oweIsFocused    = Just w == focused
+        , oweIsFloating   = M.member w floatingMap
+        }
+    | w <- W.integrate' (W.stack wsp)
+    ]
+  where
+    tag         = W.tag wsp
+    floatingMap = W.floating ws
+    zeroRect    = Rectangle 0 0 0 0
+
 -- | Find the screen rectangle for a given window. Falls back to the current
 -- screen if the window is not found on any screen.
 findScreenForWindow :: WindowRef -> WindowSet -> Rectangle
@@ -296,6 +376,8 @@ manage wi hook = do
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
+        modify $ \s -> s
+            { windowMetadata = M.insert wr (metadataFromInfo wi) (windowMetadata s) }
         windows (transform . W.insertUp wr)
 
 -- | Insert a window into the StackSet without triggering layout.
@@ -307,17 +389,20 @@ manageSilent wi hook = do
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
         modify $ \s -> s
-            { windowset = transform (W.insertUp wr (windowset s)) }
+            { windowset = transform (W.insertUp wr (windowset s))
+            , windowMetadata = M.insert wr (metadataFromInfo wi) (windowMetadata s)
+            }
 
 -- | Remove a window from management. Called when a window is destroyed.
 unmanage :: WindowRef -> M ()
 unmanage w = do
     ws <- gets windowset
     when (W.member w ws) $ do
-        -- Clean from sticky and scratchpads before removing
+        -- Clean from sticky, scratchpads, and metadata before removing
         modify $ \s -> s
-            { sticky = S.delete w (sticky s)
-            , scratchpads = M.filter (/= w) (scratchpads s)
+            { sticky         = S.delete w (sticky s)
+            , scratchpads    = M.filter (/= w) (scratchpads s)
+            , windowMetadata = M.delete w (windowMetadata s)
             }
         windows (W.delete' w)
 

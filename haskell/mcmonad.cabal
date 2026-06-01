@@ -11,6 +11,7 @@ library
   exposed-modules:
     MCMonad
     MCMonad.Core
+    MCMonad.Debug
     MCMonad.Layout
     MCMonad.Layout.I3Tree
     MCMonad.ManageHook

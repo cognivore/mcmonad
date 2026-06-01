@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module MCMonad.IPC
     ( -- * Connection
@@ -12,10 +13,17 @@ module MCMonad.IPC
     , Command(..)
     , FrameAssignment(..)
     , HotkeySpec(..)
+      -- * Overlay/menu snapshot
+    , OverlaySnapshot(..)
+    , OverlayScreenEntry(..)
+    , OverlayHiddenWorkspace(..)
+    , OverlayWindowEntry(..)
       -- * Event types (Swift -> Haskell)
     , Event(..)
     , WindowInfo(..)
     , ScreenInfo(..)
+      -- * Metadata helpers
+    , metadataFromInfo
       -- * Protocol versioning
     , protocolVersion
     ) where
@@ -38,7 +46,7 @@ import System.Directory (getHomeDirectory)
 import System.FilePath ((</>))
 import System.IO (hSetBuffering, BufferMode(..), hFlush, hPutStrLn, IOMode(..), stderr)
 
-import MCMonad.Core (Connection(..), Rectangle(..))
+import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..))
 
 -- ---------------------------------------------------------------------------
 -- Protocol version
@@ -53,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 4
+protocolVersion = 5
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -70,7 +78,80 @@ data Command
     | CloseWindow !Word32 !Int32
     | SetWorkspaceIndicator !String
     | WarpMouse !Double !Double
+    | SetDebugOverlays !Bool
+    | SetOverlayState !OverlaySnapshot
     deriving (Show, Generic)
+
+-- | One window entry in the menubar / debug overlay snapshot.
+-- 'oweFrame' is the intended frame (top-left origin, same convention
+-- as 'wiFrame').
+data OverlayWindowEntry = OverlayWindowEntry
+    { oweWindowId     :: !Word32
+    , owePid          :: !Int32
+    , oweAppName      :: !(Maybe Text)
+    , oweTitle        :: !(Maybe Text)
+    , oweBundleId     :: !(Maybe Text)
+    , oweWorkspaceTag :: !(Maybe String)
+    , oweFrame        :: !Rectangle
+    , oweIsFocused    :: !Bool
+    , oweIsFloating   :: !Bool
+    } deriving (Show, Generic)
+
+-- | A workspace visible on a specific screen.
+data OverlayScreenEntry = OverlayScreenEntry
+    { oseScreenId     :: !Int
+    , oseFrame        :: !Rectangle
+    , oseWorkspaceTag :: !String
+    , oseWindows      :: ![OverlayWindowEntry]
+    } deriving (Show, Generic)
+
+-- | A workspace not currently displayed on any screen.
+data OverlayHiddenWorkspace = OverlayHiddenWorkspace
+    { ohwTag     :: !String
+    , ohwWindows :: ![OverlayWindowEntry]
+    } deriving (Show, Generic)
+
+-- | Snapshot of the WindowSet, sent on every 'windows' call. Drives
+-- both the menubar workspace tree and the debug overlay.
+data OverlaySnapshot = OverlaySnapshot
+    { osDebugOverlays    :: !Bool
+    , osScreens          :: ![OverlayScreenEntry]
+    , osHiddenWorkspaces :: ![OverlayHiddenWorkspace]
+    } deriving (Show, Generic)
+
+instance Aeson.ToJSON OverlayWindowEntry where
+    toJSON OverlayWindowEntry{..} = Aeson.object
+        [ "windowId"     .= oweWindowId
+        , "pid"          .= owePid
+        , "appName"      .= oweAppName
+        , "title"        .= oweTitle
+        , "bundleId"     .= oweBundleId
+        , "workspaceTag" .= oweWorkspaceTag
+        , "frame"        .= oweFrame
+        , "isFocused"    .= oweIsFocused
+        , "isFloating"   .= oweIsFloating
+        ]
+
+instance Aeson.ToJSON OverlayScreenEntry where
+    toJSON OverlayScreenEntry{..} = Aeson.object
+        [ "screenId"     .= oseScreenId
+        , "frame"        .= oseFrame
+        , "workspaceTag" .= oseWorkspaceTag
+        , "windows"      .= oseWindows
+        ]
+
+instance Aeson.ToJSON OverlayHiddenWorkspace where
+    toJSON OverlayHiddenWorkspace{..} = Aeson.object
+        [ "tag"     .= ohwTag
+        , "windows" .= ohwWindows
+        ]
+
+instance Aeson.ToJSON OverlaySnapshot where
+    toJSON OverlaySnapshot{..} = Aeson.object
+        [ "debugOverlays"    .= osDebugOverlays
+        , "screens"          .= osScreens
+        , "hiddenWorkspaces" .= osHiddenWorkspaces
+        ]
 
 -- | A frame assignment: position a specific window at a specific rectangle.
 data FrameAssignment = FrameAssignment
@@ -142,6 +223,14 @@ instance Aeson.ToJSON Command where
         , "x"   .= x
         , "y"   .= y
         ]
+    toJSON (SetDebugOverlays on) = Aeson.object
+        [ "cmd" .= ("set-debug-overlays" :: Text)
+        , "on"  .= on
+        ]
+    toJSON (SetOverlayState snap) = Aeson.object
+        [ "cmd"      .= ("set-overlay-state" :: Text)
+        , "snapshot" .= snap
+        ]
 
 -- ---------------------------------------------------------------------------
 -- Events (Swift -> Haskell)
@@ -157,6 +246,9 @@ data Event
     | HotkeyPressed !Int
     | MouseEnteredWindow !Word32 !Int32
     | WindowDragCompleted !Word32 !Int32 !Rectangle
+    | MenuToggleDebug
+    | MenuFocusWindow !Word32 !Int32
+    | MenuViewWorkspace !String
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
@@ -187,6 +279,16 @@ data ScreenInfo = ScreenInfo
     { siScreenId :: !Int
     , siFrame    :: !Rectangle
     } deriving (Show, Generic)
+
+-- | Project the metadata subset of a 'WindowInfo' for caching in the
+-- 'MCMonad.Core.MState' window-metadata map.
+metadataFromInfo :: WindowInfo -> WindowMetadata
+metadataFromInfo wi = WindowMetadata
+    { wmAppName  = wiAppName wi
+    , wmTitle    = wiTitle wi
+    , wmBundleId = wiBundleId wi
+    , wmSubrole  = wiSubrole wi
+    }
 
 instance Aeson.FromJSON WindowInfo where
     parseJSON = Aeson.withObject "WindowInfo" $ \v -> WindowInfo
@@ -225,6 +327,9 @@ instance Aeson.FromJSON Event where
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"
                 "window-drag-completed" -> WindowDragCompleted <$> v .: "windowId" <*> v .: "pid" <*> v .: "frame"
+                "menu-toggle-debug"    -> pure MenuToggleDebug
+                "menu-focus-window"    -> MenuFocusWindow <$> v .: "windowId" <*> v .: "pid"
+                "menu-view-workspace"  -> MenuViewWorkspace <$> v .: "tag"
                 "ready"                -> pure Ready
                 other                  -> pure (IgnoredEvent other)
             (_, Just resp) -> case resp of

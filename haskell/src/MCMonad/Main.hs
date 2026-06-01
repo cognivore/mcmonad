@@ -16,6 +16,7 @@ import qualified XMonad.StackSet as W
 
 import MCMonad.Config
 import MCMonad.Core
+import MCMonad.Debug (toggleDebugOverlays, setDebugOverlays)
 import MCMonad.IPC
 import MCMonad.Operations
 import MCMonad.Persistence (SerialState(..), serialToWindowSet)
@@ -87,6 +88,15 @@ launch cfg = do
                 in  (ws, initialAffinities ws, existingWindows)
 
     let mconf = MConf { connection = conn }
+        -- Seed the metadata cache from the daemon's enumeration of
+        -- live windows. After a Haskell-only restart, this covers
+        -- both restored windows (already in ws0) and new windows that
+        -- will go through the manage hook a few lines below — the
+        -- manage hook re-inserts but it's idempotent.
+        seededMetadata = Map.fromList
+            [ (WindowRef (wiWindowId wi) (wiPid wi), metadataFromInfo wi)
+            | wi <- existingWindows
+            ]
         mst0  = MState { windowset = ws0
                        , mapped = Set.empty
                        , affinity = restoredAffinity
@@ -97,6 +107,8 @@ launch cfg = do
                        , pendingScratchpad = Nothing
                        , windowRects = Map.empty
                        , warpOnSwitch = mouseWarping cfg
+                       , windowMetadata = seededMetadata
+                       , debugOverlays = False
                        , lastSaveAt = Nothing
                        }
 
@@ -108,6 +120,12 @@ launch cfg = do
         let hook = manageHook cfg
         mapM_ (\wi -> manageSilent wi hook) unmatchedLives
         windows id
+
+        -- Push the initial debug-overlay state to mcmonad-core. The
+        -- daemon defaults to "overlay off" but we send the explicit
+        -- value so a daemon that *was* showing overlays from a
+        -- previous Haskell-side session clears them on reconnect.
+        setDebugOverlays False
 
         -- Run the startup hook (every launch — user may want it)
         userCodeDef () (startupHook cfg)
@@ -356,6 +374,23 @@ handleEvent debug cfg hotkeyIdMap evt = do
             case Map.lookup hid hotkeyIdMap of
                 Just action -> action
                 Nothing     -> return ()
+
+        -- Menubar actions. The dropdown's "Debug frame overlays" item,
+        -- workspace rows, and per-window rows all dispatch here.
+        MenuToggleDebug -> toggleDebugOverlays
+
+        MenuFocusWindow wid pid -> do
+            ws <- gets windowset
+            let wr = WindowRef wid pid
+            when (W.member wr ws) $ windows (W.focusWindow wr)
+
+        MenuViewWorkspace tag -> do
+            ws <- gets windowset
+            -- Only switch if this is actually a known workspace tag.
+            let allTags = map W.tag (W.workspace (W.current ws)
+                                     : map W.workspace (W.visible ws)
+                                     ++ W.hidden ws)
+            when (tag `elem` allTags) $ windows (W.greedyView tag)
 
         -- Events that arrive during init or are not actionable
         Ready                   -> return ()

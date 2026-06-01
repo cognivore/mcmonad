@@ -133,6 +133,113 @@ struct HotkeySpec: Codable, Sendable {
     let modifiers: UInt32
 }
 
+// MARK: - Overlay/Menu snapshot (Haskell -> Swift)
+
+/// One window's entry in the workspace tree + debug overlay snapshot.
+/// `frame` is the intended frame in wire coordinates (top-left origin,
+/// same convention as 'WindowInfo.frame' and 'FrameAssignment.frame').
+struct OverlayWindowEntry: Codable, Sendable {
+    let windowId: UInt32
+    let pid: Int32
+    let appName: String?
+    let title: String?
+    let bundleId: String?
+    let workspaceTag: String?
+    let frame: CGRect
+    let isFocused: Bool
+    let isFloating: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case windowId, pid, appName, title, bundleId, workspaceTag
+        case frame, isFocused, isFloating
+    }
+
+    init(
+        windowId: UInt32, pid: Int32,
+        appName: String?, title: String?, bundleId: String?,
+        workspaceTag: String?, frame: CGRect,
+        isFocused: Bool, isFloating: Bool
+    ) {
+        self.windowId = windowId; self.pid = pid
+        self.appName = appName; self.title = title; self.bundleId = bundleId
+        self.workspaceTag = workspaceTag; self.frame = frame
+        self.isFocused = isFocused; self.isFloating = isFloating
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        windowId = try c.decode(UInt32.self, forKey: .windowId)
+        pid = try c.decode(Int32.self, forKey: .pid)
+        appName = try c.decodeIfPresent(String.self, forKey: .appName)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        bundleId = try c.decodeIfPresent(String.self, forKey: .bundleId)
+        workspaceTag = try c.decodeIfPresent(String.self, forKey: .workspaceTag)
+        frame = try c.decode(FlatRect.self, forKey: .frame).cgRect
+        isFocused = try c.decodeIfPresent(Bool.self, forKey: .isFocused) ?? false
+        isFloating = try c.decodeIfPresent(Bool.self, forKey: .isFloating) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(windowId, forKey: .windowId)
+        try c.encode(pid, forKey: .pid)
+        try c.encodeIfPresent(appName, forKey: .appName)
+        try c.encodeIfPresent(title, forKey: .title)
+        try c.encodeIfPresent(bundleId, forKey: .bundleId)
+        try c.encodeIfPresent(workspaceTag, forKey: .workspaceTag)
+        try c.encode(FlatRect(frame), forKey: .frame)
+        try c.encode(isFocused, forKey: .isFocused)
+        try c.encode(isFloating, forKey: .isFloating)
+    }
+}
+
+/// A workspace visible on a specific screen.
+struct OverlayScreenEntry: Codable, Sendable {
+    let screenId: Int
+    let frame: CGRect
+    let workspaceTag: String
+    let windows: [OverlayWindowEntry]
+
+    private enum CodingKeys: String, CodingKey {
+        case screenId, frame, workspaceTag, windows
+    }
+
+    init(screenId: Int, frame: CGRect, workspaceTag: String, windows: [OverlayWindowEntry]) {
+        self.screenId = screenId; self.frame = frame
+        self.workspaceTag = workspaceTag; self.windows = windows
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        screenId = try c.decode(Int.self, forKey: .screenId)
+        frame = try c.decode(FlatRect.self, forKey: .frame).cgRect
+        workspaceTag = try c.decode(String.self, forKey: .workspaceTag)
+        windows = try c.decode([OverlayWindowEntry].self, forKey: .windows)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(screenId, forKey: .screenId)
+        try c.encode(FlatRect(frame), forKey: .frame)
+        try c.encode(workspaceTag, forKey: .workspaceTag)
+        try c.encode(windows, forKey: .windows)
+    }
+}
+
+/// A workspace not displayed on any screen.
+struct OverlayHiddenWorkspace: Codable, Sendable {
+    let tag: String
+    let windows: [OverlayWindowEntry]
+}
+
+/// Snapshot of mcmonad's WindowSet, pushed from Haskell on every windows
+/// call. Drives both the menubar workspace tree and the debug overlay.
+struct OverlaySnapshot: Codable, Sendable {
+    let debugOverlays: Bool
+    let screens: [OverlayScreenEntry]
+    let hiddenWorkspaces: [OverlayHiddenWorkspace]
+}
+
 // MARK: - Events (Swift -> Haskell)
 
 enum IPCEvent: Encodable, Sendable {
@@ -145,6 +252,9 @@ enum IPCEvent: Encodable, Sendable {
     case hotkeyPressed(hotkeyId: Int)
     case mouseEnteredWindow(windowId: UInt32, pid: Int32)
     case windowDragCompleted(windowId: UInt32, pid: Int32, frame: CGRect)
+    case menuToggleDebug
+    case menuFocusWindow(windowId: UInt32, pid: Int32)
+    case menuViewWorkspace(tag: String)
     case ready
 
     func encode(to encoder: Encoder) throws {
@@ -192,6 +302,15 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
             try container.encode(FlatRect(frame), forKey: .frame)
+        case .menuToggleDebug:
+            try container.encode("menu-toggle-debug", forKey: .event)
+        case .menuFocusWindow(let windowId, let pid):
+            try container.encode("menu-focus-window", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
+            try container.encode(pid, forKey: .pid)
+        case .menuViewWorkspace(let tag):
+            try container.encode("menu-view-workspace", forKey: .event)
+            try container.encode(tag, forKey: .tag)
         case .ready:
             try container.encode("ready", forKey: .event)
         }
@@ -211,6 +330,8 @@ enum IPCCommand: Decodable, Sendable {
     case closeWindow(windowId: UInt32, pid: Int32)
     case setWorkspaceIndicator(tag: String)
     case warpMouse(x: Double, y: Double)
+    case setDebugOverlays(on: Bool)
+    case setOverlayState(snapshot: OverlaySnapshot)
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -223,6 +344,8 @@ enum IPCCommand: Decodable, Sendable {
         case closeWindow = "close-window"
         case setWorkspaceIndicator = "set-workspace-indicator"
         case warpMouse = "warp-mouse"
+        case setDebugOverlays = "set-debug-overlays"
+        case setOverlayState = "set-overlay-state"
     }
 
     init(from decoder: Decoder) throws {
@@ -260,6 +383,12 @@ enum IPCCommand: Decodable, Sendable {
             let x = try container.decode(Double.self, forKey: .x)
             let y = try container.decode(Double.self, forKey: .y)
             self = .warpMouse(x: x, y: y)
+        case .setDebugOverlays:
+            let on = try container.decode(Bool.self, forKey: .on)
+            self = .setDebugOverlays(on: on)
+        case .setOverlayState:
+            let snap = try container.decode(OverlaySnapshot.self, forKey: .snapshot)
+            self = .setOverlayState(snapshot: snap)
         }
     }
 }
@@ -306,4 +435,6 @@ private struct DynamicCodingKey: CodingKey {
     static let tag = DynamicCodingKey(stringValue: "tag")!
     static let x = DynamicCodingKey(stringValue: "x")!
     static let y = DynamicCodingKey(stringValue: "y")!
+    static let on = DynamicCodingKey(stringValue: "on")!
+    static let snapshot = DynamicCodingKey(stringValue: "snapshot")!
 }

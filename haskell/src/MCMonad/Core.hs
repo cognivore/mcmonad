@@ -15,6 +15,8 @@ module MCMonad.Core
       -- * Window and screen types
     , WindowRef(..), ScreenId(..), ScreenDetail(..)
     , WindowSet, WindowSpace
+      -- * Window metadata cache
+    , WindowMetadata(..)
       -- * Layout system
     , Layout(..)
     , LayoutClass(..)
@@ -43,6 +45,7 @@ import Data.Int (Int32)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
+import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word32)
@@ -73,6 +76,17 @@ data WindowRef = WindowRef
     { wrWindowId :: !Word32
     , wrPid      :: !Int32
     } deriving (Eq, Ord, Show, Read, Generic)
+
+-- | Cached subset of 'MCMonad.IPC.WindowInfo' kept per managed window,
+-- so 'MCMonad.Operations.windows' can build snapshots without making
+-- the daemon re-query AX for every layout pass. Updated by the
+-- 'WindowCreated' event handler and torn down by 'WindowDestroyed'.
+data WindowMetadata = WindowMetadata
+    { wmAppName  :: !(Maybe Text)
+    , wmTitle    :: !(Maybe Text)
+    , wmBundleId :: !(Maybe Text)
+    , wmSubrole  :: !(Maybe Text)
+    } deriving (Eq, Show, Read, Generic)
 
 instance FromJSON WindowRef where
     parseJSON = Aeson.withObject "WindowRef" $ \v ->
@@ -234,6 +248,18 @@ data MState = MState
     , warpOnSwitch     :: !Bool
       -- ^ Whether to warp the mouse cursor to the focused window on
       -- workspace\/screen changes. Set from config at startup.
+    , windowMetadata   :: !(Map.Map WindowRef WindowMetadata)
+      -- ^ Cached app/title/bundle metadata for every managed window.
+      -- Populated by 'WindowCreated' (and the startup window-enumeration
+      -- path), torn down by 'WindowDestroyed'. Used by 'windows' to
+      -- build the OverlaySnapshot that drives the menubar workspace
+      -- tree and the debug overlay. Without this cache the snapshot
+      -- could only carry @(wid, pid)@; 'WindowInfo' is discarded by
+      -- 'manage' after the manage hook runs.
+    , debugOverlays    :: !Bool
+      -- ^ Whether to draw debug frame overlays. Off by default. Toggled
+      -- by 'MCMonad.Debug.toggleDebugOverlays' (either from xmonad.hs
+      -- or the menubar's "Debug frame overlays" item).
     , lastSaveAt       :: !(Maybe UTCTime)
       -- ^ Wall clock of the most recent 'MCMonad.Operations.saveStateIO'
       -- call. The 'windows' transition skips its post-mutation save when

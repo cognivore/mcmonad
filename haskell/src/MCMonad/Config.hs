@@ -18,6 +18,7 @@ import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayo
 
 import MCMonad.Core
 import MCMonad.Config.Keys
+import MCMonad.Debug (toggleDebugOverlays)
 import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
 import MCMonad.Operations (windows, sendMessage, kill, spawn, withFocused, screenWorkspace)
@@ -134,6 +135,12 @@ defaultKeys conf = Map.fromList $
     , ((m .|. shiftMask, kC),      kill)
     , ((m, kT),                    withFocused $ \w -> windows (W.sink w))
     , ((m .|. shiftMask, kReturn), spawn (terminal conf))
+
+    -- Debug overlays (off by default; menubar dropdown also toggles this).
+    -- The overlay draws a coloured border + (workspace, wid, pid, app,
+    -- title) label around every tracked window, and a red DEFIED tag
+    -- when the actual frame disagrees with the most-recent SetFrames.
+    , ((m .|. controlMask, kD), toggleDebugOverlays)
 
     ]
     ++

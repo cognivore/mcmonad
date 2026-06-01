@@ -12,6 +12,7 @@ final class CommandExecutor {
     let displayManager: DisplayManager
     let socketServer: SocketServer
     let statusBarController: StatusBarController
+    let overlayManager: OverlayManager
 
     /// Callback invoked with the list of windows produced by
     /// 'executeQueryWindows'. The owner uses it to enrol existing
@@ -26,12 +27,14 @@ final class CommandExecutor {
         hotkeyManager: HotkeyManager,
         displayManager: DisplayManager,
         socketServer: SocketServer,
-        statusBarController: StatusBarController
+        statusBarController: StatusBarController,
+        overlayManager: OverlayManager
     ) {
         self.hotkeyManager = hotkeyManager
         self.displayManager = displayManager
         self.socketServer = socketServer
         self.statusBarController = statusBarController
+        self.overlayManager = overlayManager
     }
 
     func execute(_ command: IPCCommand) {
@@ -56,6 +59,10 @@ final class CommandExecutor {
             statusBarController.updateWorkspace(tag)
         case .warpMouse(let x, let y):
             CGWarpMouseCursorPosition(CGPoint(x: x, y: y))
+        case .setDebugOverlays(let on):
+            overlayManager.setEnabled(on)
+        case .setOverlayState(let snapshot):
+            overlayManager.apply(snapshot)
         }
     }
 

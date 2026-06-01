@@ -141,15 +141,23 @@ struct MCMonadCoreApp {
     static func main() {
         logger.info("mcmonad-core starting")
 
-        // 1. Check / prompt accessibility permission
+        // 1. Check / prompt accessibility permission.
+        // AX is the only permission mcmonad-core needs; without it,
+        // findAXWindow returns nil for every wid, frame writes no-op,
+        // focus raises no-op, and hotkeys appear to do nothing. Refuse
+        // to start. The prompt dialog persists across exit; launchd
+        // respawns the daemon after the user grants permission.
         let options = [
             "AXTrustedCheckOptionPrompt" as CFString: true as CFBoolean
         ] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
         if !trusted {
-            logger.warning(
-                "Accessibility permission not yet granted — some features will fail until granted"
-            )
+            let msg = "Accessibility permission not granted. " +
+                "Grant it in System Settings > Privacy & Security > " +
+                "Accessibility, then mcmonad-core will be respawned."
+            logger.fault("\(msg, privacy: .public)")
+            fputs("mcmonad-core: \(msg)\n", stderr)
+            exit(78) // EX_CONFIG
         }
 
         // 2. SkyLight is required — access triggers load (fatal on failure)
@@ -177,6 +185,7 @@ struct MCMonadCoreApp {
         // Create services
         let hotkeyManager = HotkeyManager()
         let displayManager = DisplayManager()
+        let overlayManager = OverlayManager()
 
         // Create SocketServer + CommandExecutor
         let socketServer = SocketServer()
@@ -184,8 +193,23 @@ struct MCMonadCoreApp {
             hotkeyManager: hotkeyManager,
             displayManager: displayManager,
             socketServer: socketServer,
-            statusBarController: statusBar
+            statusBarController: statusBar,
+            overlayManager: overlayManager
         )
+
+        // Menu reads the cached snapshot from OverlayManager
+        statusBar.snapshotProvider = { [weak overlayManager] in
+            overlayManager?.cachedSnapshot
+        }
+        statusBar.onToggleDebugOverlays = { [weak socketServer] in
+            socketServer?.send(.menuToggleDebug)
+        }
+        statusBar.onFocusWindow = { [weak socketServer] wid, pid in
+            socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
+        }
+        statusBar.onViewWorkspace = { [weak socketServer] tag in
+            socketServer?.send(.menuViewWorkspace(tag: tag))
+        }
 
         // Route commands from socket to executor
         socketServer.onCommand = { command in
@@ -288,7 +312,8 @@ struct MCMonadCoreApp {
         logger.info("mcmonad-core fully initialized")
 
         // Keep references alive for the lifetime of the process
-        _keepAlive = (statusBar, hotkeyManager, displayManager, socketServer, executor, eventBridge, dragHandler)
+        _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
+                      socketServer, executor, eventBridge, dragHandler)
     }
 
     // Static storage to prevent ARC from deallocating services

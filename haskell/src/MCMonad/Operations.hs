@@ -190,12 +190,13 @@ windows f = do
     modify $ \s -> s { windowRects = M.fromList allPositions }
 
     -- 7. Focus the top window (only if focus actually changed) and arm
-    --    bounce suppression so the next AX/NSWorkspace echo for the
-    --    previously-focused app does not yank the StackSet back. See
-    --    'MCMonad.Core.Refocus' for the rationale. We update
-    --    'recentRefocus' unconditionally — 'armingRefocus' returns
-    --    'Nothing' for intra-app and no-op transitions, which correctly
-    --    clears any stale arming.
+    --    'focusIntent' so the event-handler path treats mcmonad's
+    --    StackSet as the source of truth for focus state until macOS
+    --    settles — see the 'FocusIntent' note in 'MCMonad.Core'. We
+    --    overwrite 'focusIntent' unconditionally: a 'Just newFocus' arms
+    --    fresh suppression for the new target; a 'Nothing' (empty
+    --    workspace) correctly clears any stale arming from a prior
+    --    transition.
     currentWS' <- gets windowset
     let oldFocus = W.peek old
         newFocus = W.peek currentWS'
@@ -203,7 +204,7 @@ windows f = do
         case newFocus of
             Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
             Nothing -> return ()
-    modify $ \s -> s { recentRefocus = armingRefocus oldFocus newFocus }
+    modify $ \s -> s { focusIntent = armingIntent newFocus }
 
     -- 8. Send workspace indicator update (with mode indicator)
     mode <- gets inputMode

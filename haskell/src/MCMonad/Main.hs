@@ -111,7 +111,7 @@ launch cfg = do
                        , windowMetadata = seededMetadata
                        , debugOverlays = False
                        , lastSaveAt = Nothing
-                       , recentRefocus = Nothing
+                       , focusIntent = Nothing
                        }
 
     _ <- runM mconf mst0 $ do
@@ -400,63 +400,86 @@ handleEvent debug cfg hotkeyIdMap evt = do
 -- ---------------------------------------------------------------------------
 -- Focus event dispatch
 --
--- 'FocusedWindowChanged' (from AX) and 'FrontAppChanged' (from NSWorkspace /
--- SkyLight 1508) are normally followed because they are the only signals
--- that distinguish multi-window-per-app focus, but macOS fires a bounce
--- echo for the previously-focused window right after every cross-app
--- focus change mcmonad initiates. 'MCMonad.Operations.windows' arms
--- 'recentRefocus' on every cross-app focus emit; here we test arriving
--- events against the arming and either suppress + re-issue, or apply
--- normal resolution. See the 'MCMonad.Core.Refocus' note for the full
--- rationale.
+-- 'FocusedWindowChanged' (from AX) and 'FrontAppChanged' (from NSWorkspace
+-- / SkyLight 1508) are normally followed because they are the only signals
+-- that distinguish multi-window-per-app focus changes, but they fire just
+-- as readily for macOS' internal focus-settling bounces as for legitimate
+-- user intent. While 'focusIntent' is armed, mcmonad's StackSet is the
+-- source of truth and these events are classified against the intent:
+--
+--   * exact match (wid + pid) — confirmation, no-op.
+--   * same app, different window — intra-app focus change (user clicking
+--     another window of the target's app); accept it and clear intent.
+--   * anything else — bounce or spurious cross-app divergence; re-issue
+--     'FocusWindow' to push macOS back to the target and decrement the
+--     budget. When the budget exhausts the intent clears so user-
+--     initiated cross-app focus changes eventually take effect.
+--
+-- See the 'MCMonad.Core.FocusIntent' note for the full rationale.
 
 handleFocusedWindowChanged :: Word32 -> Int32 -> M ()
 handleFocusedWindowChanged wid pid = do
-    rrf <- gets recentRefocus
-    case rrf of
-        Just r | isFocusBounce wid pid r ->
-            absorbBounce r
-        _ ->
-            applyFocusedWindowChanged
-
+    fi <- gets focusIntent
+    case fi of
+        Just i | isFocusIntentTarget wid pid i ->
+            -- Exact match: AX is confirming our command. StackSet is
+            -- already on this window. Leave intent armed in case more
+            -- divergences follow.
+            return ()
+        Just i | isIntentTargetPid pid i ->
+            -- Same app, different window (the exact-match guard above
+            -- excluded the target's wid). A different window of the
+            -- target's app gained focus — almost certainly the user
+            -- clicking another window in the same app. Accept it and
+            -- clear the intent.
+            applyAndClearIntent
+        Just i ->
+            -- Cross-app divergence: bounce or spurious AX event from a
+            -- third app. mcmonad's view stands; push macOS back to the
+            -- target and decrement the budget.
+            pushBackFocus i
+        Nothing ->
+            -- No intent armed. AX is authoritative.
+            applyClean
   where
-    applyFocusedWindowChanged = do
-        modify $ \s -> s { recentRefocus = Nothing }
+    applyClean = do
         ws <- gets windowset
         whenJust (resolveFocusedWindow wid pid ws) $ \ws' -> do
             modify $ \s -> s { windowset = ws' }
             pushOverlaySnapshot
+    applyAndClearIntent = do
+        modify $ \s -> s { focusIntent = Nothing }
+        applyClean
 
 handleFrontAppChanged :: Int32 -> M ()
 handleFrontAppChanged pid = do
-    rrf <- gets recentRefocus
-    case rrf of
-        Just r | isFrontAppBounce pid r ->
-            absorbBounce r
-        _ ->
-            applyFrontAppChanged
-
+    fi <- gets focusIntent
+    case fi of
+        Just i | isIntentTargetPid pid i ->
+            -- App-level confirmation. No-op; keep intent armed.
+            return ()
+        Just i ->
+            -- Different app activated — bounce or spurious. Push back.
+            pushBackFocus i
+        Nothing ->
+            applyClean
   where
-    applyFrontAppChanged = do
-        modify $ \s -> s { recentRefocus = Nothing }
+    applyClean = do
         ws <- gets windowset
         whenJust (resolveFrontApp pid ws) $ \ws' -> do
             modify $ \s -> s { windowset = ws' }
             pushOverlaySnapshot
 
--- | A bounce event arrived. The StackSet is already where mcmonad wants
--- it, so leave 'windowset' untouched, but re-issue 'FocusWindow' so
--- macOS' OS-level focus is pulled back onto the intended target (it has
--- bounced to the previously-focused app and will otherwise stay there
--- until the next user action). Decrement the budget; when it reaches
--- zero, clear 'recentRefocus' so any further events go through the
--- normal resolution path.
-absorbBounce :: Refocus -> M ()
-absorbBounce r = do
+-- | An event arrived that contradicts our 'FocusIntent'. macOS' focus
+-- has drifted from where mcmonad put it; push focus back onto the
+-- intended target by re-issuing the 'FocusWindow' IPC, and decrement
+-- the budget so a pathological loop self-terminates.
+pushBackFocus :: FocusIntent -> M ()
+pushBackFocus i = do
     conn <- asks connection
-    let to = rfTo r
-    io $ sendCommand conn (FocusWindow (wrWindowId to) (wrPid to))
-    modify $ \s -> s { recentRefocus = consumeRefocus r }
+    let t = fiTarget i
+    io $ sendCommand conn (FocusWindow (wrWindowId t) (wrPid t))
+    modify $ \s -> s { focusIntent = consumeIntent i }
 
 -- ---------------------------------------------------------------------------
 -- Helpers

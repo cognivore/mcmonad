@@ -33,6 +33,12 @@ module MCMonad.Core
       -- * Focus resolution
     , resolveFocusedWindow
     , resolveFrontApp
+      -- * Bounce suppression
+    , Refocus(..)
+    , armingRefocus
+    , isFocusBounce
+    , isFrontAppBounce
+    , consumeRefocus
     ) where
 
 import Control.Concurrent.MVar
@@ -48,7 +54,7 @@ import Data.Set (Set)
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 import Data.Typeable (Typeable, cast)
-import Data.Word (Word32)
+import Data.Word (Word8, Word32)
 import GHC.Generics (Generic)
 import System.IO (Handle)
 import qualified XMonad.Core as XMonad
@@ -268,6 +274,12 @@ data MState = MState
       -- doesn't fan out to a save per call. 'restart' bypasses the
       -- throttle so a Mod-q reload still writes the freshest snapshot
       -- before 'exec'.
+    , recentRefocus    :: !(Maybe Refocus)
+      -- ^ Bounce-suppression state. Set by 'MCMonad.Operations.windows'
+      -- after every inter-app focus change to the @(from, to)@ pair plus
+      -- a small countdown; cleared by the event-handler path once the
+      -- expected AX + NSWorkspace echo has been absorbed (or once any
+      -- non-bounce focus event arrives). See the 'Refocus' note above.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's
@@ -417,3 +429,86 @@ resolveFrontApp pid ws = case W.peek ws of
     _ -> case find ((== pid) . wrPid) (currentWorkspaceWindows ws) of
         Just wr -> Just (W.focusWindow wr ws)
         Nothing -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- AX/NSWorkspace bounce suppression
+--
+-- When 'MCMonad.Operations.windows' issues a cross-app focus change, macOS
+-- reliably fires a transient second wave of focus notifications for the
+-- previously-focused window of the previously-focused app, even though the
+-- four-step SLPS focus protocol on mcmonad-core just succeeded for the new
+-- target. AX delivers a 'kAXFocusedWindowChangedNotification' for the old
+-- window; NSWorkspace delivers a 'didActivateApplicationNotification' for
+-- the old app. Both fire within a runloop tick of mcmonad's command. The
+-- root cause is macOS' internal focus-settling: the previous app briefly
+-- regains focus before macOS finalises on the new target. AX does not
+-- distinguish "user intent" from "internal bounce echo" — every focus
+-- transition is reported.
+--
+-- A naive "follow AX" policy walks the StackSet's focus straight back onto
+-- the previously-focused window. The user's next 'Mod-J' / 'Mod-K' then
+-- cycles from the wrong starting point, which manifests as "focus
+-- switching stops working for a little bit".
+--
+-- The fix is single-shot bounce suppression. 'windows' arms 'Refocus'
+-- describing the inter-app focus change it just performed; the event
+-- handlers test arriving AX/NSWorkspace events against that signature and
+-- drop matching ones, re-issuing the 'FocusWindow' command so macOS is
+-- pushed back onto the target rather than left in its bounced state.
+-- A small countdown guards against pathological multi-bounce behaviour
+-- (the empirically-observed pair is one AX + one NSWorkspace event).
+--
+-- Intra-app focus changes do not arm 'Refocus': AX is per-PID and does
+-- not fire echo events when the focused window of an app changes within
+-- the app, so there is nothing to suppress.
+
+-- | What kind of focus change 'windows' just performed, recorded so the
+-- next AX\/NSWorkspace event burst can be filtered. 'rfFrom' is the
+-- previous focus (the window AX is about to echo for); 'rfTo' is the
+-- new focus (the window we want macOS to land on).
+data Refocus = Refocus
+    { rfFrom              :: !WindowRef
+    , rfTo                :: !WindowRef
+    , rfPendingBounces    :: !Word8
+    } deriving (Eq, Show, Read, Generic)
+
+-- | Number of bounce events expected per cross-app refocus: one
+-- 'kAXFocusedWindowChangedNotification' from the previous app's AX
+-- observer, plus one 'didActivateApplicationNotification' from
+-- NSWorkspace. Initial 'rfPendingBounces' is set to this.
+defaultBounceBudget :: Word8
+defaultBounceBudget = 2
+
+-- | Build a 'Refocus' from the focus state before and after a 'windows'
+-- transition. Returns 'Just' only for inter-app changes (the only case
+-- where macOS bounces); returns 'Nothing' for intra-app changes,
+-- focus-cleared transitions, and no-op transitions. Callers should
+-- overwrite 'recentRefocus' with this value unconditionally — passing
+-- 'Nothing' through 'modify' correctly clears any stale arming from a
+-- previous transition.
+armingRefocus :: Maybe WindowRef -> Maybe WindowRef -> Maybe Refocus
+armingRefocus (Just from) (Just to)
+    | wrPid from /= wrPid to = Just (Refocus from to defaultBounceBudget)
+armingRefocus _ _ = Nothing
+
+-- | Does an incoming @FocusedWindowChanged wid pid@ event match the
+-- bounce signature for the given 'Refocus'? AX bounces back to the
+-- previously-focused window, so we test against 'rfFrom' exactly.
+isFocusBounce :: Word32 -> Int32 -> Refocus -> Bool
+isFocusBounce wid pid r =
+    wrWindowId (rfFrom r) == wid && wrPid (rfFrom r) == pid
+
+-- | Does an incoming @FrontAppChanged pid@ event match the bounce
+-- signature for the given 'Refocus'? NSWorkspace re-activates the
+-- previously-focused app, which has only PID-level granularity.
+isFrontAppBounce :: Int32 -> Refocus -> Bool
+isFrontAppBounce pid r = wrPid (rfFrom r) == pid
+
+-- | Decrement the bounce budget after a bounce event has been
+-- suppressed. Returns 'Nothing' when the budget is exhausted so the
+-- next event flows through the normal resolution path.
+consumeRefocus :: Refocus -> Maybe Refocus
+consumeRefocus r
+    | rfPendingBounces r > 1 =
+        Just r { rfPendingBounces = rfPendingBounces r - 1 }
+    | otherwise = Nothing

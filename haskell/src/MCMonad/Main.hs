@@ -8,6 +8,7 @@ import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
+import Data.Int (Int32)
 import Data.Word (Word32)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitSuccess)
@@ -110,6 +111,7 @@ launch cfg = do
                        , windowMetadata = seededMetadata
                        , debugOverlays = False
                        , lastSaveAt = Nothing
+                       , recentRefocus = Nothing
                        }
 
     _ <- runM mconf mst0 $ do
@@ -339,29 +341,11 @@ handleEvent debug cfg hotkeyIdMap evt = do
                     rh = toRational (rect_h rect / rect_h screenR)
                 windows (W.float wr (W.RationalRect rx ry rw rh))
 
-        FocusedWindowChanged wid pid -> do
-            -- AX reported the exact focused window of an app. Trust this:
-            -- it is the only signal that distinguishes between multiple
-            -- windows of the same PID. Do NOT echo a FocusWindow back to
-            -- Swift — macOS already focused it; we'd just feedback-loop.
-            -- Push a fresh OverlaySnapshot so the debug overlay's blue
-            -- focused-label moves to the newly-focused window.
-            ws <- gets windowset
-            whenJust (resolveFocusedWindow wid pid ws) $ \ws' -> do
-                modify $ \s -> s { windowset = ws' }
-                pushOverlaySnapshot
+        FocusedWindowChanged wid pid ->
+            handleFocusedWindowChanged wid pid
 
-        FrontAppChanged pid -> do
-            -- App-level activation (NSWorkspace / SkyLight 1508). Carries
-            -- no windowId, so we only act when the user actually switched
-            -- *across* apps. Within an app, the precise AX-driven
-            -- FocusedWindowChanged is authoritative — letting this path
-            -- run would clobber it with "first window of this PID".
-            -- Push the overlay snapshot for the same reason as above.
-            ws <- gets windowset
-            whenJust (resolveFrontApp pid ws) $ \ws' -> do
-                modify $ \s -> s { windowset = ws' }
-                pushOverlaySnapshot
+        FrontAppChanged pid ->
+            handleFrontAppChanged pid
 
         MouseEnteredWindow wid _pid ->
             when (focusFollowsMouse cfg) $ do
@@ -412,6 +396,67 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- is the defence-in-depth.
             io $ hPutStrLn stderr $
                 "mcmonad: ignoring unknown wire message: " ++ T.unpack name
+
+-- ---------------------------------------------------------------------------
+-- Focus event dispatch
+--
+-- 'FocusedWindowChanged' (from AX) and 'FrontAppChanged' (from NSWorkspace /
+-- SkyLight 1508) are normally followed because they are the only signals
+-- that distinguish multi-window-per-app focus, but macOS fires a bounce
+-- echo for the previously-focused window right after every cross-app
+-- focus change mcmonad initiates. 'MCMonad.Operations.windows' arms
+-- 'recentRefocus' on every cross-app focus emit; here we test arriving
+-- events against the arming and either suppress + re-issue, or apply
+-- normal resolution. See the 'MCMonad.Core.Refocus' note for the full
+-- rationale.
+
+handleFocusedWindowChanged :: Word32 -> Int32 -> M ()
+handleFocusedWindowChanged wid pid = do
+    rrf <- gets recentRefocus
+    case rrf of
+        Just r | isFocusBounce wid pid r ->
+            absorbBounce r
+        _ ->
+            applyFocusedWindowChanged
+
+  where
+    applyFocusedWindowChanged = do
+        modify $ \s -> s { recentRefocus = Nothing }
+        ws <- gets windowset
+        whenJust (resolveFocusedWindow wid pid ws) $ \ws' -> do
+            modify $ \s -> s { windowset = ws' }
+            pushOverlaySnapshot
+
+handleFrontAppChanged :: Int32 -> M ()
+handleFrontAppChanged pid = do
+    rrf <- gets recentRefocus
+    case rrf of
+        Just r | isFrontAppBounce pid r ->
+            absorbBounce r
+        _ ->
+            applyFrontAppChanged
+
+  where
+    applyFrontAppChanged = do
+        modify $ \s -> s { recentRefocus = Nothing }
+        ws <- gets windowset
+        whenJust (resolveFrontApp pid ws) $ \ws' -> do
+            modify $ \s -> s { windowset = ws' }
+            pushOverlaySnapshot
+
+-- | A bounce event arrived. The StackSet is already where mcmonad wants
+-- it, so leave 'windowset' untouched, but re-issue 'FocusWindow' so
+-- macOS' OS-level focus is pulled back onto the intended target (it has
+-- bounced to the previously-focused app and will otherwise stay there
+-- until the next user action). Decrement the budget; when it reaches
+-- zero, clear 'recentRefocus' so any further events go through the
+-- normal resolution path.
+absorbBounce :: Refocus -> M ()
+absorbBounce r = do
+    conn <- asks connection
+    let to = rfTo r
+    io $ sendCommand conn (FocusWindow (wrWindowId to) (wrPid to))
+    modify $ \s -> s { recentRefocus = consumeRefocus r }
 
 -- ---------------------------------------------------------------------------
 -- Helpers

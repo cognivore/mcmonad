@@ -5,6 +5,8 @@ import qualified XMonad.StackSet as W
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
     , updateAffinities, resolveFocusedWindow, resolveFrontApp
+    , Refocus(..), armingRefocus, isFocusBounce, isFrontAppBounce
+    , consumeRefocus
     )
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
@@ -448,6 +450,104 @@ prop_frontApp_never_switches_workspace ss =
                 Nothing  -> property True
                 Just ss' -> W.currentTag ss' === W.currentTag ss
 
+-- === BOUNCE SUPPRESSION (Refocus / armingRefocus / isFocusBounce) ===
+--
+-- After a cross-app focus change, macOS fires AX
+-- 'kAXFocusedWindowChangedNotification' + NSWorkspace
+-- 'didActivateApplicationNotification' for the previously-focused
+-- (window, app). The handlers in 'MCMonad.Main' suppress those echoes
+-- by checking arriving events against a 'Refocus' record armed by
+-- 'MCMonad.Operations.windows'. The properties below cover the pure
+-- helpers that decide what arms and what matches.
+
+-- | A pair of distinct WindowRefs that live in *different* apps. Used to
+-- exercise the cross-app paths.
+data CrossAppPair = CrossAppPair WindowRef WindowRef deriving Show
+
+instance Arbitrary CrossAppPair where
+    arbitrary = do
+        wid1 <- choose (1, 10000)
+        wid2 <- choose (1, 10000) `suchThat` (/= wid1)
+        pid1 <- choose (1, 1000)
+        pid2 <- choose (1, 1000) `suchThat` (/= pid1)
+        return (CrossAppPair (WindowRef wid1 pid1) (WindowRef wid2 pid2))
+
+-- | A pair of distinct WindowRefs that live in the *same* app.
+data SameAppPair = SameAppPair WindowRef WindowRef deriving Show
+
+instance Arbitrary SameAppPair where
+    arbitrary = do
+        wid1 <- choose (1, 10000)
+        wid2 <- choose (1, 10000) `suchThat` (/= wid1)
+        pid  <- choose (1, 1000)
+        return (SameAppPair (WindowRef wid1 pid) (WindowRef wid2 pid))
+
+-- armingRefocus arms on cross-app focus changes — there is a bounce to
+-- suppress, so a Refocus is produced.
+prop_armingRefocus_crossApp_arms :: CrossAppPair -> Bool
+prop_armingRefocus_crossApp_arms (CrossAppPair from to) =
+    case armingRefocus (Just from) (Just to) of
+        Just r  -> rfFrom r == from && rfTo r == to
+        Nothing -> False
+
+-- armingRefocus does NOT arm on intra-app focus changes — AX is per-PID
+-- and never echoes for within-app focus rotations.
+prop_armingRefocus_sameApp_does_not_arm :: SameAppPair -> Bool
+prop_armingRefocus_sameApp_does_not_arm (SameAppPair from to) =
+    armingRefocus (Just from) (Just to) == Nothing
+
+-- armingRefocus does not arm when focus appears or disappears (no @from@
+-- means the StackSet was empty; no @to@ means we focused nothing — neither
+-- triggers a macOS focus bounce).
+prop_armingRefocus_no_endpoint_does_not_arm :: Maybe WindowRef -> Maybe WindowRef -> Property
+prop_armingRefocus_no_endpoint_does_not_arm mFrom mTo =
+    isNothing mFrom || isNothing mTo
+    ==> armingRefocus mFrom mTo === Nothing
+
+-- | 'CrossAppPair' guarantees the two refs differ by PID, which is
+-- exactly the condition under which 'armingRefocus' produces 'Just'.
+-- This helper hoists that invariant into a non-partial pattern.
+crossAppRefocus :: CrossAppPair -> Refocus
+crossAppRefocus (CrossAppPair from to) = case armingRefocus (Just from) (Just to) of
+    Just r  -> r
+    Nothing -> error "crossAppRefocus: CrossAppPair invariant violated"
+
+-- isFocusBounce recognises the @rfFrom@ window — and ONLY that window —
+-- as a bounce echo. The to-window arriving back is a confirmation, not a
+-- bounce.
+prop_isFocusBounce_matches_from :: CrossAppPair -> Bool
+prop_isFocusBounce_matches_from p@(CrossAppPair from to) =
+    let r = crossAppRefocus p
+    in isFocusBounce (wrWindowId from) (wrPid from) r
+       && not (isFocusBounce (wrWindowId to)   (wrPid to)   r)
+
+-- A bounce-arming Refocus armed from 'from'→'to' does not see arbitrary
+-- third-party windows as bounces.
+prop_isFocusBounce_thirdParty_not_bounce :: CrossAppPair -> WindowRef -> Property
+prop_isFocusBounce_thirdParty_not_bounce p@(CrossAppPair from _to) other =
+    wrPid other /= wrPid from
+    ==> let r = crossAppRefocus p
+        in not (isFocusBounce (wrWindowId other) (wrPid other) r)
+
+-- isFrontAppBounce recognises the @rfFrom@ pid — the NSWorkspace
+-- reactivation of the previously-focused app — and not the target pid.
+prop_isFrontAppBounce_matches_from :: CrossAppPair -> Bool
+prop_isFrontAppBounce_matches_from p@(CrossAppPair from to) =
+    let r = crossAppRefocus p
+    in isFrontAppBounce (wrPid from) r
+       && not (isFrontAppBounce (wrPid to) r)
+
+-- consumeRefocus is monotonic: each call decrements the pending budget,
+-- and produces Nothing exactly when the budget runs out.
+prop_consumeRefocus_terminates :: CrossAppPair -> Bool
+prop_consumeRefocus_terminates p =
+    let r0      = crossAppRefocus p
+        budget  = fromIntegral (rfPendingBounces r0) :: Int
+        steps   = take (budget + 1)
+                       (iterate (>>= consumeRefocus) (Just r0))
+    in last steps == Nothing
+       && length (filter (/= Nothing) steps) == budget
+
 
 -- === PERSISTENCE ROUND-TRIP (MCMonad.Persistence) ===
 --
@@ -735,6 +835,14 @@ allProperties =
     , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
     , ("frontApp switches within workspace",         property prop_frontApp_switches_within_workspace)
     , ("frontApp never switches workspace",          property prop_frontApp_never_switches_workspace)
+
+    , ("armingRefocus arms cross-app",                property prop_armingRefocus_crossApp_arms)
+    , ("armingRefocus does not arm intra-app",        property prop_armingRefocus_sameApp_does_not_arm)
+    , ("armingRefocus needs both endpoints",          property prop_armingRefocus_no_endpoint_does_not_arm)
+    , ("isFocusBounce matches rfFrom",                property prop_isFocusBounce_matches_from)
+    , ("isFocusBounce ignores third-party windows",   property prop_isFocusBounce_thirdParty_not_bounce)
+    , ("isFrontAppBounce matches rfFrom pid",         property prop_isFrontAppBounce_matches_from)
+    , ("consumeRefocus drains exactly the budget",    property prop_consumeRefocus_terminates)
     -- Cross-restart identity matcher
     -- Persistence round-trip (WindowRef identity)
     , ("persistence: kept saved survives, stale dropped", property prop_persistence_round_trip)

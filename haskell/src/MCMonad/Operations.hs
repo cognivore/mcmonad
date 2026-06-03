@@ -189,7 +189,13 @@ windows f = do
     -- 6b. Store window positions for directional focus navigation
     modify $ \s -> s { windowRects = M.fromList allPositions }
 
-    -- 7. Focus the top window (only if focus actually changed)
+    -- 7. Focus the top window (only if focus actually changed) and arm
+    --    bounce suppression so the next AX/NSWorkspace echo for the
+    --    previously-focused app does not yank the StackSet back. See
+    --    'MCMonad.Core.Refocus' for the rationale. We update
+    --    'recentRefocus' unconditionally — 'armingRefocus' returns
+    --    'Nothing' for intra-app and no-op transitions, which correctly
+    --    clears any stale arming.
     currentWS' <- gets windowset
     let oldFocus = W.peek old
         newFocus = W.peek currentWS'
@@ -197,6 +203,7 @@ windows f = do
         case newFocus of
             Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
             Nothing -> return ()
+    modify $ \s -> s { recentRefocus = armingRefocus oldFocus newFocus }
 
     -- 8. Send workspace indicator update (with mode indicator)
     mode <- gets inputMode

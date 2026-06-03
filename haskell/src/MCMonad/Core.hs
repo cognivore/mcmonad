@@ -485,6 +485,22 @@ resolveFrontApp pid ws = case W.peek ws of
 -- 'FrontAppChanged' uses the same logic but without the intra-app arm
 -- (NSWorkspace doesn't carry a window id, so there's no "same app
 -- different window" to recognise).
+--
+-- LOAD-BEARING ESCAPE HATCH. The budget alone is not sufficient. AX
+-- cannot tell a legitimate mouse click on another app's window apart
+-- from a focus-settling bounce echo for the previously-focused app —
+-- both arrive at the handler as cross-app divergent 'FocusedWindowChanged'
+-- \/ 'FrontAppChanged' events. Without a separate channel, every mouse
+-- click on a third-app window costs (budget + 1) physical clicks before
+-- it takes effect, which is unservicable. The disambiguator is the
+-- physical mouse-down event surfaced over IPC as 'UserMouseDown'
+-- (CGEventTap on .leftMouseDown\/.rightMouseDown\/.otherMouseDown in
+-- core; the handler in 'MCMonad.Main' clears 'focusIntent'
+-- unconditionally on receipt, so the very next AX\/NSWorkspace event
+-- flows through 'resolveFocusedWindow' \/ 'resolveFrontApp' as
+-- authoritative). DO NOT remove the 'UserMouseDown' arm without
+-- supplying an equivalent out-of-band physical-input channel — without
+-- one, the "mouse clicks need to be repeated" regression returns.
 
 -- | The focus mcmonad most recently told macOS to land on, plus the
 -- budget for how many divergent AX\/NSWorkspace events we will fight

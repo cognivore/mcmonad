@@ -311,6 +311,16 @@ struct MCMonadCoreApp {
         }
         dragHandler.start()
 
+        // Global mouse-down monitor: surfaces a 'user has just clicked'
+        // signal to the Haskell side so it can disarm 'focusIntent' and
+        // honour the AX/NSWorkspace event that follows the click. See
+        // 'MouseDownMonitor.swift' for the full rationale.
+        let mouseDownMonitor = MouseDownMonitor()
+        mouseDownMonitor.onUserMouseDown = { [weak socketServer] in
+            socketServer?.send(.userMouseDown)
+        }
+        mouseDownMonitor.start()
+
         // Periodic window validation — catches windows that vanish without
         // firing SkyLight 804/1326 (e.g. quickly closed system dialogs).
         // Runs every 2 seconds on the main run loop.
@@ -330,7 +340,8 @@ struct MCMonadCoreApp {
 
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
-                      socketServer, executor, eventBridge, dragHandler)
+                      socketServer, executor, eventBridge, dragHandler,
+                      mouseDownMonitor)
     }
 
     // Static storage to prevent ARC from deallocating services

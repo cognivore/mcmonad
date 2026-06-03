@@ -252,6 +252,7 @@ enum IPCEvent: Encodable, Sendable {
     case hotkeyPressed(hotkeyId: Int)
     case mouseEnteredWindow(windowId: UInt32, pid: Int32)
     case windowDragCompleted(windowId: UInt32, pid: Int32, frame: CGRect)
+    case userMouseDown
     case menuToggleDebug
     case menuFocusWindow(windowId: UInt32, pid: Int32)
     case menuViewWorkspace(tag: String)
@@ -302,6 +303,8 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
             try container.encode(FlatRect(frame), forKey: .frame)
+        case .userMouseDown:
+            try container.encode("user-mouse-down", forKey: .event)
         case .menuToggleDebug:
             try container.encode("menu-toggle-debug", forKey: .event)
         case .menuFocusWindow(let windowId, let pid):

@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 5
+protocolVersion = 6
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -246,6 +246,13 @@ data Event
     | HotkeyPressed !Int
     | MouseEnteredWindow !Word32 !Int32
     | WindowDragCompleted !Word32 !Int32 !Rectangle
+    | UserMouseDown
+      -- ^ A global mouse-down event fired somewhere on the system.
+      -- Surfaced by 'MouseDownMonitor' in mcmonad-core. Used by the
+      -- focus-event dispatch as a "user intent has just happened"
+      -- signal: any 'focusIntent' in flight is cleared so the AX /
+      -- NSWorkspace notification that follows the click is treated as
+      -- authoritative rather than a bounce echo.
     | MenuToggleDebug
     | MenuFocusWindow !Word32 !Int32
     | MenuViewWorkspace !String
@@ -327,6 +334,7 @@ instance Aeson.FromJSON Event where
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"
                 "window-drag-completed" -> WindowDragCompleted <$> v .: "windowId" <*> v .: "pid" <*> v .: "frame"
+                "user-mouse-down"      -> pure UserMouseDown
                 "menu-toggle-debug"    -> pure MenuToggleDebug
                 "menu-focus-window"    -> MenuFocusWindow <$> v .: "windowId" <*> v .: "pid"
                 "menu-view-workspace"  -> MenuViewWorkspace <$> v .: "tag"

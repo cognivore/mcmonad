@@ -356,6 +356,15 @@ handleEvent debug cfg hotkeyIdMap evt = do
                     when (W.peek ws /= Just wref) $
                         windows (W.focusWindow wref)
 
+        UserMouseDown ->
+            -- A physical click happened somewhere on the system. This
+            -- is the only signal that reliably distinguishes user
+            -- intent from macOS' AX bounce echoes after a 'FocusWindow'
+            -- IPC command, so disarm 'focusIntent' unconditionally and
+            -- let the next AX / NSWorkspace event flow through to
+            -- 'resolveFocusedWindow' / 'resolveFrontApp' normally.
+            modify $ \s -> s { focusIntent = Nothing }
+
         ScreensChanged scs ->
             rescreen scs
 

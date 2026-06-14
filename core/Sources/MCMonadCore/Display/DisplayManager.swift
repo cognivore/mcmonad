@@ -30,6 +30,23 @@ final class DisplayManager {
         }
     }
 
+    /// The screen a window currently occupies, for parking it off-screen.
+    /// Prefers the screen with the largest overlap; if the window overlaps no
+    /// screen (e.g. it was already parked far off-screen by an earlier hide),
+    /// picks the one whose centre is nearest. All frames are in screen coords
+    /// (origin top-left), matching `currentScreens()`.
+    func screen(forFrame frame: CGRect) -> ScreenInfo? {
+        let screens = currentScreens()
+        guard !screens.isEmpty else { return nil }
+        if let best = screens.max(by: { overlapArea($0.frame, frame) < overlapArea($1.frame, frame) }),
+           overlapArea(best.frame, frame) > 0 {
+            return best
+        }
+        return screens.min(by: {
+            centreDistanceSquared($0.frame, frame) < centreDistanceSquared($1.frame, frame)
+        })
+    }
+
     func startObserving() {
         observer = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -52,4 +69,15 @@ final class DisplayManager {
             self.observer = nil
         }
     }
+}
+
+private func overlapArea(_ a: CGRect, _ b: CGRect) -> CGFloat {
+    let i = a.intersection(b)
+    return i.isNull ? 0 : i.width * i.height
+}
+
+private func centreDistanceSquared(_ a: CGRect, _ b: CGRect) -> CGFloat {
+    let dx = a.midX - b.midX
+    let dy = a.midY - b.midY
+    return dx * dx + dy * dy
 }

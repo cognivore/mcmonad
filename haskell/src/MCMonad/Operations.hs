@@ -134,11 +134,24 @@ windows f = do
         newVisible = allVisibleWindows currentAfterSticky
 
     conn <- asks connection
+    prevMapped <- gets mapped
 
-    -- 2. Hide windows no longer visible (never hide sticky windows)
-    let toHide = filter (\w -> w `notElem` newVisible && not (S.member w stickySet)) oldVisible
-    io $ hPutStrLn stderr $ "WINDOWS: oldVisible=" ++ show (length oldVisible) ++ " newVisible=" ++ show (length newVisible) ++ " toHide=" ++ show (map wrWindowId toHide)
-    unless (null toHide) $
+    -- 2. Hide every window that should NOT be visible — declaratively, across
+    --    ALL workspaces, not just the ones that were visible last cycle. A
+    --    window parked on a hidden workspace that drifted back on-screen (a
+    --    prior off-screen clamp, or an app re-asserting its own position) is
+    --    therefore re-parked on the next switch, instead of being remembered
+    --    as "already hidden" forever (the bug behind the stuck background).
+    --    Never hide sticky windows. Fire only when the visible set actually
+    --    changed, so pure focus-follows-mouse churn doesn't re-issue hides on
+    --    every event.
+    let visibleChanged = S.fromList newVisible /= prevMapped
+        toHide = filter (\w -> w `notElem` newVisible && not (S.member w stickySet))
+                        (allManagedWindows currentAfterSticky)
+    io $ hPutStrLn stderr $ "WINDOWS: visibleChanged=" ++ show visibleChanged
+        ++ " newVisible=" ++ show (length newVisible)
+        ++ " toHide=" ++ show (map wrWindowId toHide)
+    when (visibleChanged && not (null toHide)) $
         io $ sendCommand conn (HideWindows (map wrWindowId toHide))
 
     -- 3. Show windows that became visible
@@ -271,6 +284,14 @@ allVisibleWindows :: WindowSet -> [WindowRef]
 allVisibleWindows ws =
     concatMap (W.integrate' . W.stack . W.workspace)
               (W.current ws : W.visible ws)
+
+-- | Every managed window across all workspaces — current, visible, and
+-- hidden. Used to hide declaratively: anything here that is not in
+-- 'allVisibleWindows' should be parked off-screen.
+allManagedWindows :: WindowSet -> [WindowRef]
+allManagedWindows ws =
+    concatMap (W.integrate' . W.stack)
+              (map W.workspace (W.current ws : W.visible ws) ++ W.hidden ws)
 
 -- | Convert a (WindowRef, Rectangle) pair to a FrameAssignment.
 toFrameAssignment :: (WindowRef, Rectangle) -> FrameAssignment

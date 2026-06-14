@@ -11,6 +11,15 @@ func _AXUIElementGetWindow(
     _ windowId: inout CGWindowID
 ) -> AXError
 
+/// Private AX attribute set by VoiceOver and by some apps (Chrome/Chromium/
+/// Electron/Firefox). While it is `true`, AX position/size writes are routed
+/// through an animated path and land late or in the wrong place. Window
+/// managers (yabai, Amethyst, AeroSpace) disable it around frame writes and
+/// restore it afterwards — so do we.
+/// `nonisolated(unsafe)`: an immutable CFString constant, like the framework's
+/// own kAX* attributes (matches FrameLog's global-state pattern).
+nonisolated(unsafe) private let kAXEnhancedUserInterface = "AXEnhancedUserInterface" as CFString
+
 // MARK: - AXWindowService
 
 /// AXUIElement wrapper for window metadata reads and frame writes.
@@ -193,6 +202,22 @@ enum AXWindowService {
             return false
         }
 
+        // Disable AXEnhancedUserInterface on the app for the duration of the
+        // geometry writes, then restore it (see the constant's note). The flag
+        // lives on the *app* element, not the window — matching yabai's
+        // AX_ENHANCED_UI_WORKAROUND. Without this, Chrome/Electron/Firefox (and
+        // anything running while VoiceOver is on) animate or mis-place the move.
+        let appElement = AXUIElementCreateApplication(pid)
+        let hadEnhancedUI = enhancedUserInterfaceEnabled(appElement)
+        if hadEnhancedUI {
+            AXUIElementSetAttributeValue(appElement, kAXEnhancedUserInterface, kCFBooleanFalse)
+        }
+        defer {
+            if hadEnhancedUI {
+                AXUIElementSetAttributeValue(appElement, kAXEnhancedUserInterface, kCFBooleanTrue)
+            }
+        }
+
         let isGrowing: Bool
         if let hint = currentHint {
             isGrowing = targetFrame.width > hint.width + 0.5
@@ -350,6 +375,19 @@ enum AXWindowService {
         else { return nil }
 
         return CGRect(origin: pos, size: size)
+    }
+
+    // MARK: - Internal: AXEnhancedUserInterface
+
+    /// Whether the app currently has AXEnhancedUserInterface enabled.
+    /// Absent or non-boolean ⇒ treated as off (matches yabai).
+    private static func enhancedUserInterfaceEnabled(_ app: AXUIElement) -> Bool {
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXEnhancedUserInterface, &valueRef) == .success,
+              let valueRef,
+              CFGetTypeID(valueRef) == CFBooleanGetTypeID()
+        else { return false }
+        return CFBooleanGetValue((valueRef as! CFBoolean))
     }
 
     // MARK: - Internal: find AX element for window

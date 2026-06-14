@@ -255,34 +255,42 @@ final class CommandExecutor {
         fputs("CMD: hide-windows ids=\(windowIds)\n", stderr)
         guard !windowIds.isEmpty else { return }
 
-        // Move windows just past the right screen edge via AX.
-        // SkyLight SLSMoveWindow can't move other apps' windows (permission).
-        // AX works because we have Accessibility permission.
-        let screenMaxX = NSScreen.screens.map { $0.frame.maxX }.max() ?? 5000
-        let hideX = screenMaxX + 100
-
+        // Park each window 1px inside the bottom-right corner of the screen it
+        // is on, leaving only a ~1px sliver visible. The origin MUST stay
+        // inside the display union: a window placed *fully* off-screen gets
+        // yanked back on-screen by AppKit (a titled NSWindow "automatically
+        // constrains itself to the screen") — that was the "Photoshop ghost on
+        // an empty workspace" bug, caused by the old `screenMaxX + 100` target.
+        // The surviving sliver doubles as a manual drag-handle if the daemon
+        // dies. Mirrors AeroSpace's hideInCorner. SkyLight can't move other
+        // apps' windows (permission); AX can, since we hold Accessibility.
         for wid in windowIds {
-            if let snap = SkyLightQuery.queryWindow(wid) {
-                let target = CGRect(x: hideX, y: 0,
-                                    width: snap.frame.width, height: snap.frame.height)
-                FrameLog.emit(source: .cmdHideMove,
-                              windowId: wid, pid: snap.pid, rect: target,
-                              tHash: TitleHash.hash(windowId: wid, pid: snap.pid),
-                              extra: "from=(\(fmtCoord(snap.frame.origin.x)),"
-                                   + "\(fmtCoord(snap.frame.origin.y)),"
-                                   + "\(fmtCoord(snap.frame.width)),"
-                                   + "\(fmtCoord(snap.frame.height))) hideX=\(fmtCoord(hideX))")
-                AXWindowService.setFrame(
-                    target,
-                    windowId: wid,
-                    pid: snap.pid,
-                    currentHint: snap.frame
-                )
-            } else {
-                FrameLog.emit(source: .cmdHideMove,
-                              windowId: wid, result: "no-snap",
-                              extra: "hideX=\(fmtCoord(hideX))")
+            guard let snap = SkyLightQuery.queryWindow(wid) else {
+                FrameLog.emit(source: .cmdHideMove, windowId: wid, result: "no-snap")
+                continue
             }
+            guard let screen = displayManager.screen(forFrame: snap.frame) else {
+                FrameLog.emit(source: .cmdHideMove, windowId: wid, pid: snap.pid,
+                              result: "no-screen")
+                continue
+            }
+            let corner = CGPoint(x: screen.frame.maxX - 1, y: screen.frame.maxY - 1)
+            let target = CGRect(origin: corner, size: snap.frame.size)
+            FrameLog.emit(source: .cmdHideMove,
+                          windowId: wid, pid: snap.pid, rect: target,
+                          tHash: TitleHash.hash(windowId: wid, pid: snap.pid),
+                          extra: "corner from=(\(fmtCoord(snap.frame.origin.x)),"
+                               + "\(fmtCoord(snap.frame.origin.y))) "
+                               + "screen=(\(fmtCoord(screen.frame.origin.x)),"
+                               + "\(fmtCoord(screen.frame.origin.y)),"
+                               + "\(fmtCoord(screen.frame.width)),"
+                               + "\(fmtCoord(screen.frame.height)))")
+            AXWindowService.setFrame(
+                target,
+                windowId: wid,
+                pid: snap.pid,
+                currentHint: snap.frame
+            )
         }
     }
 

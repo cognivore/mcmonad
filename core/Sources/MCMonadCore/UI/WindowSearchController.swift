@@ -9,18 +9,16 @@ private final class KeyablePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// The fuzzy window-search dropdown.
+/// The Spotlight-style fuzzy window search.
 ///
-/// Drops down from the menubar icon (or screen-centre as a fallback when
-/// there is no anchor) as a small panel: a search field on top and a live
-/// fuzzy-filtered list of every window across every workspace below.
+/// A floating key panel centred in the upper third of the active screen: a
+/// large search field on top and a live fuzzy-filtered list of every window
+/// across every workspace below. Looks and behaves like macOS Spotlight.
 ///
-/// Why a panel instead of a field *inside* the NSMenu: an `NSMenu` runs its
-/// own modal event-tracking loop that swallows key events before they reach
-/// an embedded text field, and it will not re-lay-out its item list while
-/// open — so neither text entry nor live filtering work reliably in a menu.
-/// A key panel anchored under the icon reads as the dropdown while giving us
-/// full control of keyboard and drawing.
+/// Why a panel and not a field *inside* the NSMenu: an `NSMenu` runs its own
+/// modal event-tracking loop that swallows key events before they reach an
+/// embedded text field, and it will not re-lay-out its item list while open
+/// — so neither text entry nor live filtering work reliably in a menu.
 ///
 /// Selecting a row (Return or double-click) reports `(windowId, pid)` via
 /// `onFocusWindow`, which Main wires to the same `menu-focus-window` IPC
@@ -41,17 +39,21 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
     /// Fires with (windowId, pid) when the user picks a window.
     var onFocusWindow: ((UInt32, Int32) -> Void)?
 
-    /// The menubar status button to anchor the dropdown beneath.
+    /// Unused for positioning (the panel centres Spotlight-style); kept so
+    /// existing wiring in Main compiles without change.
     var anchorButton: NSStatusBarButton?
 
     private var panel: KeyablePanel?
     private var searchField: NSSearchField!
     private var tableView: NSTableView!
 
-    private static let panelWidth: CGFloat = 380
-    private static let panelHeight: CGFloat = 420
-    private static let fieldHeight: CGFloat = 28
-    private static let pad: CGFloat = 8
+    private static let panelWidth: CGFloat = 640
+    private static let panelHeight: CGFloat = 460
+    private static let fieldHeight: CGFloat = 48
+    private static let pad: CGFloat = 12
+    /// Fraction of the screen height to leave above the panel (Spotlight
+    /// sits a bit above centre).
+    private static let topFraction: CGFloat = 0.22
 
     /// One searchable window row.
     private struct Entry {
@@ -136,8 +138,23 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         field.focusRingType = .none
         field.sendsSearchStringImmediately = true
         field.sendsWholeSearchString = false
+        field.font = .systemFont(ofSize: 26, weight: .light)
+        field.bezelStyle = .roundedBezel
+        if let cell = field.cell as? NSSearchFieldCell {
+            cell.cancelButtonCell = nil
+        }
         container.addSubview(field)
         self.searchField = field
+
+        // A hairline divider under the search field, Spotlight-style.
+        let divider = NSBox(frame: NSRect(
+            x: 0,
+            y: Self.panelHeight - Self.fieldHeight - 2 * Self.pad,
+            width: Self.panelWidth,
+            height: 1
+        ))
+        divider.boxType = .separator
+        container.addSubview(divider)
 
         // Results table inside a scroll view.
         let scrollFrame = NSRect(
@@ -154,7 +171,7 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         let table = NSTableView(frame: scrollFrame)
         table.headerView = nil
         table.backgroundColor = .clear
-        table.rowHeight = 22
+        table.rowHeight = 30
         table.allowsEmptySelection = false
         table.allowsMultipleSelection = false
         table.dataSource = self
@@ -165,6 +182,12 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         let col = NSTableColumn(identifier: .init("window"))
         col.width = scrollFrame.width
         col.resizingMask = .autoresizingMask
+        let dataCell = NSTextFieldCell()
+        dataCell.font = .systemFont(ofSize: 15)
+        dataCell.lineBreakMode = .byTruncatingTail
+        dataCell.isBordered = false
+        dataCell.drawsBackground = false
+        col.dataCell = dataCell
         table.addTableColumn(col)
 
         scroll.documentView = table
@@ -176,24 +199,15 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
     }
 
     private func positionPanel(_ panel: KeyablePanel) {
-        // Anchor under the menubar icon when we have one; otherwise centre
-        // on the screen with the mouse / main screen.
-        if let statusWindow = anchorButton?.window {
-            let f = statusWindow.frame
-            var x = f.midX - Self.panelWidth / 2
-            let y = f.minY - Self.panelHeight - 2
-            if let screen = statusWindow.screen ?? NSScreen.main {
-                let vis = screen.visibleFrame
-                x = min(max(x, vis.minX + 4), vis.maxX - Self.panelWidth - 4)
-            }
-            panel.setFrameOrigin(NSPoint(x: x, y: y))
-        } else if let screen = NSScreen.main {
-            let vis = screen.visibleFrame
-            panel.setFrameOrigin(NSPoint(
-                x: vis.midX - Self.panelWidth / 2,
-                y: vis.midY - Self.panelHeight / 2
-            ))
-        }
+        // Spotlight-style: centred horizontally and a bit above centre on
+        // the screen that currently has the mouse (falling back to main).
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main
+        guard let vis = screen?.visibleFrame else { return }
+        let x = vis.midX - Self.panelWidth / 2
+        let y = vis.maxY - Self.panelHeight - vis.height * Self.topFraction
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
     // MARK: - Data

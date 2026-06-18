@@ -145,17 +145,17 @@ defaultKeys conf = Map.fromList $
     -- when the actual frame disagrees with the most-recent SetFrames.
     , ((m .|. controlMask, kD), toggleDebugOverlays)
 
-    -- Fuzzy window search + "follow the active window". Both use the
-    -- Option+Command+Shift triad so they cannot be hit by accident and
-    -- are independent of 'modMask' (deliberately not 'm').
+    -- Fuzzy window search + "follow the active window". Independent of
+    -- 'modMask' (deliberately not 'm').
     --
-    -- Opt+Cmd+Shift+P: open the fuzzy window-search dropdown ("I lost
+    -- Opt+Shift+P: open the Spotlight-style fuzzy window search ("I lost
     -- Google Chrome" → type "chr" → Enter).
     --
     -- Opt+Cmd+Shift+J: jump to the workspace where the *currently active*
     -- window lives. Click a Dock icon, then press this to follow the app
-    -- onto its (possibly off-screen) workspace.
-    , ((optionMask .|. commandMask .|. shiftMask, kP), showWindowPicker)
+    -- onto its (possibly off-screen) workspace. Keeps the Command in its
+    -- triad so it can't be hit by accident.
+    , ((optionMask .|. shiftMask, kP), showWindowPicker)
     , ((optionMask .|. commandMask .|. shiftMask, kJ), jumpToActiveWindow)
 
     ]

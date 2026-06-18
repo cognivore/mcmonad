@@ -80,6 +80,20 @@ in
         # On compile failure we delete the stale binary + sidecar so the
         # launcher falls back to the bundled binary; activation does not
         # abort — the user will see the failure on next login.
+        #
+        # -fforce-recomp is load-bearing: when only the mcmonad *library*
+        # store path changes (mcmonad.hs itself byte-identical, as with a
+        # bindings or layout change that lives in the library, not the
+        # user config), ghc --make's recompilation checker sees an
+        # unchanged source + cached .hi/.o and SKIPS the rebuild. The
+        # custom binary then keeps the OLD library's behaviour — old
+        # keybindings, old defaults — while still reporting the matching
+        # protocol version, so the launcher happily runs it and the new
+        # behaviour never reaches the user. Forcing recompilation every
+        # activation guarantees the running config tracks the deployed
+        # library (e.g. a generated palinchron config picks up new
+        # defaultKeys bindings on switch instead of only on a manual
+        # Mod-q after the .hi/.o cache is busted).
         mcmonad_hs=${lib.escapeShellArg "${homeDir}/.config/mcmonad/mcmonad.hs"}
         mcmonad_ghc=${lib.escapeShellArg "${bundlePath}/Contents/MacOS/mcmonad-ghc"}
         case "$(uname -m)" in
@@ -98,7 +112,7 @@ in
             # for the bundled GHC anyway, since GHC was rewritten to use
             # /usr/bin tools at bundle time.
             if env -u DEVELOPER_DIR -u SDKROOT \
-                    "$mcmonad_ghc" --make "$mcmonad_hs" -o "$mcmonad_bin" -v0 \
+                    "$mcmonad_ghc" --make "$mcmonad_hs" -o "$mcmonad_bin" -fforce-recomp -v0 \
                 && "$mcmonad_bin" --protocol-version > "$mcmonad_bin.proto"; then
                 :
             else

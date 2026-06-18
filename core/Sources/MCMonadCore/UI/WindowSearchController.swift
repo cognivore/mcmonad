@@ -9,6 +9,32 @@ private final class KeyablePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// An `NSTextField` cell that vertically centres its text within tall
+/// bounds — both when drawing (placeholder/value) and while editing. A
+/// plain `NSTextField`/`NSSearchField` top-aligns its text, which is why a
+/// large font in a tall Spotlight-style field looked clipped/squished.
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    private func centered(_ rect: NSRect) -> NSRect {
+        let h = cellSize(forBounds: rect).height
+        guard h < rect.height else { return rect }
+        let dy = (rect.height - h) / 2
+        return NSRect(x: rect.minX, y: rect.minY + dy, width: rect.width, height: h)
+    }
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        super.drawingRect(forBounds: centered(rect))
+    }
+    override func edit(withFrame rect: NSRect, in controlView: NSView,
+                       editor: NSText, delegate: Any?, event: NSEvent?) {
+        super.edit(withFrame: centered(rect), in: controlView,
+                   editor: editor, delegate: delegate, event: event)
+    }
+    override func select(withFrame rect: NSRect, in controlView: NSView,
+                         editor: NSText, delegate: Any?, start: Int, length: Int) {
+        super.select(withFrame: centered(rect), in: controlView,
+                     editor: editor, delegate: delegate, start: start, length: length)
+    }
+}
+
 /// The Spotlight-style fuzzy window search.
 ///
 /// A floating key panel centred in the upper third of the active screen: a
@@ -26,7 +52,7 @@ private final class KeyablePanel: NSPanel {
 /// path is shared.
 @MainActor
 final class WindowSearchController: NSObject, NSWindowDelegate,
-    NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
 
     private static let logger = Logger(
         subsystem: "com.mcmonad.core",
@@ -44,16 +70,19 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
     var anchorButton: NSStatusBarButton?
 
     private var panel: KeyablePanel?
-    private var searchField: NSSearchField!
+    private var searchField: NSTextField!
     private var tableView: NSTableView!
 
-    private static let panelWidth: CGFloat = 640
+    private static let panelWidth: CGFloat = 660
     private static let panelHeight: CGFloat = 460
-    private static let fieldHeight: CGFloat = 48
-    private static let pad: CGFloat = 12
+    private static let bandHeight: CGFloat = 66   // search-field area
+    private static let pad: CGFloat = 10
+    private static let rowHeight: CGFloat = 32
+    private static let rowInset: CGFloat = 16
+    private static let cellId = NSUserInterfaceItemIdentifier("windowRow")
     /// Fraction of the screen height to leave above the panel (Spotlight
     /// sits a bit above centre).
-    private static let topFraction: CGFloat = 0.22
+    private static let topFraction: CGFloat = 0.20
 
     /// One searchable window row.
     private struct Entry {
@@ -114,42 +143,65 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.delegate = self
+        panel.appearance = NSAppearance(named: .vibrantDark)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        // Rounded visual-effect container.
+        // Rounded, dark, translucent container — the Spotlight box.
         let container = NSVisualEffectView(frame: frame)
-        container.material = .menu
+        container.material = .hudWindow
         container.blendingMode = .behindWindow
         container.state = .active
         container.wantsLayer = true
-        container.layer?.cornerRadius = 10
+        container.layer?.cornerRadius = 12
         container.layer?.masksToBounds = true
+        container.layer?.borderWidth = 1
+        container.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
         panel.contentView = container
 
-        // Search field.
-        let field = NSSearchField(frame: NSRect(
-            x: Self.pad,
-            y: Self.panelHeight - Self.fieldHeight - Self.pad,
-            width: Self.panelWidth - 2 * Self.pad,
-            height: Self.fieldHeight
+        // Magnifier glyph.
+        let glyphSize: CGFloat = 26
+        let glyph = NSImageView(frame: NSRect(
+            x: Self.rowInset + 2,
+            y: Self.panelHeight - Self.bandHeight / 2 - glyphSize / 2,
+            width: glyphSize, height: glyphSize
         ))
-        field.placeholderString = "Search windows…"
-        field.delegate = self
+        let symbolCfg = NSImage.SymbolConfiguration(pointSize: 20, weight: .regular)
+        glyph.image = NSImage(systemSymbolName: "magnifyingglass",
+                              accessibilityDescription: "Search")?
+            .withSymbolConfiguration(symbolCfg)
+        glyph.contentTintColor = .secondaryLabelColor
+        glyph.imageScaling = .scaleProportionallyUpOrDown
+        container.addSubview(glyph)
+
+        // Search field — large, borderless, vertically centred.
+        let fieldX = glyph.frame.maxX + 12
+        let field = NSTextField(frame: NSRect(
+            x: fieldX,
+            y: Self.panelHeight - Self.bandHeight,
+            width: Self.panelWidth - fieldX - Self.rowInset,
+            height: Self.bandHeight
+        ))
+        field.cell = VerticallyCenteredTextFieldCell()
+        field.isEditable = true
+        field.isSelectable = true
+        field.isBordered = false
+        field.drawsBackground = false
         field.focusRingType = .none
-        field.sendsSearchStringImmediately = true
-        field.sendsWholeSearchString = false
-        field.font = .systemFont(ofSize: 26, weight: .light)
-        field.bezelStyle = .roundedBezel
-        if let cell = field.cell as? NSSearchFieldCell {
-            cell.cancelButtonCell = nil
-        }
+        field.font = .systemFont(ofSize: 28, weight: .light)
+        field.textColor = .labelColor
+        field.placeholderString = "Search windows…"
+        field.usesSingleLineMode = true
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.lineBreakMode = .byTruncatingTail
+        field.delegate = self
         container.addSubview(field)
         self.searchField = field
 
-        // A hairline divider under the search field, Spotlight-style.
+        // Hairline divider under the search band.
         let divider = NSBox(frame: NSRect(
             x: 0,
-            y: Self.panelHeight - Self.fieldHeight - 2 * Self.pad,
+            y: Self.panelHeight - Self.bandHeight,
             width: Self.panelWidth,
             height: 1
         ))
@@ -158,20 +210,24 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
 
         // Results table inside a scroll view.
         let scrollFrame = NSRect(
-            x: Self.pad,
+            x: 0,
             y: Self.pad,
-            width: Self.panelWidth - 2 * Self.pad,
-            height: Self.panelHeight - Self.fieldHeight - 3 * Self.pad
+            width: Self.panelWidth,
+            height: Self.panelHeight - Self.bandHeight - Self.pad
         )
         let scroll = NSScrollView(frame: scrollFrame)
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
+        scroll.automaticallyAdjustsContentInsets = false
 
         let table = NSTableView(frame: scrollFrame)
         table.headerView = nil
         table.backgroundColor = .clear
-        table.rowHeight = 30
+        table.rowHeight = Self.rowHeight
+        table.intercellSpacing = NSSize(width: 0, height: 2)
+        table.selectionHighlightStyle = .regular
+        table.style = .plain
         table.allowsEmptySelection = false
         table.allowsMultipleSelection = false
         table.dataSource = self
@@ -182,12 +238,6 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         let col = NSTableColumn(identifier: .init("window"))
         col.width = scrollFrame.width
         col.resizingMask = .autoresizingMask
-        let dataCell = NSTextFieldCell()
-        dataCell.font = .systemFont(ofSize: 15)
-        dataCell.lineBreakMode = .byTruncatingTail
-        dataCell.isBordered = false
-        dataCell.drawsBackground = false
-        col.dataCell = dataCell
         table.addTableColumn(col)
 
         scroll.documentView = table
@@ -302,10 +352,31 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
     }
 
     func tableView(_ tableView: NSTableView,
-                   objectValueFor tableColumn: NSTableColumn?,
-                   row: Int) -> Any? {
+                   viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
         guard row >= 0, row < filtered.count else { return nil }
-        return filtered[row].display
+        let cell = (tableView.makeView(withIdentifier: Self.cellId, owner: self)
+                    as? NSTableCellView) ?? Self.makeCellView()
+        cell.textField?.stringValue = filtered[row].display
+        return cell
+    }
+
+    private static func makeCellView() -> NSTableCellView {
+        let cell = NSTableCellView()
+        cell.identifier = cellId
+        let tf = NSTextField(labelWithString: "")
+        tf.font = .systemFont(ofSize: 14)
+        tf.lineBreakMode = .byTruncatingTail
+        tf.cell?.truncatesLastVisibleLine = true
+        tf.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(tf)
+        cell.textField = tf
+        NSLayoutConstraint.activate([
+            tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: rowInset),
+            tf.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -rowInset),
+            tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 
     @objc private func rowDoubleClicked(_ sender: Any?) {

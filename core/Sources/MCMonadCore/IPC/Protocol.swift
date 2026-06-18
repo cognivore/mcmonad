@@ -256,6 +256,7 @@ enum IPCEvent: Encodable, Sendable {
     case menuToggleDebug
     case menuFocusWindow(windowId: UInt32, pid: Int32)
     case menuViewWorkspace(tag: String)
+    case focusedWindowQueryResponse(windowId: UInt32, pid: Int32)
     case ready
 
     func encode(to encoder: Encoder) throws {
@@ -314,6 +315,10 @@ enum IPCEvent: Encodable, Sendable {
         case .menuViewWorkspace(let tag):
             try container.encode("menu-view-workspace", forKey: .event)
             try container.encode(tag, forKey: .tag)
+        case .focusedWindowQueryResponse(let windowId, let pid):
+            try container.encode("focused-window-query-response", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
+            try container.encode(pid, forKey: .pid)
         case .ready:
             try container.encode("ready", forKey: .event)
         }
@@ -335,6 +340,8 @@ enum IPCCommand: Decodable, Sendable {
     case warpMouse(x: Double, y: Double)
     case setDebugOverlays(on: Bool)
     case setOverlayState(snapshot: OverlaySnapshot)
+    case queryFocusedWindow
+    case showWindowPicker
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -349,6 +356,8 @@ enum IPCCommand: Decodable, Sendable {
         case warpMouse = "warp-mouse"
         case setDebugOverlays = "set-debug-overlays"
         case setOverlayState = "set-overlay-state"
+        case queryFocusedWindow = "query-focused-window"
+        case showWindowPicker = "show-window-picker"
     }
 
     init(from decoder: Decoder) throws {
@@ -392,6 +401,10 @@ enum IPCCommand: Decodable, Sendable {
         case .setOverlayState:
             let snap = try container.decode(OverlaySnapshot.self, forKey: .snapshot)
             self = .setOverlayState(snapshot: snap)
+        case .queryFocusedWindow:
+            self = .queryFocusedWindow
+        case .showWindowPicker:
+            self = .showWindowPicker
         }
     }
 }

@@ -21,6 +21,11 @@ final class CommandExecutor {
     /// from Main once the EventBridge that handles it is built.
     var onExistingWindowsEnumerated: (([WindowInfo]) -> Void)?
 
+    /// Invoked when Haskell asks to open the fuzzy window-search dropdown
+    /// (the `show-window-picker` command). Wired in Main to the
+    /// WindowSearchController.
+    var onShowWindowPicker: (() -> Void)?
+
     private let encoder = JSONEncoder()
 
     init(
@@ -63,6 +68,10 @@ final class CommandExecutor {
             overlayManager.setEnabled(on)
         case .setOverlayState(let snapshot):
             overlayManager.apply(snapshot)
+        case .queryFocusedWindow:
+            executeQueryFocusedWindow()
+        case .showWindowPicker:
+            onShowWindowPicker?()
         }
     }
 
@@ -245,6 +254,48 @@ final class CommandExecutor {
 
     private func executeRegisterHotkeys(_ hotkeys: [HotkeySpec]) {
         hotkeyManager.register(hotkeys)
+    }
+
+    /// Answer a `query-focused-window` by reporting the window macOS
+    /// currently considers focused: the frontmost application's AX focused
+    /// window, mapped back to a CGWindowID via _AXUIElementGetWindow. This
+    /// is the only reliable source after a Dock-icon click, where the
+    /// activated app's focused window may sit on an off-screen workspace
+    /// that mcmonad's StackSet focus never followed. Emits nothing if the
+    /// focus can't be resolved (no fabricated answer).
+    private func executeQueryFocusedWindow() {
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            FocusLog.emit(source: .cmdFocusWindow, result: "no-frontmost-app")
+            return
+        }
+        let pid = app.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                appElement,
+                kAXFocusedWindowAttribute as CFString,
+                &focusedRef
+              ) == .success,
+              let focused = focusedRef,
+              CFGetTypeID(focused) == AXUIElementGetTypeID()
+        else {
+            FocusLog.emit(source: .cmdFocusWindow, pid: pid,
+                          result: "no-ax-focused-window")
+            return
+        }
+        let element = unsafeDowncast(focused as AnyObject, to: AXUIElement.self)
+        var windowId: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &windowId) == .success else {
+            FocusLog.emit(source: .cmdFocusWindow, pid: pid,
+                          result: "no-window-id")
+            return
+        }
+        FocusLog.emit(source: .cmdFocusWindow, windowId: UInt32(windowId), pid: pid,
+                      tHash: TitleHash.hash(windowId: UInt32(windowId), pid: pid),
+                      extra: "via=queryFocusedWindow")
+        socketServer.send(.focusedWindowQueryResponse(
+            windowId: UInt32(windowId), pid: pid
+        ))
     }
 
     private func executeCloseWindow(windowId: UInt32, pid: Int32) {

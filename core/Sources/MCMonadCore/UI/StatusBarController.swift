@@ -35,6 +35,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     /// wires this to send `menuViewWorkspace`.
     var onViewWorkspace: ((String) -> Void)?
 
+    /// Fires when the user clicks "Search windows…". The main module
+    /// wires this to open the fuzzy window-search dropdown.
+    var onSearchWindows: (() -> Void)?
+
+    /// The menubar button, so the search dropdown can anchor under it.
+    var statusButton: NSStatusBarButton? { statusItem?.button }
+
     func setup() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
@@ -90,6 +97,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         )
         header.isEnabled = false
         menu.addItem(header)
+        menu.addItem(NSMenuItem.separator())
+
+        // Fuzzy window search — opens the keyboard-driven dropdown.
+        let searchItem = NSMenuItem(
+            title: "Search windows…",
+            action: #selector(searchWindowsClicked(_:)),
+            keyEquivalent: ""
+        )
+        searchItem.target = self
+        menu.addItem(searchItem)
         menu.addItem(NSMenuItem.separator())
 
         guard let snap = snap else {
@@ -263,6 +280,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleDebugClicked(_ sender: Any?) {
         onToggleDebugOverlays?()
+    }
+
+    @objc private func searchWindowsClicked(_ sender: Any?) {
+        onSearchWindows?()
     }
 
     @objc private func focusWindowClicked(_ sender: Any?) {

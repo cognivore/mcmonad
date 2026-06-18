@@ -21,7 +21,10 @@ import MCMonad.Config.Keys
 import MCMonad.Debug (toggleDebugOverlays)
 import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
-import MCMonad.Operations (windows, sendMessage, kill, spawn, withFocused, screenWorkspace)
+import MCMonad.Operations
+    ( windows, sendMessage, kill, spawn, withFocused, screenWorkspace
+    , jumpToActiveWindow, showWindowPicker
+    )
 
 -- ---------------------------------------------------------------------------
 -- Modifier types
@@ -141,6 +144,19 @@ defaultKeys conf = Map.fromList $
     -- title) label around every tracked window, and a red DEFIED tag
     -- when the actual frame disagrees with the most-recent SetFrames.
     , ((m .|. controlMask, kD), toggleDebugOverlays)
+
+    -- Fuzzy window search + "follow the active window". Both use the
+    -- Option+Command+Shift triad so they cannot be hit by accident and
+    -- are independent of 'modMask' (deliberately not 'm').
+    --
+    -- Opt+Cmd+Shift+P: open the fuzzy window-search dropdown ("I lost
+    -- Google Chrome" → type "chr" → Enter).
+    --
+    -- Opt+Cmd+Shift+J: jump to the workspace where the *currently active*
+    -- window lives. Click a Dock icon, then press this to follow the app
+    -- onto its (possibly off-screen) workspace.
+    , ((optionMask .|. commandMask .|. shiftMask, kP), showWindowPicker)
+    , ((optionMask .|. commandMask .|. shiftMask, kJ), jumpToActiveWindow)
 
     ]
     ++

@@ -192,6 +192,9 @@ struct MCMonadCoreApp {
         let statusBar = StatusBarController()
         statusBar.setup()
 
+        // Fuzzy window-search dropdown
+        let windowSearch = WindowSearchController()
+
         // Create services
         let hotkeyManager = HotkeyManager()
         let displayManager = DisplayManager()
@@ -226,6 +229,25 @@ struct MCMonadCoreApp {
         }
         statusBar.onViewWorkspace = { [weak socketServer] tag in
             socketServer?.send(.menuViewWorkspace(tag: tag))
+        }
+
+        // Fuzzy window-search dropdown wiring. It reads the same cached
+        // snapshot the menubar tree uses, anchors under the menubar icon,
+        // and reports a pick through the existing menu-focus-window path
+        // (which focuses the window and jumps to its workspace).
+        windowSearch.snapshotProvider = { [weak overlayManager] in
+            overlayManager?.cachedSnapshot
+        }
+        windowSearch.anchorButton = statusBar.statusButton
+        windowSearch.onFocusWindow = { [weak socketServer] wid, pid in
+            socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
+        }
+        statusBar.onSearchWindows = { [weak windowSearch] in
+            windowSearch?.show()
+        }
+        // Opt+Cmd+Shift+P → Haskell → show-window-picker command → here.
+        executor.onShowWindowPicker = { [weak windowSearch] in
+            windowSearch?.toggle()
         }
 
         // Route commands from socket to executor
@@ -341,7 +363,7 @@ struct MCMonadCoreApp {
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, executor, eventBridge, dragHandler,
-                      mouseDownMonitor)
+                      mouseDownMonitor, windowSearch)
     }
 
     // Static storage to prevent ARC from deallocating services

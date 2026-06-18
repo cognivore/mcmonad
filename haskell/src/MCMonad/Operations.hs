@@ -16,6 +16,8 @@ module MCMonad.Operations
     , withFocused
     , reveal
     , setFocus
+    , jumpToActiveWindow
+    , showWindowPicker
       -- * Launching programs
     , spawn
       -- * Restart
@@ -504,6 +506,29 @@ setFocus :: WindowRef -> M ()
 setFocus w = do
     conn <- asks connection
     io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
+
+-- | Jump to the workspace holding the window macOS currently considers
+-- focused, and focus it. Useful after clicking a Dock icon for an app
+-- whose window sits on an off-screen workspace: mcmonad's StackSet focus
+-- does not follow such activations (the AX\/NSWorkspace resolve helpers
+-- only act on the current workspace), so we ask the daemon where focus
+-- actually landed and follow it.
+--
+-- Asynchronous: this only fires the 'QueryFocusedWindow' query. The
+-- actual workspace switch happens when the 'FocusedWindowQueryResponse'
+-- event arrives — see the handler in "MCMonad.Main".
+jumpToActiveWindow :: M ()
+jumpToActiveWindow = do
+    conn <- asks connection
+    io $ sendCommand conn QueryFocusedWindow
+
+-- | Open the fuzzy window-search dropdown. The daemon owns the picker
+-- UI; a selection returns as a 'MCMonad.IPC.MenuFocusWindow' event,
+-- which reuses the menubar dropdown's focus-and-jump path.
+showWindowPicker :: M ()
+showWindowPicker = do
+    conn <- asks connection
+    io $ sendCommand conn ShowWindowPicker
 
 -- ---------------------------------------------------------------------------
 -- Launching programs

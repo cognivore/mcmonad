@@ -344,6 +344,17 @@ handleEvent debug cfg hotkeyIdMap evt = do
         FocusedWindowChanged wid pid ->
             handleFocusedWindowChanged wid pid
 
+        FocusedWindowQueryResponse wid pid -> do
+            -- Answer to our own 'QueryFocusedWindow' (the Mod-Cmd-Shift-J
+            -- "jump to the active window's workspace" hotkey). The window
+            -- may be on any workspace, including a hidden one or the other
+            -- screen; 'W.focusWindow' brings its workspace to the current
+            -- screen and focuses it. Bypasses the 'focusIntent' dispatch
+            -- entirely — this is a direct, user-requested jump.
+            ws <- gets windowset
+            let wr = WindowRef wid pid
+            when (W.member wr ws) $ windows (W.focusWindow wr)
+
         FrontAppChanged pid ->
             handleFrontAppChanged pid
 

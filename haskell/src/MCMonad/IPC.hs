@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 6
+protocolVersion = 7
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -80,6 +80,19 @@ data Command
     | WarpMouse !Double !Double
     | SetDebugOverlays !Bool
     | SetOverlayState !OverlaySnapshot
+    | QueryFocusedWindow
+      -- ^ Ask the daemon which window macOS currently considers focused
+      -- (the frontmost app's AX focused window). Answered asynchronously
+      -- with a 'FocusedWindowQueryResponse' event. Used by the
+      -- "jump to the active window's workspace" hotkey: after a Dock
+      -- click activates an app whose window lives on an off-screen
+      -- workspace, mcmonad's StackSet focus has not followed (the
+      -- resolve* helpers only act on the current workspace), so we have
+      -- to ask macOS where focus actually is.
+    | ShowWindowPicker
+      -- ^ Ask the daemon to open the fuzzy window-search dropdown. The
+      -- daemon owns the UI; selection comes back as a 'MenuFocusWindow'
+      -- event, reusing the menubar dropdown's focus path.
     deriving (Show, Generic)
 
 -- | One window entry in the menubar / debug overlay snapshot.
@@ -231,6 +244,12 @@ instance Aeson.ToJSON Command where
         [ "cmd"      .= ("set-overlay-state" :: Text)
         , "snapshot" .= snap
         ]
+    toJSON QueryFocusedWindow = Aeson.object
+        [ "cmd" .= ("query-focused-window" :: Text)
+        ]
+    toJSON ShowWindowPicker = Aeson.object
+        [ "cmd" .= ("show-window-picker" :: Text)
+        ]
 
 -- ---------------------------------------------------------------------------
 -- Events (Swift -> Haskell)
@@ -242,6 +261,11 @@ data Event
     | WindowFrameChanged !Word32 !Rectangle
     | FrontAppChanged !Int32
     | FocusedWindowChanged !Word32 !Int32
+    | FocusedWindowQueryResponse !Word32 !Int32
+      -- ^ Reply to 'QueryFocusedWindow': the window macOS currently
+      -- considers focused. Distinct from 'FocusedWindowChanged' so it
+      -- bypasses the 'focusIntent' bounce-suppression dispatch and is
+      -- always acted on (it is a direct answer to our own question).
     | ScreensChanged [ScreenInfo]
     | HotkeyPressed !Int
     | MouseEnteredWindow !Word32 !Int32
@@ -330,6 +354,7 @@ instance Aeson.FromJSON Event where
                 "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
                 "focused-window-changed" -> FocusedWindowChanged <$> v .: "windowId" <*> v .: "pid"
+                "focused-window-query-response" -> FocusedWindowQueryResponse <$> v .: "windowId" <*> v .: "pid"
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"

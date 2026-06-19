@@ -123,6 +123,14 @@ final class EventBridge: SkyLightEventDelegate {
         case .frontAppChanged(let pid):
             // Validate managed windows — catch closes that SkyLight missed
             validateWindows()
+            // Never report our OWN activation. mcmonad-core has no managed
+            // windows, so the brain can't act on it usefully — and worse,
+            // when the window-search panel takes key focus the core becomes
+            // frontmost, the Haskell FocusIntent sees a divergence from the
+            // window it last focused, and re-issues FocusWindow to push
+            // focus back to that window. That steals key from the panel and
+            // dismisses it ("blink then disappear"). Suppress at the source.
+            guard pid != getpid() else { break }
             FocusLog.emit(source: .emitFrontAppChanged, pid: pid,
                           extra: "via=skylightBridge")
             socketServer.send(.frontAppChanged(pid: pid))
@@ -308,6 +316,10 @@ struct MCMonadCoreApp {
             let pid = app.processIdentifier
             FocusLog.emit(source: .nsWorkspaceActivation, pid: pid,
                           extra: "appBundleId=\(app.bundleIdentifier ?? "-")")
+            // Ignore our own activation — see the matching guard in
+            // EventBridge.frontAppChanged for why (window-search panel
+            // would otherwise be dismissed by the focus push-back).
+            guard pid != getpid() else { return }
             Task { @MainActor in
                 FocusLog.emit(source: .emitFrontAppChanged, pid: pid,
                               extra: "via=nsWorkspaceActivation")

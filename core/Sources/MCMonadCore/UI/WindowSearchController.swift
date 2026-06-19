@@ -102,10 +102,12 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
 
     // MARK: - Public entry points
 
-    /// Toggle the dropdown: open it (or close it if already showing).
+    /// Toggle the dropdown: open it, or — if already showing — close it the
+    /// same way Esc does, restoring focus to the previously-focused window.
+    /// (Pressing the open hotkey again is a cancel, not a click-away.)
     func toggle() {
         if let panel, panel.isVisible {
-            hide()
+            cancel()
         } else {
             show()
         }

@@ -32,6 +32,31 @@ enum WindowFocus {
         focusWindow(pid: pid, windowId: windowId)
     }
 
+    /// The window macOS currently considers focused: the frontmost
+    /// application's AX focused window, mapped back to a CGWindowID via
+    /// _AXUIElementGetWindow. Returns nil when it can't be resolved (no
+    /// frontmost app, no focused window, or the element has no window id).
+    /// Shared by the "jump to active window" query and the window-search
+    /// panel's Esc-restores-focus path.
+    static func frontmostFocusedWindow() -> (windowId: UInt32, pid: pid_t)? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let pid = app.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                appElement,
+                kAXFocusedWindowAttribute as CFString,
+                &focusedRef
+              ) == .success,
+              let focused = focusedRef,
+              CFGetTypeID(focused) == AXUIElementGetTypeID()
+        else { return nil }
+        let element = unsafeDowncast(focused as AnyObject, to: AXUIElement.self)
+        var wid: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &wid) == .success else { return nil }
+        return (UInt32(wid), pid)
+    }
+
     static func focusWindow(pid: pid_t, windowId: UInt32) {
         let tHash = TitleHash.hash(windowId: windowId, pid: pid)
 

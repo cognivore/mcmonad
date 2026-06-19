@@ -17,34 +17,49 @@ LAUNCHER_LOG="$LOG_DIR/mcmonad-launcher.log"
 AGENT_LABEL="com.mcmonad.agent"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 
-# Size-based log rotation. The core's FocusLog/FrameLog are deliberately
-# chatty (every frame op and focus signal), so the logs reach tens of MB
-# in a session. launchd has no rotation and the daemon can run for days,
-# so we cap each log ourselves: keep one previous generation (.1) and
-# truncate the live file in place. In-place truncation is required because
-# the core/haskell children hold the file open in append mode (O_APPEND) —
-# a rename would leave them writing to the rotated-away inode, whereas
-# ': > file' resets the length and append writes resume from zero.
-MAX_LOG_BYTES="${MCMONAD_MAX_LOG_BYTES:-10485760}"  # 10 MiB
+# Time-based log rotation. The core's FocusLog/FrameLog are deliberately
+# chatty, but disk is cheap and a couple of days of history is worth far
+# more for debugging than a tight size cap. So we rotate by DAY and keep
+# the last MCMONAD_LOG_RETAIN_DAYS generations (default 2): the first
+# rotation of a new calendar day shifts the live log to .1, .1 to .2, and
+# drops anything past the retain count. A marker file records the day we
+# last rotated so the many daemon restarts within a day don't churn.
+# In-place truncation (': > file') is required because the core/haskell
+# children hold the file open in append mode (O_APPEND) — a rename would
+# leave them writing to the rotated-away inode, whereas truncation resets
+# the length and append writes resume from zero.
+LOG_RETAIN_DAYS="${MCMONAD_LOG_RETAIN_DAYS:-2}"
+LOGROTATE_MARKER="$LOG_DIR/.mcmonad-logrotate-day"
 
 log() { echo "[mcmonad-launcher] $(date '+%H:%M:%S') $*" >&2; }
 
-rotate_log() {
+# Shift one log's daily generations down and truncate the live file.
+rotate_one() {
     local f="$1"
     [ -f "$f" ] || return 0
-    local size
-    size=$(stat -f%z "$f" 2>/dev/null || echo 0)
-    if [ "$size" -gt "$MAX_LOG_BYTES" ]; then
-        cp -f "$f" "$f.1" 2>/dev/null || true
-        : > "$f"
-        log "rotated $(basename "$f") (was $size bytes) -> $(basename "$f").1"
-    fi
+    rm -f "$f.$LOG_RETAIN_DAYS" 2>/dev/null || true
+    local i="$LOG_RETAIN_DAYS"
+    while [ "$i" -gt 1 ]; do
+        local prev=$((i - 1))
+        [ -f "$f.$prev" ] && mv -f "$f.$prev" "$f.$i" 2>/dev/null || true
+        i="$prev"
+    done
+    cp -f "$f" "$f.1" 2>/dev/null || true
+    : > "$f"
 }
 
-rotate_logs() {
-    rotate_log "$CORE_LOG"
-    rotate_log "$HASKELL_LOG"
-    rotate_log "$LAUNCHER_LOG"
+# Rotate all logs once per calendar day, keyed off a marker file so the
+# many restarts within one day are no-ops.
+maybe_rotate_logs() {
+    local today last=""
+    today="$(date +%Y%m%d)"
+    [ -f "$LOGROTATE_MARKER" ] && last="$(cat "$LOGROTATE_MARKER" 2>/dev/null || echo)"
+    [ "$today" = "$last" ] && return 0
+    rotate_one "$CORE_LOG"
+    rotate_one "$HASKELL_LOG"
+    rotate_one "$LAUNCHER_LOG"
+    echo "$today" > "$LOGROTATE_MARKER"
+    log "rotated logs for $today (retaining ${LOG_RETAIN_DAYS} day(s))"
 }
 
 # Support both .app bundle (binaries alongside launcher) and home-manager
@@ -137,7 +152,7 @@ uninstall_agent() {
 }
 
 run_daemon() {
-    rotate_logs
+    maybe_rotate_logs
 
     log "Starting mcmonad-core"
     "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
@@ -160,9 +175,9 @@ run_daemon() {
     }
     trap cleanup TERM INT
 
-    # Monitor both processes. If either dies, restart it. Check log sizes
-    # roughly once a minute (every 30th 2s tick) so a long-lived daemon
-    # doesn't grow the logs without bound between restarts.
+    # Monitor both processes. If either dies, restart it. Check for a day
+    # rollover roughly once a minute (every 30th 2s tick) so a long-lived
+    # daemon rotates at the start of each new day without a restart.
     local tick=0
     while true; do
         if ! kill -0 "$CORE_PID" 2>/dev/null; then
@@ -177,7 +192,7 @@ run_daemon() {
         fi
         tick=$((tick + 1))
         if [ "$((tick % 30))" -eq 0 ]; then
-            rotate_logs
+            maybe_rotate_logs
         fi
         sleep 2
     done

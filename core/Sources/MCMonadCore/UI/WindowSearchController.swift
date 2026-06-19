@@ -95,6 +95,11 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
     private var entries: [Entry] = []
     private var filtered: [Entry] = []
 
+    /// The window focused *before* the panel opened. Captured on show()
+    /// so Esc (cancel) can restore it. The daemon deliberately ignores its
+    /// own activation in the focus engine, so nothing else puts focus back.
+    private var restoreTarget: (windowId: UInt32, pid: pid_t)?
+
     // MARK: - Public entry points
 
     /// Toggle the dropdown: open it (or close it if already showing).
@@ -110,6 +115,10 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         loadEntries()
         let panel = ensurePanel()
 
+        // Capture the currently-focused window BEFORE we steal key focus,
+        // so Esc can restore it. Must run before NSApp.activate.
+        restoreTarget = WindowFocus.frontmostFocusedWindow()
+
         searchField.stringValue = ""
         applyFilter("")
         positionPanel(panel)
@@ -121,6 +130,19 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
 
     func hide() {
         panel?.orderOut(nil)
+    }
+
+    /// Dismiss without choosing a window and hand focus back to whatever
+    /// was focused before the panel opened. Distinct from click-away
+    /// dismissal (windowDidResignKey), where the user is deliberately
+    /// moving focus elsewhere and we must NOT yank it back.
+    private func cancel() {
+        let target = restoreTarget
+        restoreTarget = nil
+        hide()
+        if let target {
+            WindowFocus.focus(windowId: target.windowId, pid: target.pid)
+        }
     }
 
     // MARK: - Panel construction
@@ -400,7 +422,7 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         case #selector(NSResponder.insertNewline(_:)):
             activateSelection(); return true
         case #selector(NSResponder.cancelOperation(_:)):
-            hide(); return true
+            cancel(); return true
         default:
             return false
         }
@@ -419,6 +441,8 @@ final class WindowSearchController: NSObject, NSWindowDelegate,
         let row = tableView.selectedRow
         guard row >= 0, row < filtered.count else { return }
         let e = filtered[row]
+        // Chose a window — focus it, not the previously-focused one.
+        restoreTarget = nil
         hide()
         onFocusWindow?(e.windowId, e.pid)
     }

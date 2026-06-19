@@ -264,37 +264,17 @@ final class CommandExecutor {
     /// that mcmonad's StackSet focus never followed. Emits nothing if the
     /// focus can't be resolved (no fabricated answer).
     private func executeQueryFocusedWindow() {
-        guard let app = NSWorkspace.shared.frontmostApplication else {
-            FocusLog.emit(source: .cmdFocusWindow, result: "no-frontmost-app")
+        guard let target = WindowFocus.frontmostFocusedWindow() else {
+            FocusLog.emit(source: .cmdFocusWindow,
+                          result: "no-frontmost-focused-window")
             return
         }
-        let pid = app.processIdentifier
-        let appElement = AXUIElementCreateApplication(pid)
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-                appElement,
-                kAXFocusedWindowAttribute as CFString,
-                &focusedRef
-              ) == .success,
-              let focused = focusedRef,
-              CFGetTypeID(focused) == AXUIElementGetTypeID()
-        else {
-            FocusLog.emit(source: .cmdFocusWindow, pid: pid,
-                          result: "no-ax-focused-window")
-            return
-        }
-        let element = unsafeDowncast(focused as AnyObject, to: AXUIElement.self)
-        var windowId: CGWindowID = 0
-        guard _AXUIElementGetWindow(element, &windowId) == .success else {
-            FocusLog.emit(source: .cmdFocusWindow, pid: pid,
-                          result: "no-window-id")
-            return
-        }
-        FocusLog.emit(source: .cmdFocusWindow, windowId: UInt32(windowId), pid: pid,
-                      tHash: TitleHash.hash(windowId: UInt32(windowId), pid: pid),
+        FocusLog.emit(source: .cmdFocusWindow,
+                      windowId: target.windowId, pid: target.pid,
+                      tHash: TitleHash.hash(windowId: target.windowId, pid: target.pid),
                       extra: "via=queryFocusedWindow")
         socketServer.send(.focusedWindowQueryResponse(
-            windowId: UInt32(windowId), pid: pid
+            windowId: target.windowId, pid: target.pid
         ))
     }
 

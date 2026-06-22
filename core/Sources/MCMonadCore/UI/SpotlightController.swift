@@ -680,6 +680,24 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         }
     }
 
+    /// Request mic/speech authorization once, at daemon startup, BEFORE any
+    /// panel exists. The Spotlight panel sits at `.popUpMenu` level, so a TCC
+    /// prompt requested while it's open appears *behind* it and silently
+    /// resolves to notDetermined — which is why speech permission never stuck.
+    /// Priming at startup surfaces the prompt cleanly (bringing the daemon
+    /// forward only when a prompt will actually show).
+    func primeVoiceAuthorization() {
+        guard voiceAuthorized == nil else { return }
+        if voice.needsAuthorizationPrompt {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        voice.requestAuthorization { granted in
+            Task { @MainActor [weak self] in
+                self?.voiceAuthorized = granted
+            }
+        }
+    }
+
     /// Start listening. The launcher calls this whenever it presents a fresh
     /// input field (open, mode switch, timer prompt), so voice is live by
     /// default — no trigger needed. Safe to call when already listening

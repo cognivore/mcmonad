@@ -74,6 +74,14 @@ final class VoiceInput {
 
     var isAvailable: Bool { recognizer?.isAvailable ?? false }
 
+    /// True when speech or mic permission is still undecided, i.e. requesting
+    /// authorization now would surface a system prompt. Used to decide whether
+    /// to bring the daemon forward so that prompt is actually visible.
+    var needsAuthorizationPrompt: Bool {
+        SFSpeechRecognizer.authorizationStatus() == .notDetermined
+            || AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined
+    }
+
     // MARK: - Authorization
 
     /// Request both speech-recognition and microphone permission. Calls back
@@ -82,20 +90,26 @@ final class VoiceInput {
     /// isolation — which the runtime would then trap on.
     func requestAuthorization(_ completion: @escaping @Sendable (Bool) -> Void) {
         guard recognizer != nil else {
+            Self.logger.error("requestAuth: recognizer is nil (locale unsupported)")
             completion(false)
             return
         }
+        let log = Self.logger
         SFSpeechRecognizer.requestAuthorization { @Sendable speechStatus in
+            log.info("requestAuth: speechStatus=\(speechStatus.rawValue, privacy: .public)")
             let speechOK = (speechStatus == .authorized)
             guard speechOK else {
                 completion(false)
                 return
             }
-            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+            log.info("requestAuth: micStatus=\(micStatus.rawValue, privacy: .public)")
+            switch micStatus {
             case .authorized:
                 completion(true)
             case .notDetermined:
                 AVCaptureDevice.requestAccess(for: .audio) { @Sendable micOK in
+                    log.info("requestAuth: micGranted=\(micOK, privacy: .public)")
                     completion(micOK)
                 }
             default:

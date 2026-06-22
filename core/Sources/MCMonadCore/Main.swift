@@ -271,6 +271,12 @@ struct MCMonadCoreApp {
             spotlight?.toggle(mode: mode)
         }
 
+        // Request mic/speech permission now, at startup — before any Spotlight
+        // panel exists to obscure the TCC prompt. Without this the speech
+        // prompt fires behind the .popUpMenu-level panel and silently resolves
+        // to notDetermined, so voice never starts.
+        spotlight.primeVoiceAuthorization()
+
         // Route commands from socket to executor
         socketServer.onCommand = { command in
             executor.execute(command)

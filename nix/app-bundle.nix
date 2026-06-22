@@ -401,6 +401,10 @@ GHCWRAPPER
     <true/>
     <key>LSUIElement</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>mcmonad listens for voice commands to launch apps and set timers from the Spotlight launcher.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>mcmonad transcribes your voice commands on-device to launch apps and set timers from the Spotlight launcher.</string>
 </dict>
 </plist>
 PLIST

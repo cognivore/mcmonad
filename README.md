@@ -81,9 +81,48 @@ McMonad defaults to Option as the mod key. If you are a proper Linux / XMonad us
 | `Opt-Shift-Return` | Spawn terminal |
 | `Opt-Shift-c` | Close focused window |
 | `Opt-t` | Push floating window back into tiling |
+| `Opt-p` | Spotlight launcher — command runner + app launcher |
+| `Opt-Shift-p` | Spotlight launcher — window search |
 | `Opt-1`..`Opt-9` | Switch to workspace |
 | `Opt-Shift-1`..`Opt-Shift-9` | Move window to workspace |
 | `Opt-w` / `Opt-e` / `Opt-r` | Focus screen 1 / 2 / 3 |
+
+### The Spotlight launcher
+
+McMonad ships a Spotlight-style overlay — one floating panel with switchable
+**modes**, cycled with `Tab`:
+
+- **Command mode** (`Opt+P`) — a command runner and app launcher. Type an app
+  name and hit Return to launch it ("chrome", "librewolf"). Type `timer` to be
+  asked for minutes, or set one inline: `timer 15 check on agents` starts a
+  15-minute countdown labelled "check on agents".
+- **Window mode** (`Opt+Shift+P`) — the fuzzy window search across every
+  workspace. "I lost Google Chrome" → type `chr` → Return jumps to it. (This is
+  the old `Opt+Shift+P` window picker; it now lives inside the launcher, and
+  `Tab` flips to command mode.)
+
+`↑`/`↓` move the selection, `Return` activates it, `Esc` cancels (restoring the
+window you came from).
+
+**Running timers live in the menu bar.** While any timer is counting down, a
+`⏱ 14:32` item appears in the menu bar showing the soonest one; its dropdown
+lists every running timer and lets you cancel them. When a timer finishes it
+chimes and a "time's up" banner appears. No timers running → no menu-bar
+clutter.
+
+**Voice input — on by default.** The launcher starts listening the moment it
+opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first
+keystroke hands off to the keyboard (so dictation never fights your typing);
+`⌘L` or the mic button toggles listening back on. Transcription uses Apple's
+`Speech.framework` **on-device** (free; nothing leaves your Mac). First use
+prompts for Microphone and Speech Recognition permission; if you decline, the
+mic affordance hides and everything else keeps working.
+
+> **Note on `Opt+P` and Karabiner.** If your Karabiner config remaps `Opt+P`
+> (the [starter pack](https://github.com/geosurge-ai/nixvana-ii) maps it to
+> macOS Spotlight), Karabiner eats the key before McMonad's Carbon hotkey sees
+> it. Remove that rule to let `Opt+P` reach the McMonad launcher, or bind the
+> launcher to a different key with `showSpotlight "command"` in your config.
 
 ### Default terminal
 

@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 7
+protocolVersion = 8
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -93,6 +93,13 @@ data Command
       -- ^ Ask the daemon to open the fuzzy window-search dropdown. The
       -- daemon owns the UI; selection comes back as a 'MenuFocusWindow'
       -- event, reusing the menubar dropdown's focus path.
+    | ShowSpotlight !String
+      -- ^ Ask the daemon to open the Spotlight launcher in a given mode
+      -- (@"command"@ or @"window"@). Command mode runs the app launcher,
+      -- timer, and voice input entirely inside mcmonad-core; window mode
+      -- behaves like 'ShowWindowPicker'. @Tab@ cycles modes once open.
+      -- Window selection returns as a 'MenuFocusWindow' event; app launch
+      -- and timers are handled daemon-side and need no reply.
     deriving (Show, Generic)
 
 -- | One window entry in the menubar / debug overlay snapshot.
@@ -249,6 +256,10 @@ instance Aeson.ToJSON Command where
         ]
     toJSON ShowWindowPicker = Aeson.object
         [ "cmd" .= ("show-window-picker" :: Text)
+        ]
+    toJSON (ShowSpotlight mode) = Aeson.object
+        [ "cmd"  .= ("show-spotlight" :: Text)
+        , "mode" .= mode
         ]
 
 -- ---------------------------------------------------------------------------

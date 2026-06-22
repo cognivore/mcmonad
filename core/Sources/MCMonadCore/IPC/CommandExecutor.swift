@@ -22,9 +22,14 @@ final class CommandExecutor {
     var onExistingWindowsEnumerated: (([WindowInfo]) -> Void)?
 
     /// Invoked when Haskell asks to open the fuzzy window-search dropdown
-    /// (the `show-window-picker` command). Wired in Main to the
-    /// WindowSearchController.
+    /// (the legacy `show-window-picker` command). Wired in Main to open the
+    /// Spotlight panel in window mode.
     var onShowWindowPicker: (() -> Void)?
+
+    /// Invoked when Haskell asks to open the Spotlight launcher (the
+    /// `show-spotlight` command), carrying the requested mode string
+    /// ("command" or "window"). Wired in Main to the SpotlightController.
+    var onShowSpotlight: ((String) -> Void)?
 
     private let encoder = JSONEncoder()
 
@@ -72,6 +77,8 @@ final class CommandExecutor {
             executeQueryFocusedWindow()
         case .showWindowPicker:
             onShowWindowPicker?()
+        case .showSpotlight(let mode):
+            onShowSpotlight?(mode)
         }
     }
 

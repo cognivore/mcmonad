@@ -200,8 +200,11 @@ struct MCMonadCoreApp {
         let statusBar = StatusBarController()
         statusBar.setup()
 
-        // Fuzzy window-search dropdown
-        let windowSearch = WindowSearchController()
+        // Spotlight launcher (command runner + app launcher + window search)
+        let spotlight = SpotlightController()
+
+        // Menu-bar countdown timer widget, driven by the Spotlight launcher.
+        let timerController = TimerController()
 
         // Create services
         let hotkeyManager = HotkeyManager()
@@ -239,23 +242,33 @@ struct MCMonadCoreApp {
             socketServer?.send(.menuViewWorkspace(tag: tag))
         }
 
-        // Fuzzy window-search dropdown wiring. It reads the same cached
-        // snapshot the menubar tree uses, anchors under the menubar icon,
-        // and reports a pick through the existing menu-focus-window path
-        // (which focuses the window and jumps to its workspace).
-        windowSearch.snapshotProvider = { [weak overlayManager] in
+        // Spotlight launcher wiring. Window mode reads the same cached
+        // snapshot the menubar tree uses and reports a pick through the
+        // existing menu-focus-window path (which focuses the window and jumps
+        // to its workspace). Command mode launches apps and starts timers
+        // entirely inside the daemon — app launch flows back as a normal
+        // window-created event; timers drive the menu-bar widget directly.
+        spotlight.snapshotProvider = { [weak overlayManager] in
             overlayManager?.cachedSnapshot
         }
-        windowSearch.anchorButton = statusBar.statusButton
-        windowSearch.onFocusWindow = { [weak socketServer] wid, pid in
+        spotlight.onFocusWindow = { [weak socketServer] wid, pid in
             socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
         }
-        statusBar.onSearchWindows = { [weak windowSearch] in
-            windowSearch?.show()
+        spotlight.onStartTimer = { [weak timerController] seconds, label in
+            timerController?.start(seconds: seconds, label: label)
         }
-        // Opt+Cmd+Shift+P → Haskell → show-window-picker command → here.
-        executor.onShowWindowPicker = { [weak windowSearch] in
-            windowSearch?.toggle()
+        statusBar.onSearchWindows = { [weak spotlight] in
+            spotlight?.show(mode: .window)
+        }
+        // Legacy Opt+Shift+P → show-window-picker → Spotlight in window mode.
+        executor.onShowWindowPicker = { [weak spotlight] in
+            spotlight?.toggle(mode: .window)
+        }
+        // Opt+P / Opt+Shift+P → Haskell → show-spotlight command → here.
+        executor.onShowSpotlight = { [weak spotlight] modeStr in
+            let mode: SpotlightController.Mode =
+                (modeStr == "window") ? .window : .command
+            spotlight?.toggle(mode: mode)
         }
 
         // Route commands from socket to executor
@@ -375,7 +388,7 @@ struct MCMonadCoreApp {
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, executor, eventBridge, dragHandler,
-                      mouseDownMonitor, windowSearch)
+                      mouseDownMonitor, spotlight, timerController)
     }
 
     // Static storage to prevent ARC from deallocating services

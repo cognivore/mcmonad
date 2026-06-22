@@ -23,7 +23,7 @@ import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
 import MCMonad.Operations
     ( windows, sendMessage, kill, spawn, withFocused, screenWorkspace
-    , jumpToActiveWindow, showWindowPicker
+    , jumpToActiveWindow, showSpotlight
     )
 
 -- ---------------------------------------------------------------------------
@@ -145,17 +145,23 @@ defaultKeys conf = Map.fromList $
     -- when the actual frame disagrees with the most-recent SetFrames.
     , ((m .|. controlMask, kD), toggleDebugOverlays)
 
-    -- Fuzzy window search + "follow the active window". Independent of
+    -- Spotlight launcher + "follow the active window". Independent of
     -- 'modMask' (deliberately not 'm').
     --
-    -- Opt+Shift+P: open the Spotlight-style fuzzy window search ("I lost
-    -- Google Chrome" → type "chr" → Enter).
+    -- Opt+P: open the Spotlight launcher in command-runner mode — type
+    -- "timer" (then minutes) or "timer 15 check on agents" to set a
+    -- countdown that lives in the menu bar, or an app name ("chrome",
+    -- "librewolf") to launch it. A mic button (or ⌘L) drives voice input.
+    --
+    -- Opt+Shift+P: open the same launcher in window-search mode ("I lost
+    -- Google Chrome" → type "chr" → Enter). Tab cycles modes either way.
     --
     -- Opt+Cmd+Shift+J: jump to the workspace where the *currently active*
     -- window lives. Click a Dock icon, then press this to follow the app
     -- onto its (possibly off-screen) workspace. Keeps the Command in its
     -- triad so it can't be hit by accident.
-    , ((optionMask .|. shiftMask, kP), showWindowPicker)
+    , ((optionMask, kP), showSpotlight "command")
+    , ((optionMask .|. shiftMask, kP), showSpotlight "window")
     , ((optionMask .|. commandMask .|. shiftMask, kJ), jumpToActiveWindow)
 
     ]

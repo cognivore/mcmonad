@@ -18,6 +18,7 @@ module MCMonad.Operations
     , setFocus
     , jumpToActiveWindow
     , showWindowPicker
+    , showSpotlight
       -- * Launching programs
     , spawn
       -- * Restart
@@ -529,6 +530,17 @@ showWindowPicker :: M ()
 showWindowPicker = do
     conn <- asks connection
     io $ sendCommand conn ShowWindowPicker
+
+-- | Open the Spotlight launcher in a given mode: @"command"@ (the command
+-- runner + app launcher + voice) or @"window"@ (fuzzy window search). The
+-- daemon owns the UI and cycles modes on @Tab@; a window selection comes
+-- back as a 'MCMonad.IPC.MenuFocusWindow' event (same focus-and-jump path
+-- as 'showWindowPicker'), while app launch and timers are handled entirely
+-- daemon-side.
+showSpotlight :: String -> M ()
+showSpotlight mode = do
+    conn <- asks connection
+    io $ sendCommand conn (ShowSpotlight mode)
 
 -- ---------------------------------------------------------------------------
 -- Launching programs

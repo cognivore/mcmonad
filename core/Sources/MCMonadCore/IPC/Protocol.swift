@@ -342,6 +342,7 @@ enum IPCCommand: Decodable, Sendable {
     case setOverlayState(snapshot: OverlaySnapshot)
     case queryFocusedWindow
     case showWindowPicker
+    case showSpotlight(mode: String)
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -358,6 +359,7 @@ enum IPCCommand: Decodable, Sendable {
         case setOverlayState = "set-overlay-state"
         case queryFocusedWindow = "query-focused-window"
         case showWindowPicker = "show-window-picker"
+        case showSpotlight = "show-spotlight"
     }
 
     init(from decoder: Decoder) throws {
@@ -405,6 +407,9 @@ enum IPCCommand: Decodable, Sendable {
             self = .queryFocusedWindow
         case .showWindowPicker:
             self = .showWindowPicker
+        case .showSpotlight:
+            let mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "command"
+            self = .showSpotlight(mode: mode)
         }
     }
 }
@@ -453,4 +458,5 @@ private struct DynamicCodingKey: CodingKey {
     static let y = DynamicCodingKey(stringValue: "y")!
     static let on = DynamicCodingKey(stringValue: "on")!
     static let snapshot = DynamicCodingKey(stringValue: "snapshot")!
+    static let mode = DynamicCodingKey(stringValue: "mode")!
 }

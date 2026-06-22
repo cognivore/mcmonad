@@ -548,24 +548,29 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 filtered = [hintItem("Type minutes, e.g. “15 check on agents”")]
             }
 
-        case .browsing where mode == .command:
+        case .browsing:
+            // "timer …" is recognised in EVERY mode, so a countdown can be set
+            // — typed or dictated — whether you're in command or window mode.
             var items: [Item] = []
-            if let parsed = Self.parseTimerCommand(q) {
+            let timerCmd = Self.parseTimerCommand(q)
+            if let parsed = timerCmd {
                 if let m = parsed.minutes {
                     items.append(timerStartItem(minutes: m, label: parsed.label))
-                    // Drop the builtin Timer from the ranked list (the synth row covers it).
-                    items += rank(q, in: commandBase.filter { !$0.isOpenTimerPrompt })
                 } else {
                     items.append(timerCommandItem())
-                    items += rank(q, in: commandBase.filter { !$0.isOpenTimerPrompt })
                 }
-            } else {
-                items = rank(q, in: commandBase)
+            }
+            switch mode {
+            case .command:
+                // Don't show the builtin Timer twice when a timer row is present.
+                let base = timerCmd != nil
+                    ? commandBase.filter { !$0.isOpenTimerPrompt }
+                    : commandBase
+                items += rank(q, in: base)
+            case .window:
+                items += rank(q, in: windowBase)
             }
             filtered = items
-
-        case .browsing:
-            filtered = rank(q, in: windowBase)
         }
 
         tableView?.reloadData()
@@ -718,22 +723,20 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             submitTimerField()
             return
         }
-        switch mode {
-        case .command:
-            if let parsed = Self.parseTimerCommand(text) {
-                if let m = parsed.minutes {
-                    finish()
-                    onStartTimer?(TimeInterval(m) * 60, parsed.label)
-                } else {
-                    enterTimerPrompt()
-                }
+        // A spoken "timer …" sets a countdown in ANY mode — dictation isn't
+        // gated by which mode the launcher happens to be in.
+        if let parsed = Self.parseTimerCommand(text) {
+            if let m = parsed.minutes {
+                finish()
+                onStartTimer?(TimeInterval(m) * 60, parsed.label)
             } else {
-                // Launch the best-matching app.
-                activateSelection()
+                enterTimerPrompt()
             }
-        case .window:
-            activateSelection()
+            return
         }
+        // Otherwise act on the top result for the current mode:
+        // command → launch the best-matching app; window → focus the window.
+        activateSelection()
     }
 
     // MARK: - Local key monitor (⌘L toggles voice)

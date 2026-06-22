@@ -32,6 +32,23 @@ in
         '''
       '';
     };
+
+    signingIdentity = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Code-signing identity used to re-sign the bundled binaries on every
+        activation (a name or SHA-1 hash, as shown by
+        `security find-identity -v -p codesigning`). Signing with a stable
+        identity — e.g. your Apple Development or Developer ID certificate —
+        gives mcmonad-core a fixed code identity, so TCC grants (Accessibility,
+        Microphone, Speech Recognition) persist across rebuilds instead of
+        resetting each time the ad-hoc signature's cdhash changes. When null,
+        falls back to a self-signed `MCMonad` certificate if one is present,
+        otherwise the ad-hoc signature from the build is kept.
+      '';
+      example = "Apple Development: you@example.com (TEAMID)";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -47,26 +64,32 @@ in
           ${app}/Applications/MCMonad.app/ \
           ${lib.escapeShellArg bundlePath}/
 
-        # Re-sign the bundle with a stable code identity if one is set up
-        # in the user's login keychain. Without this, every Nix rebuild
-        # produces a binary whose adhoc Identifier embeds a fresh content
-        # hash, TCC treats it as a different binary at the same path, and
-        # the AX grant doesn't carry over — windows stop placing until you
-        # re-grant in System Settings. With a self-signed cert (CN=MCMonad)
-        # in the login keychain, the Identifier becomes the cert's CN
-        # (a fixed string) and TCC remembers the grant. If the cert isn't
-        # there, this block no-ops and the bundle keeps its adhoc signature.
-        # To opt in: Keychain Access → Certificate Assistant → Create a
-        # Certificate (Name "MCMonad", Self Signed Root, Code Signing).
-        if /usr/bin/security find-certificate -c MCMonad >/dev/null 2>&1; then
+        # Re-sign the bundle with a stable code identity so TCC grants
+        # (Accessibility, Microphone, Speech Recognition) survive rebuilds.
+        # Every Nix rebuild produces an adhoc binary whose Identifier embeds a
+        # fresh content hash; TCC treats it as a brand-new client at the same
+        # path, so the grant doesn't carry over and windows stop placing /
+        # the mic stops working until you re-grant. A stable signature fixes
+        # the identity. Prefer an explicitly configured identity
+        # (services.mcmonad.signingIdentity — e.g. an Apple Development /
+        # Developer ID cert, by name or SHA-1); otherwise fall back to a
+        # self-signed `MCMonad` cert if present. Dylibs are signed first, then
+        # the executables, with the SAME identity, so library validation
+        # passes for the now-team-signed mcmonad-core. If neither is
+        # available the bundle keeps its adhoc signature.
+        mcmonad_sign_id=${lib.escapeShellArg (if cfg.signingIdentity != null then cfg.signingIdentity else "")}
+        if [ -z "$mcmonad_sign_id" ] && /usr/bin/security find-certificate -c MCMonad >/dev/null 2>&1; then
+            mcmonad_sign_id=MCMonad
+        fi
+        if [ -n "$mcmonad_sign_id" ]; then
             mcmonad_app_contents=${lib.escapeShellArg "${bundlePath}/Contents"}
             for f in \
+                "$mcmonad_app_contents/Frameworks/"*.dylib \
                 "$mcmonad_app_contents/MacOS/mcmonad-core" \
-                "$mcmonad_app_contents/MacOS/mcmonad" \
-                "$mcmonad_app_contents/Frameworks/"*.dylib; do
+                "$mcmonad_app_contents/MacOS/mcmonad"; do
                 [ -e "$f" ] || continue
-                /usr/bin/codesign --force --sign MCMonad "$f" 2>/dev/null || \
-                    echo "mcmonad: codesign $f with MCMonad failed; leaving adhoc" >&2
+                /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$f" 2>/dev/null || \
+                    echo "mcmonad: codesign $f with '$mcmonad_sign_id' failed; leaving adhoc" >&2
             done
         fi
 

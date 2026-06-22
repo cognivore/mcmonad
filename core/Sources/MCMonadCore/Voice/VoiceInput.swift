@@ -54,7 +54,11 @@ final class VoiceInput {
             completion(false)
             return
         }
-        SFSpeechRecognizer.requestAuthorization { speechStatus in
+        // These handlers are invoked by TCC/AVFoundation on background queues.
+        // Mark them @Sendable so the compiler does NOT infer main-actor
+        // isolation from this @MainActor method — otherwise the Swift runtime
+        // asserts "not on the main queue" and SIGTRAPs when they fire.
+        SFSpeechRecognizer.requestAuthorization { @Sendable speechStatus in
             let speechOK = (speechStatus == .authorized)
             guard speechOK else {
                 completion(false)
@@ -64,7 +68,7 @@ final class VoiceInput {
             case .authorized:
                 completion(true)
             case .notDetermined:
-                AVCaptureDevice.requestAccess(for: .audio) { micOK in
+                AVCaptureDevice.requestAccess(for: .audio) { @Sendable micOK in
                     completion(micOK)
                 }
             default:
@@ -104,7 +108,9 @@ final class VoiceInput {
         }
 
         let box = UnsafeBox(value: req)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        // The tap fires on the realtime audio render thread — must be
+        // @Sendable (never main-actor-isolated) or the runtime traps.
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer, _ in
             box.value.append(buffer)
         }
 
@@ -122,9 +128,11 @@ final class VoiceInput {
         onListeningChanged?(true)
         Self.logger.info("voice listening started")
 
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+        task = recognizer.recognitionTask(with: req) { @Sendable [weak self] result, error in
             // Extract Sendable values on the recognition queue, then hop to
             // the main actor — never transfer the non-Sendable result object.
+            // @Sendable: this handler is called off-main; without it the
+            // compiler would infer main-actor isolation and the runtime traps.
             let text: String? = result.map { $0.bestTranscription.formattedString }
             let isFinal = result?.isFinal ?? false
             let failed = (error != nil)

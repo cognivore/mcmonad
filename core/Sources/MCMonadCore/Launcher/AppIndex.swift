@@ -110,10 +110,14 @@ final class AppIndex {
     func launch(_ entry: AppEntry) {
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.activates = true
-        NSWorkspace.shared.openApplication(at: entry.url, configuration: cfg) { _, err in
+        // openApplication's completion fires on a background queue — capture
+        // only Sendable values and mark @Sendable so the compiler doesn't
+        // infer main-actor isolation (which would trap at runtime).
+        let name = entry.name
+        NSWorkspace.shared.openApplication(at: entry.url, configuration: cfg) { @Sendable _, err in
             if let err {
                 Self.logger.error(
-                    "launch failed for \(entry.name, privacy: .public): \(err.localizedDescription, privacy: .public)"
+                    "launch failed for \(name, privacy: .public): \(err.localizedDescription, privacy: .public)"
                 )
             }
         }

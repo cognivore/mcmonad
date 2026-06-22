@@ -7,15 +7,17 @@ import os
 /// fully on-device (`requiresOnDeviceRecognition`), so spoken commands never
 /// leave the machine.
 ///
-/// The flow: tap the default input device with `AVAudioEngine`, stream PCM
-/// buffers into an `SFSpeechAudioBufferRecognitionRequest`, and surface
-/// partial transcripts live (`onPartial`) plus a final transcript
-/// (`onFinal`) when the speaker pauses. The controller feeds partials into
-/// the search field and runs the command parser on the final string.
+/// **Continuous listening.** The on-device recognizer finalises a recognition
+/// task after a pause in speech (and caps a single task at ~1 minute). To keep
+/// the mic live the whole time the launcher is open, the `AVAudioEngine` tap
+/// stays running and only the `SFSpeechAudioBufferRecognitionRequest` + task
+/// are recycled: when a task ends (final result, silence, or error) we start a
+/// fresh one, until `stop()` is called (the user typed, dismissed, or a spoken
+/// command fired). The tap feeds whichever request is current through a small
+/// locked holder, so swapping requests never drops or misroutes audio.
 ///
 /// Permissions degrade gracefully: if speech-recognition or microphone
-/// authorization is unavailable (e.g. a bare daemon binary whose enclosing
-/// bundle TCC can't resolve), `requestAuthorization` reports `false`, the
+/// authorization is unavailable, `requestAuthorization` reports `false`, the
 /// controller hides the mic affordance, and everything else keeps working.
 @MainActor
 final class VoiceInput {
@@ -24,10 +26,26 @@ final class VoiceInput {
         category: "Voice"
     )
 
-    /// Carries a non-Sendable reference across the audio render thread
-    /// boundary. `SFSpeechAudioBufferRecognitionRequest.append` is documented
-    /// as safe to call from the realtime tap callback.
-    private struct UnsafeBox<T>: @unchecked Sendable { let value: T }
+    /// Routes realtime audio buffers to the current recognition request. The
+    /// tap closure runs on the audio render thread; `set` runs on the main
+    /// actor when a session is (re)started. A lock keeps the swap safe.
+    /// `SFSpeechAudioBufferRecognitionRequest.append` is documented as safe to
+    /// call from the tap callback.
+    private final class RequestHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var request: SFSpeechAudioBufferRecognitionRequest?
+        func append(_ buffer: AVAudioPCMBuffer) {
+            lock.lock()
+            let r = request
+            lock.unlock()
+            r?.append(buffer)
+        }
+        func set(_ r: SFSpeechAudioBufferRecognitionRequest?) {
+            lock.lock()
+            request = r
+            lock.unlock()
+        }
+    }
 
     var onPartial: ((String) -> Void)?
     var onFinal: ((String) -> Void)?
@@ -36,28 +54,28 @@ final class VoiceInput {
 
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let audioEngine = AVAudioEngine()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private let holder = RequestHolder()
     private var task: SFSpeechRecognitionTask?
+    private var engineRunning = false
 
+    /// The user's intent to be listening. Stays true across automatic session
+    /// restarts; only `stop()` clears it. `isListening` mirrors it for the UI.
+    private var active = false
     private(set) var isListening = false
 
-    /// Whether the recognizer exists and is currently available. Auth is
-    /// checked separately via `requestAuthorization`.
     var isAvailable: Bool { recognizer?.isAvailable ?? false }
 
     // MARK: - Authorization
 
     /// Request both speech-recognition and microphone permission. Calls back
-    /// on the main actor with the combined result.
+    /// with the combined result. The handler runs on a background queue (TCC),
+    /// so it is @Sendable to keep the compiler from inferring main-actor
+    /// isolation — which the runtime would then trap on.
     func requestAuthorization(_ completion: @escaping @Sendable (Bool) -> Void) {
         guard recognizer != nil else {
             completion(false)
             return
         }
-        // These handlers are invoked by TCC/AVFoundation on background queues.
-        // Mark them @Sendable so the compiler does NOT infer main-actor
-        // isolation from this @MainActor method — otherwise the Swift runtime
-        // asserts "not on the main queue" and SIGTRAPs when they fire.
         SFSpeechRecognizer.requestAuthorization { @Sendable speechStatus in
             let speechOK = (speechStatus == .authorized)
             guard speechOK else {
@@ -80,59 +98,65 @@ final class VoiceInput {
     // MARK: - Listening
 
     func toggle() {
-        if isListening { stop() } else { start() }
+        if active { stop() } else { start() }
     }
 
+    /// Begin continuous listening. Idempotent while already active.
     func start() {
-        guard !isListening else { return }
+        guard !active else { return }
         guard let recognizer, recognizer.isAvailable else {
             onError?("Speech recognition is not available right now.")
             return
         }
+
+        let input = audioEngine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        // A zero/invalid input format (no or busy mic device) makes installTap
+        // throw an Obj-C exception that would crash us — bail first.
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            onError?("No usable microphone input.")
+            return
+        }
+
+        let holder = self.holder
+        // Tap runs on the realtime audio thread — @Sendable, never main-isolated.
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer, _ in
+            holder.append(buffer)
+        }
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            onError?("Microphone failed to start: \(error.localizedDescription)")
+            return
+        }
+        engineRunning = true
+
+        active = true
+        isListening = true
+        onListeningChanged?(true)
+        Self.logger.info("voice listening started (continuous)")
+        beginSession()
+    }
+
+    /// Start one recognition request/task. Restarted automatically whenever a
+    /// task ends, for as long as `active` holds.
+    private func beginSession() {
+        guard active, let recognizer else { return }
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition {
             req.requiresOnDeviceRecognition = true
         }
-        request = req
-
-        let input = audioEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        // Guard against a zero/invalid input format (no or busy mic device),
-        // which makes installTap throw an exception that would crash us.
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            onError?("No usable microphone input.")
-            request = nil
-            return
-        }
-
-        let box = UnsafeBox(value: req)
-        // The tap fires on the realtime audio render thread — must be
-        // @Sendable (never main-actor-isolated) or the runtime traps.
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer, _ in
-            box.value.append(buffer)
-        }
-
-        audioEngine.prepare()
-        do {
-            try audioEngine.start()
-        } catch {
-            input.removeTap(onBus: 0)
-            request = nil
-            onError?("Microphone failed to start: \(error.localizedDescription)")
-            return
-        }
-
-        isListening = true
-        onListeningChanged?(true)
-        Self.logger.info("voice listening started")
+        holder.set(req)
 
         task = recognizer.recognitionTask(with: req) { @Sendable [weak self] result, error in
-            // Extract Sendable values on the recognition queue, then hop to
-            // the main actor — never transfer the non-Sendable result object.
-            // @Sendable: this handler is called off-main; without it the
-            // compiler would infer main-actor isolation and the runtime traps.
+            // Extract Sendable values on the recognition queue, then hop to the
+            // main actor — never transfer the non-Sendable result object. The
+            // handler is @Sendable so it is not inferred main-actor-isolated
+            // (it runs off-main; the runtime would otherwise trap).
             let text: String? = result.map { $0.bestTranscription.formattedString }
             let isFinal = result?.isFinal ?? false
             let failed = (error != nil)
@@ -141,25 +165,46 @@ final class VoiceInput {
                 if let text, !text.isEmpty {
                     if isFinal {
                         self.onFinal?(text)
-                        self.stop()
                     } else {
                         self.onPartial?(text)
                     }
-                } else if failed {
-                    self.stop()
+                }
+                // A task ends on final result, silence, or error. Keep the mic
+                // live by starting a fresh session — unless onFinal triggered a
+                // command that stopped us (active == false), or audio is gone.
+                if (isFinal || failed), self.active {
+                    if failed {
+                        // Brief backoff so a persistently-failing recognizer
+                        // can't spin a hot restart loop.
+                        try? await Task.sleep(nanoseconds: 400_000_000)
+                        guard self.active else { return }
+                    }
+                    self.restartSession()
                 }
             }
         }
     }
 
-    func stop() {
-        guard isListening else { return }
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        request?.endAudio()
+    /// Recycle the recognition request/task while keeping the engine + tap up.
+    private func restartSession() {
+        holder.set(nil)
         task?.cancel()
-        request = nil
         task = nil
+        guard active, engineRunning else { return }
+        beginSession()
+    }
+
+    func stop() {
+        guard active else { return }
+        active = false
+        holder.set(nil)
+        task?.cancel()
+        task = nil
+        if engineRunning {
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            engineRunning = false
+        }
         isListening = false
         onListeningChanged?(false)
         Self.logger.info("voice listening stopped")

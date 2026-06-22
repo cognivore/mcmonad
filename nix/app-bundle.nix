@@ -397,8 +397,6 @@ GHCWRAPPER
     <string>0.1.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>LSBackgroundOnly</key>
-    <true/>
     <key>LSUIElement</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>

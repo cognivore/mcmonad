@@ -34,15 +34,24 @@ final class VoiceInput {
     private final class RequestHolder: @unchecked Sendable {
         private let lock = NSLock()
         private var request: SFSpeechAudioBufferRecognitionRequest?
+        private var appended = 0
+        private let logger = Logger(subsystem: "com.mcmonad.core", category: "Voice")
         func append(_ buffer: AVAudioPCMBuffer) {
             lock.lock()
             let r = request
+            appended += 1
+            let n = appended
             lock.unlock()
             r?.append(buffer)
+            // Diagnostic: confirm real audio is flowing from the mic tap.
+            if n == 1 || n % 100 == 0 {
+                logger.info("tap: appended \(n) buffers (frames=\(buffer.frameLength))")
+            }
         }
         func set(_ r: SFSpeechAudioBufferRecognitionRequest?) {
             lock.lock()
             request = r
+            appended = 0
             lock.unlock()
         }
     }
@@ -118,6 +127,10 @@ final class VoiceInput {
             return
         }
 
+        Self.logger.info(
+            "voice start: speechAuth=\(SFSpeechRecognizer.authorizationStatus().rawValue, privacy: .public) micAuth=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue, privacy: .public) inFmt=\(format.sampleRate, privacy: .public)Hz x\(format.channelCount, privacy: .public)"
+        )
+
         let holder = self.holder
         // Tap runs on the realtime audio thread — @Sendable, never main-isolated.
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer, _ in
@@ -152,6 +165,7 @@ final class VoiceInput {
         }
         holder.set(req)
 
+        let recogLogger = Self.logger
         task = recognizer.recognitionTask(with: req) { @Sendable [weak self] result, error in
             // Extract Sendable values on the recognition queue, then hop to the
             // main actor — never transfer the non-Sendable result object. The
@@ -160,6 +174,12 @@ final class VoiceInput {
             let text: String? = result.map { $0.bestTranscription.formattedString }
             let isFinal = result?.isFinal ?? false
             let failed = (error != nil)
+            if let text {
+                recogLogger.info("recog \(isFinal ? "final" : "partial", privacy: .public): \(text, privacy: .public)")
+            }
+            if let error {
+                recogLogger.error("recog error: \(error.localizedDescription, privacy: .public)")
+            }
             Task { @MainActor in
                 guard let self else { return }
                 if let text, !text.isEmpty {

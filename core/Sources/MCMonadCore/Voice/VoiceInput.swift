@@ -61,7 +61,12 @@ final class VoiceInput {
     var onListeningChanged: ((Bool) -> Void)?
     var onError: ((String) -> Void)?
 
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    // Use the user's current locale (e.g. en-GB) — its on-device speech assets
+    // are the ones macOS actually provisions; hardcoding en-US picks a recognizer
+    // whose assets may be absent. Fall back to en-US only if the current locale
+    // has no recognizer.
+    private let recognizer = SFSpeechRecognizer()
+        ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let audioEngine = AVAudioEngine()
     private let holder = RequestHolder()
     private var task: SFSpeechRecognitionTask?

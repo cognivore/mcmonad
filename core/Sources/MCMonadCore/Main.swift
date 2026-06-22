@@ -271,11 +271,17 @@ struct MCMonadCoreApp {
             spotlight?.toggle(mode: mode)
         }
 
-        // Request mic/speech permission now, at startup — before any Spotlight
-        // panel exists to obscure the TCC prompt. Without this the speech
-        // prompt fires behind the .popUpMenu-level panel and silently resolves
-        // to notDetermined, so voice never starts.
-        spotlight.primeVoiceAuthorization()
+        // Request mic/speech permission shortly after startup — but only once
+        // the run loop is actually running. Calling requestAuthorization from
+        // launchServices() (before NSApplication.run()) makes SFSpeechRecognizer
+        // resolve straight to .denied without ever presenting the prompt, which
+        // then poisons voiceAuthorized=false and blocks the panel from asking
+        // too. Deferring onto the main actor guarantees .run() is live (and no
+        // Spotlight panel is up) so the TCC prompt presents cleanly.
+        Task { @MainActor [weak spotlight] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            spotlight?.primeVoiceAuthorization()
+        }
 
         // Route commands from socket to executor
         socketServer.onCommand = { command in

@@ -214,7 +214,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(searchField)
         installKeyMonitor()
-        beginVoice()   // listen by default — speak or type
+        // Voice is OPT-IN: press the mic button or ⌘L to talk. Auto-listening
+        // on open held the microphone the entire time the launcher was up —
+        // the always-on orange mic indicator — which is unwanted.
     }
 
     func hide() {
@@ -262,7 +264,6 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         applyModeChrome()
         applyFilter("")
         panel?.makeFirstResponder(searchField)
-        beginVoice()
     }
 
     /// Update placeholder / glyph / mode label / hint for the current state.
@@ -632,7 +633,6 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         searchField.stringValue = ""
         applyModeChrome()
         applyFilter("")
-        beginVoice()   // speak the minutes too
     }
 
     /// Parse the timer-prompt field and start a timer if it has minutes.

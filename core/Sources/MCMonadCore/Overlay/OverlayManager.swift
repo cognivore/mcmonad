@@ -57,6 +57,13 @@ final class OverlayManager {
     func apply(_ snapshot: OverlaySnapshot) {
         lastSnapshot = snapshot
         cachedSnapshot = snapshot
+        // Diagnostic: confirms snapshots reach the daemon and how many windows
+        // they carry — the menubar tree and the Spotlight window list both read
+        // this cache, so an empty list here explains an empty picker.
+        let wc = snapshot.screens.reduce(0) { $0 + $1.windows.count }
+            + snapshot.hiddenWorkspaces.reduce(0) { $0 + $1.windows.count }
+        fputs("OVERLAY: apply screens=\(snapshot.screens.count) "
+            + "hidden=\(snapshot.hiddenWorkspaces.count) windows=\(wc)\n", stderr)
         guard enabled else { return }
         redraw(snapshot)
     }

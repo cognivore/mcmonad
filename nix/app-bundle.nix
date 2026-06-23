@@ -3,6 +3,12 @@
 let
   resourceDir = ../core/Sources/MCMonadCore/Resources;
   launcherScript = ../scripts/mcmonad-launcher;
+  # Shipped as source and compiled on-device during home-manager activation
+  # (avoids a fragile C compile inside the Nix sandbox). Makes mcmonad-core
+  # its own TCC-responsible process so the Microphone/Speech prompt is
+  # attributed to com.mcmonad.core (which carries the usage strings).
+  tccSpawnSrc = ../scripts/mcmonad-tcc-spawn.c;
+  coreEntitlements = ../core/mcmonad-core.entitlements;
 in
 
 pkgs.stdenv.mkDerivation {
@@ -411,6 +417,12 @@ PLIST
     cp ${resourceDir}/MenuBarIcon.png "$APP/Resources/MenuBarIcon.png"
     cp "${resourceDir}/MenuBarIcon@2x.png" "$APP/Resources/MenuBarIcon@2x.png"
 
+    # TCC-disclaim spawn shim (source) + microphone entitlements. The shim is
+    # compiled and signed during home-manager activation (which has the CLT),
+    # not here — keeping a C toolchain out of the Nix build sandbox.
+    cp ${tccSpawnSrc} "$APP/Resources/mcmonad-tcc-spawn.c"
+    cp ${coreEntitlements} "$APP/Resources/mcmonad-core.entitlements"
+
     # --- Ad-hoc codesign ---
     # Every binary/dylib whose load commands we rewrote with
     # install_name_tool needs to be re-signed, or macOS SIGKILLs the
@@ -423,7 +435,9 @@ PLIST
       /usr/bin/codesign --force --sign - "$f"
     done
     /usr/bin/codesign --force --sign - "$APP/MacOS/mcmonad"
-    /usr/bin/codesign --force --sign - "$APP/MacOS/mcmonad-core"
+    # Core carries the microphone entitlement (declared intent; enforced only
+    # under hardened runtime). home-manager re-signs it with a stable cert.
+    /usr/bin/codesign --force --sign - --entitlements ${coreEntitlements} "$APP/MacOS/mcmonad-core"
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && \
         /usr/bin/codesign --force --sign - "$tool"

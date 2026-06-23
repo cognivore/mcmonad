@@ -67,6 +67,28 @@ maybe_rotate_logs() {
 CORE_BIN="${MCMONAD_CORE_BIN:-$APP_DIR/MacOS/mcmonad-core}"
 DEFAULT_HASKELL_BIN="${MCMONAD_HASKELL_BIN:-$APP_DIR/MacOS/mcmonad}"
 
+# TCC-disclaim spawn shim. When present, mcmonad-core is launched through it
+# so the daemon is its OWN TCC-responsible process — otherwise macOS
+# attributes the Microphone/Speech permission prompt to this launcher (the
+# app bundle's main executable) rather than to com.mcmonad.core, and the
+# grant never sticks to the binary that carries the usage strings. Compiled
+# and signed during home-manager activation; absent for a raw .app, in which
+# case we spawn the core directly (mic prompt then attributes to the bundle).
+TCC_SPAWN="$APP_DIR/MacOS/mcmonad-tcc-spawn"
+
+# Spawn mcmonad-core (through the shim if available) backgrounded, with output
+# to the core log. Sets CORE_PID to the supervised pid (the shim's — it lives
+# exactly as long as core and forwards signals, so the death/restart and
+# cleanup logic is unchanged).
+start_core() {
+    if [ -x "$TCC_SPAWN" ]; then
+        "$TCC_SPAWN" "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
+    else
+        "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
+    fi
+    CORE_PID=$!
+}
+
 # MCMONAD_GHC: path to a GHC that has the mcmonad library.
 # Set by home-manager module or derived from the app bundle below.
 # Required for Mod-q recompilation — not defaulted.
@@ -155,8 +177,7 @@ run_daemon() {
     maybe_rotate_logs
 
     log "Starting mcmonad-core"
-    "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
-    CORE_PID=$!
+    start_core
 
     log "Starting mcmonad (haskell)"
     "$HASKELL_BIN" >> "$HASKELL_LOG" 2>&1 &
@@ -182,8 +203,7 @@ run_daemon() {
     while true; do
         if ! kill -0 "$CORE_PID" 2>/dev/null; then
             log "mcmonad-core died, restarting"
-            "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
-            CORE_PID=$!
+            start_core
         fi
         if ! kill -0 "$HASKELL_PID" 2>/dev/null; then
             log "mcmonad died, restarting"

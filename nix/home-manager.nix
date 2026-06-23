@@ -81,16 +81,51 @@ in
         if [ -z "$mcmonad_sign_id" ] && /usr/bin/security find-certificate -c MCMonad >/dev/null 2>&1; then
             mcmonad_sign_id=MCMonad
         fi
+        mcmonad_app_contents=${lib.escapeShellArg "${bundlePath}/Contents"}
+
+        # Compile the TCC-disclaim spawn shim on-device (the Nix build sandbox
+        # has no C toolchain). It makes mcmonad-core its OWN responsible process
+        # for the Microphone/Speech permission prompt, so the prompt and grant
+        # attach to com.mcmonad.core (which carries the usage strings) rather
+        # than to the launcher / app bundle — see scripts/mcmonad-tcc-spawn.c.
+        # Best-effort: on failure the launcher spawns the core directly.
+        tcc_src="$mcmonad_app_contents/Resources/mcmonad-tcc-spawn.c"
+        tcc_bin="$mcmonad_app_contents/MacOS/mcmonad-tcc-spawn"
+        if [ -f "$tcc_src" ]; then
+            if env -u DEVELOPER_DIR -u SDKROOT \
+                    /usr/bin/xcrun clang -O2 "$tcc_src" -o "$tcc_bin"; then
+                :
+            else
+                echo "mcmonad: failed to compile mcmonad-tcc-spawn; core will spawn directly (mic prompt may misattribute)" >&2
+                rm -f "$tcc_bin"
+            fi
+        fi
+
+        # Re-sign with a stable identity so TCC grants (Accessibility,
+        # Microphone, Speech Recognition) survive rebuilds. Sign dylibs and the
+        # haskell binary first, then the shim, then mcmonad-core LAST — with the
+        # microphone entitlement, after its dylib deps are signed. Core's stable
+        # identity + its own responsible-process launch is what lets the
+        # Spotlight voice input actually reach the microphone.
         if [ -n "$mcmonad_sign_id" ]; then
-            mcmonad_app_contents=${lib.escapeShellArg "${bundlePath}/Contents"}
             for f in \
                 "$mcmonad_app_contents/Frameworks/"*.dylib \
-                "$mcmonad_app_contents/MacOS/mcmonad-core" \
                 "$mcmonad_app_contents/MacOS/mcmonad"; do
                 [ -e "$f" ] || continue
                 /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$f" 2>/dev/null || \
                     echo "mcmonad: codesign $f with '$mcmonad_sign_id' failed; leaving adhoc" >&2
             done
+            if [ -x "$tcc_bin" ]; then
+                /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$tcc_bin" 2>/dev/null || true
+            fi
+            /usr/bin/codesign --force --sign "$mcmonad_sign_id" \
+                --entitlements "$mcmonad_app_contents/Resources/mcmonad-core.entitlements" \
+                "$mcmonad_app_contents/MacOS/mcmonad-core" 2>/dev/null || \
+                echo "mcmonad: codesign mcmonad-core with '$mcmonad_sign_id' failed; leaving adhoc" >&2
+        elif [ -x "$tcc_bin" ]; then
+            # No stable cert: at least adhoc-sign the freshly compiled shim so
+            # macOS will run it.
+            /usr/bin/codesign --force --sign - "$tcc_bin" 2>/dev/null || true
         fi
 
         # Recompile the user's mcmonad.hs against the freshly installed

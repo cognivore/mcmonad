@@ -33,12 +33,31 @@ final class TimerController: NSObject, NSMenuDelegate {
         let total: TimeInterval
     }
 
+    /// A fired-timer reminder card: a persistent, interactive HUD that stays on
+    /// screen until dismissed or snoozed. `label` is kept so Snooze can re-arm
+    /// the same timer.
+    private struct Reminder {
+        let id: Int
+        let panel: NSPanel
+        let label: String
+    }
+
     private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var timers: [ActiveTimer] = []
     private var nextId = 1
     private var tick: Timer?
-    private var hudPanel: NSPanel?
+
+    /// Fired-timer reminders, oldest first. Each stays up until the user clicks
+    /// Dismiss or Snooze — a missed timer must never silently vanish. Relaid
+    /// out on add/remove so the stack has no gaps.
+    private var reminders: [Reminder] = []
+    private var nextReminderId = 1
+
+    private static let reminderWidth: CGFloat = 460
+    private static let reminderHeight: CGFloat = 92
+    private static let reminderGap: CGFloat = 10
+    private static let snoozeSeconds: TimeInterval = 5 * 60
 
     override init() {
         super.init()
@@ -97,8 +116,7 @@ final class TimerController: NSObject, NSMenuDelegate {
     private func fire(_ t: ActiveTimer) {
         Self.logger.info("timer #\(t.id) fired: \(t.label, privacy: .public)")
         playSound()
-        let what = t.label.isEmpty ? "Timer" : t.label
-        showHUD(text: "⏰  \(what) — time's up")
+        showReminder(label: t.label)
     }
 
     private func teardown() {
@@ -200,26 +218,32 @@ final class TimerController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// A small, non-activating, click-through HUD shown briefly on the screen
-    /// under the mouse. Auto-dismisses; never steals key focus.
-    private func showHUD(text: String) {
-        hudPanel?.orderOut(nil)
+    /// Show a persistent reminder card for a fired timer. Unlike a toast it does
+    /// NOT auto-dismiss: a missed timer stays on screen, stacked under any other
+    /// fired reminders, until the user clicks Dismiss or Snooze. The card is a
+    /// non-activating `popUpMenu`-level HUD, so it floats above other windows,
+    /// takes clicks on its buttons without stealing focus, and is ignored by the
+    /// tiling engine (its window level is outside the managed {0,3,8} set).
+    private func showReminder(label rawLabel: String) {
+        let id = nextReminderId
+        nextReminderId += 1
+        let trimmed = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = trimmed.isEmpty ? "Timer" : trimmed
 
-        let width: CGFloat = 420
-        let height: CGFloat = 64
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            contentRect: NSRect(x: 0, y: 0, width: Self.reminderWidth, height: Self.reminderHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.level = .popUpMenu
         panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.ignoresMouseEvents = true
+        panel.appearance = NSAppearance(named: .vibrantDark)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let container = NSVisualEffectView(frame: panel.contentView!.bounds)
@@ -229,36 +253,80 @@ final class TimerController: NSObject, NSMenuDelegate {
         container.wantsLayer = true
         container.layer?.cornerRadius = 14
         container.layer?.masksToBounds = true
+        container.layer?.borderWidth = 1
+        container.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.55).cgColor
         container.autoresizingMask = [.width, .height]
-
-        let label = NSTextField(labelWithString: text)
-        label.font = .systemFont(ofSize: 20, weight: .medium)
-        label.textColor = .labelColor
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            label.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 16),
-        ])
         panel.contentView = container
 
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
-        if let vis = screen?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(
-                x: vis.midX - width / 2,
-                y: vis.maxY - height - vis.height * 0.18
-            ))
-        }
-        panel.orderFrontRegardless()
-        hudPanel = panel
+        let message = NSTextField(labelWithString: "⏰  \(title) — time's up")
+        message.font = .systemFont(ofSize: 18, weight: .medium)
+        message.textColor = .labelColor
+        message.alignment = .center
+        message.lineBreakMode = .byTruncatingTail
+        message.frame = NSRect(x: 16, y: Self.reminderHeight - 44,
+                               width: Self.reminderWidth - 32, height: 28)
+        container.addSubview(message)
 
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            if self?.hudPanel === panel { self?.hudPanel = nil }
-            panel.orderOut(nil)
+        let buttonW: CGFloat = 150
+        let buttonH: CGFloat = 30
+        let buttonY: CGFloat = 14
+        let gap: CGFloat = 12
+
+        let snooze = NSButton(frame: NSRect(
+            x: Self.reminderWidth / 2 - buttonW - gap / 2,
+            y: buttonY, width: buttonW, height: buttonH))
+        snooze.bezelStyle = .rounded
+        snooze.title = "Snooze 5 min"
+        snooze.tag = id
+        snooze.target = self
+        snooze.action = #selector(snoozeReminderClicked(_:))
+        container.addSubview(snooze)
+
+        let dismiss = NSButton(frame: NSRect(
+            x: Self.reminderWidth / 2 + gap / 2,
+            y: buttonY, width: buttonW, height: buttonH))
+        dismiss.bezelStyle = .rounded
+        dismiss.title = "Dismiss"
+        dismiss.tag = id
+        dismiss.target = self
+        dismiss.action = #selector(dismissReminderClicked(_:))
+        container.addSubview(dismiss)
+
+        reminders.append(Reminder(id: id, panel: panel, label: rawLabel))
+        relayoutReminders()
+        panel.orderFrontRegardless()
+    }
+
+    /// Re-stack reminder cards from a fixed top-centre anchor so dismissing one
+    /// closes the gap. Newest cards sit lower in the stack.
+    private func relayoutReminders() {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let vis = screen.visibleFrame
+        let x = vis.midX - Self.reminderWidth / 2
+        let topY = vis.maxY - Self.reminderHeight - vis.height * 0.12
+        for (i, r) in reminders.enumerated() {
+            let y = topY - CGFloat(i) * (Self.reminderHeight + Self.reminderGap)
+            r.panel.setFrameOrigin(NSPoint(x: x, y: y))
         }
+    }
+
+    @objc private func snoozeReminderClicked(_ sender: NSButton) {
+        guard let r = reminders.first(where: { $0.id == sender.tag }) else { return }
+        let label = r.label
+        dismissReminder(id: sender.tag)
+        // Re-arm the same timer; it fires (and shows a fresh reminder) again
+        // after the snooze interval.
+        start(seconds: Self.snoozeSeconds, label: label)
+    }
+
+    @objc private func dismissReminderClicked(_ sender: NSButton) {
+        dismissReminder(id: sender.tag)
+    }
+
+    private func dismissReminder(id: Int) {
+        guard let idx = reminders.firstIndex(where: { $0.id == id }) else { return }
+        reminders[idx].panel.orderOut(nil)
+        reminders.remove(at: idx)
+        relayoutReminders()
     }
 }

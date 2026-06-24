@@ -3,11 +3,6 @@
 let
   resourceDir = ../core/Sources/MCMonadCore/Resources;
   launcherScript = ../scripts/mcmonad-launcher;
-  # Shipped as source and compiled on-device during home-manager activation
-  # (avoids a fragile C compile inside the Nix sandbox). Makes mcmonad-core
-  # its own TCC-responsible process so the Microphone/Speech prompt is
-  # attributed to com.mcmonad.core (which carries the usage strings).
-  tccSpawnSrc = ../scripts/mcmonad-tcc-spawn.c;
   coreEntitlements = ../core/mcmonad-core.entitlements;
 in
 
@@ -469,10 +464,7 @@ PLIST
     cp ${resourceDir}/MenuBarIcon.png "$APP/Resources/MenuBarIcon.png"
     cp "${resourceDir}/MenuBarIcon@2x.png" "$APP/Resources/MenuBarIcon@2x.png"
 
-    # TCC-disclaim spawn shim (source) + microphone entitlements. The shim is
-    # compiled and signed during home-manager activation (which has the CLT),
-    # not here — keeping a C toolchain out of the Nix build sandbox.
-    cp ${tccSpawnSrc} "$APP/Resources/mcmonad-tcc-spawn.c"
+    # Microphone/Speech entitlements — applied to MCMonadCore.app at sign time.
     cp ${coreEntitlements} "$APP/Resources/mcmonad-core.entitlements"
 
     # --- Ad-hoc codesign ---

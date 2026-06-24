@@ -62,32 +62,35 @@ maybe_rotate_logs() {
     log "rotated logs for $today (retaining ${LOG_RETAIN_DAYS} day(s))"
 }
 
-# Support both .app bundle (binaries alongside launcher) and home-manager
-# (paths passed via MCMONAD_CORE_BIN / MCMONAD_HASKELL_BIN env vars).
-CORE_BIN="${MCMONAD_CORE_BIN:-$APP_DIR/MacOS/mcmonad-core}"
+# mcmonad-core ships as a SEPARATE TOP-LEVEL app bundle (MCMonadCore.app,
+# sibling to MCMonad.app). It MUST be launched via LaunchServices (`open`) —
+# NOT exec'd as a bare binary — so TCC attributes its mic/speech request to its
+# own identity com.mcmonad.core, which has a computable code requirement and can
+# present + persist the prompt. A binary exec'd directly, or nested inside
+# MCMonad.app, is attributed to com.mcmonad.app (the bash launcher → no code
+# requirement → kTCCErrorDomain Code=5 → the prompt never renders). This was
+# proven empirically; see app-bundle.nix. MCMONAD_CORE_APP overrides the path.
+CORE_APP="${MCMONAD_CORE_APP:-$(cd "$APP_DIR/../.." 2>/dev/null && pwd)/MCMonadCore.app}"
+# Pattern that matches the running core process (for pgrep-based supervision,
+# since `open` detaches the launched app — we don't get a child pid).
+CORE_GREP="MCMonadCore.app/Contents/MacOS/mcmonad-core"
 DEFAULT_HASKELL_BIN="${MCMONAD_HASKELL_BIN:-$APP_DIR/MacOS/mcmonad}"
 
-# TCC-disclaim spawn shim. When present, mcmonad-core is launched through it
-# so the daemon is its OWN TCC-responsible process — otherwise macOS
-# attributes the Microphone/Speech permission prompt to this launcher (the
-# app bundle's main executable) rather than to com.mcmonad.core, and the
-# grant never sticks to the binary that carries the usage strings. Compiled
-# and signed during home-manager activation; absent for a raw .app, in which
-# case we spawn the core directly (mic prompt then attributes to the bundle).
-TCC_SPAWN="$APP_DIR/MacOS/mcmonad-tcc-spawn"
-
-# Spawn mcmonad-core (through the shim if available) backgrounded, with output
-# to the core log. Sets CORE_PID to the supervised pid (the shim's — it lives
-# exactly as long as core and forwards signals, so the death/restart and
-# cleanup logic is unchanged).
+# Launch mcmonad-core as an app via LaunchServices, redirecting its stdout/stderr
+# to the core log. `open` of an already-running app is a no-op, so this is safe
+# to call from the monitor loop to restart a dead core without ever spawning a
+# duplicate. No disclaim shim is needed: an LS-launched app is already its own
+# TCC-responsible process.
 start_core() {
-    if [ -x "$TCC_SPAWN" ]; then
-        "$TCC_SPAWN" "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
-    else
-        "$CORE_BIN" >> "$CORE_LOG" 2>&1 &
-    fi
-    CORE_PID=$!
+    open --stdout "$CORE_LOG" --stderr "$CORE_LOG" "$CORE_APP" 2>>"$LAUNCHER_LOG" \
+        || log "open '$CORE_APP' failed"
 }
+
+# Is a mcmonad-core process currently alive?
+core_alive() { pgrep -f "$CORE_GREP" >/dev/null 2>&1; }
+
+# Stop the LS-launched core (no child pid to kill — match by path).
+stop_core() { pkill -f "$CORE_GREP" 2>/dev/null || true; }
 
 # MCMONAD_GHC: path to a GHC that has the mcmonad library.
 # Set by home-manager module or derived from the app bundle below.
@@ -185,8 +188,9 @@ run_daemon() {
 
     cleanup() {
         log "Shutting down"
-        kill "$CORE_PID" "$HASKELL_PID" 2>/dev/null || true
-        wait "$CORE_PID" "$HASKELL_PID" 2>/dev/null || true
+        stop_core
+        kill "$HASKELL_PID" 2>/dev/null || true
+        wait "$HASKELL_PID" 2>/dev/null || true
         # Without this exit, the trap returns to run_daemon's while
         # loop, which sees the children dead, logs "X died, restarting"
         # and respawns them — orphaning the daemon from launchd. Exit
@@ -201,8 +205,8 @@ run_daemon() {
     # daemon rotates at the start of each new day without a restart.
     local tick=0
     while true; do
-        if ! kill -0 "$CORE_PID" 2>/dev/null; then
-            log "mcmonad-core died, restarting"
+        if ! core_alive; then
+            log "mcmonad-core not running, (re)launching"
             start_core
         fi
         if ! kill -0 "$HASKELL_PID" 2>/dev/null; then

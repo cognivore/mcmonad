@@ -12,6 +12,11 @@ let
   # user path and point launchd at that path so a single TCC entry per
   # binary is reused across rebuilds.
   bundlePath = "${homeDir}/Applications/MCMonad.app";
+  # mcmonad-core ships as a SEPARATE top-level app so TCC gives it its own
+  # identity (com.mcmonad.core) — required for the Microphone/Speech prompt to
+  # render. Nested inside MCMonad.app it was attributed to com.mcmonad.app (the
+  # bash launcher → kTCCErrorDomain Code=5, no prompt). The launcher `open`s it.
+  coreBundlePath = "${homeDir}/Applications/MCMonadCore.app";
 in
 {
   options.services.mcmonad = {
@@ -63,6 +68,11 @@ in
           --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
           ${app}/Applications/MCMonad.app/ \
           ${lib.escapeShellArg bundlePath}/
+        # mcmonad-core is a SEPARATE top-level app (own TCC identity).
+        run ${pkgs.rsync}/bin/rsync \
+          --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
+          ${app}/Applications/MCMonadCore.app/ \
+          ${lib.escapeShellArg coreBundlePath}/
 
         # Re-sign the bundle with a stable code identity so TCC grants
         # (Accessibility, Microphone, Speech Recognition) survive rebuilds.
@@ -118,15 +128,28 @@ in
             if [ -x "$tcc_bin" ]; then
                 /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$tcc_bin" 2>/dev/null || true
             fi
+            # Sign core's SEPARATE TOP-LEVEL bundle (MCMonadCore.app) — sealing
+            # the bundle is what gives com.mcmonad.core a stable, computable
+            # designated code requirement, so TCC can present and persist the
+            # mic/speech grant across rebuilds. (Top-level placement is what lets
+            # TCC attribute the request to com.mcmonad.core at all; nested inside
+            # MCMonad.app it resolved to com.mcmonad.app → Code=5, no prompt.)
             /usr/bin/codesign --force --sign "$mcmonad_sign_id" \
                 --entitlements "$mcmonad_app_contents/Resources/mcmonad-core.entitlements" \
-                "$mcmonad_app_contents/MacOS/mcmonad-core" 2>/dev/null || \
-                echo "mcmonad: codesign mcmonad-core with '$mcmonad_sign_id' failed; leaving adhoc" >&2
+                ${lib.escapeShellArg coreBundlePath} 2>/dev/null || \
+                echo "mcmonad: codesign MCMonadCore.app with '$mcmonad_sign_id' failed; leaving adhoc" >&2
         elif [ -x "$tcc_bin" ]; then
             # No stable cert: at least adhoc-sign the freshly compiled shim so
             # macOS will run it.
             /usr/bin/codesign --force --sign - "$tcc_bin" 2>/dev/null || true
         fi
+
+        # Register the top-level core app with LaunchServices so TCC resolves
+        # its identity to com.mcmonad.core on first launch (belt-and-suspenders;
+        # `open` also registers it, but doing it here makes the first prime's
+        # mic/speech request attribute correctly without a race).
+        lsreg=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+        [ -x "$lsreg" ] && "$lsreg" -f ${lib.escapeShellArg coreBundlePath} 2>/dev/null || true
 
         # Recompile the user's mcmonad.hs against the freshly installed
         # mcmonad library, so the Mod-q-compiled custom binary stays in

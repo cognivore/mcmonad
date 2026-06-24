@@ -30,9 +30,61 @@ pkgs.stdenv.mkDerivation {
 
     # --- Binaries ---
     cp ${mcmonad}/bin/mcmonad "$APP/MacOS/mcmonad"
-    cp ${mcmonad-core}/bin/mcmonad-core "$APP/MacOS/mcmonad-core"
     cp ${launcherScript} "$APP/MacOS/mcmonad-launcher"
-    chmod +x "$APP/MacOS/mcmonad-launcher" "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core"
+    chmod +x "$APP/MacOS/mcmonad-launcher" "$APP/MacOS/mcmonad"
+
+    # mcmonad-core ships as its OWN TOP-LEVEL .app bundle (sibling to
+    # MCMonad.app), NOT loose in MacOS/ and NOT nested inside MCMonad.app.
+    #
+    # Why this is load-bearing for voice (proven empirically in the unified log):
+    #   * Loose in MCMonad.app/Contents/MacOS or nested in Contents/Resources/,
+    #     TCC attributes the mic/speech request to the ENCLOSING bundle
+    #     com.mcmonad.app, whose CFBundleExecutable is the bash launcher. A shell
+    #     script can't be code-signed, so TCC cannot build a designated code
+    #     requirement → kTCCErrorDomain Code=5 "Failed to get code requirements"
+    #     → the prompt never renders and the grant can't be stored.
+    #   * Even launched via LaunchServices (`open`), a bundle nested in another
+    #     app's Contents/ is still owned by the outer app for TCC → Sub stays
+    #     com.mcmonad.app and the request is auto-denied.
+    #   * As a TOP-LEVEL bundle, TCC resolves Sub = com.mcmonad.core (its own
+    #     signed identity), the Microphone/Speech prompts render, and the grant
+    #     persists. (Confirmed: speechStatus=3, micGranted=true under
+    #     com.mcmonad.core once top-level.)
+    #
+    # core has zero /nix dylib deps (only system frameworks + the system Swift
+    # runtime), so it stands alone with no Frameworks/ fixup. The bash launcher
+    # `open`s this sibling app (LaunchServices launch) and supervises it.
+    CORE_APP="MCMonadCore.app/Contents"
+    mkdir -p "$CORE_APP/MacOS"
+    cp ${mcmonad-core}/bin/mcmonad-core "$CORE_APP/MacOS/mcmonad-core"
+    chmod +x "$CORE_APP/MacOS/mcmonad-core"
+    cat > "$CORE_APP/Info.plist" <<'COREPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.mcmonad.core</string>
+    <key>CFBundleName</key>
+    <string>mcmonad-core</string>
+    <key>CFBundleExecutable</key>
+    <string>mcmonad-core</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>mcmonad listens for voice commands to launch apps and set timers from the Spotlight launcher.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>mcmonad transcribes your voice commands on-device to launch apps and set timers from the Spotlight launcher.</string>
+</dict>
+</plist>
+COREPLIST
 
     # Capture the IPC protocol version from the freshly built binary
     # (its /nix/store dylib refs still resolve at this point in the
@@ -76,7 +128,9 @@ pkgs.stdenv.mkDerivation {
     }
 
     echo "Collecting dylib dependencies..."
-    DYLIBS=$(collect_dylibs "$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core")
+    # Only mcmonad (Haskell) carries /nix dylib deps; mcmonad-core links solely
+    # system frameworks + the system Swift runtime, so it is omitted here.
+    DYLIBS=$(collect_dylibs "$APP/MacOS/mcmonad")
 
     # Copy all dylibs into Frameworks/
     for dylib in $DYLIBS; do
@@ -104,11 +158,9 @@ pkgs.stdenv.mkDerivation {
       done
     }
 
-    # Rewrite the main binaries
+    # Rewrite the main binaries. (mcmonad-core has no /nix refs to rewrite.)
     echo "Rewriting rpaths in mcmonad..."
     rewrite_refs "$APP/MacOS/mcmonad"
-    echo "Rewriting rpaths in mcmonad-core..."
-    rewrite_refs "$APP/MacOS/mcmonad-core"
 
     # Rewrite the dylibs themselves (they reference each other via nix paths)
     for dylib in "$APP/Frameworks/"*.dylib; do
@@ -357,7 +409,7 @@ GHCWRAPPER
     echo ""
     echo "Verifying no remaining /nix/store references in binaries..."
     REMAINING=0
-    ALL_BINARIES=("$APP/MacOS/mcmonad" "$APP/MacOS/mcmonad-core")
+    ALL_BINARIES=("$APP/MacOS/mcmonad" "MCMonadCore.app/Contents/MacOS/mcmonad-core")
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && ALL_BINARIES+=("$tool")
     done
@@ -435,9 +487,13 @@ PLIST
       /usr/bin/codesign --force --sign - "$f"
     done
     /usr/bin/codesign --force --sign - "$APP/MacOS/mcmonad"
-    # Core carries the microphone entitlement (declared intent; enforced only
-    # under hardened runtime). home-manager re-signs it with a stable cert.
-    /usr/bin/codesign --force --sign - --entitlements ${coreEntitlements} "$APP/MacOS/mcmonad-core"
+    # Sign core's TOP-LEVEL bundle with the microphone entitlement. Signing the
+    # .app seals the bundle + its main executable, which gives com.mcmonad.core
+    # a computable designated code requirement — the thing TCC needs to present
+    # and persist the mic/speech grant. home-manager re-signs this bundle with a
+    # stable cert so the grant survives rebuilds.
+    /usr/bin/codesign --force --sign - --entitlements ${coreEntitlements} \
+      "MCMonadCore.app"
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && \
         /usr/bin/codesign --force --sign - "$tool"
@@ -455,6 +511,10 @@ PLIST
     runHook preInstall
     mkdir -p $out/Applications
     cp -r MCMonad.app $out/Applications/
+    # mcmonad-core ships as a SEPARATE top-level app (its own TCC identity
+    # com.mcmonad.core — required for the mic/speech prompt to render). The
+    # launcher inside MCMonad.app `open`s this sibling.
+    cp -r MCMonadCore.app $out/Applications/
     runHook postInstall
   '';
 

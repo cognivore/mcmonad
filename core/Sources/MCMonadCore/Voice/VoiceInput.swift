@@ -43,9 +43,18 @@ final class VoiceInput {
             let n = appended
             lock.unlock()
             r?.append(buffer)
-            // Diagnostic: confirm real audio is flowing from the mic tap.
+            // Diagnostic: confirm real audio is flowing — and that it isn't
+            // all-zero. macOS can report the mic as authorized yet feed a
+            // silent (all-zero) stream when the TCC grant didn't truly land at
+            // the HAL layer; logging peak amplitude distinguishes "no audio"
+            // from "silent audio" from "real audio".
             if n == 1 || n % 100 == 0 {
-                logger.info("tap: appended \(n) buffers (frames=\(buffer.frameLength))")
+                var peak: Float = 0
+                if let ch = buffer.floatChannelData?[0] {
+                    for i in 0..<Int(buffer.frameLength) { peak = max(peak, abs(ch[i])) }
+                }
+                let peakStr = String(format: "%.4f", peak)
+                logger.info("tap: appended \(n) buffers (frames=\(buffer.frameLength) peak=\(peakStr, privacy: .public))")
             }
         }
         func set(_ r: SFSpeechAudioBufferRecognitionRequest?) {
@@ -137,6 +146,21 @@ final class VoiceInput {
             return
         }
 
+        // The on-device model must be provisioned. On macOS < 26 there is no
+        // AssetInventory API to download it ourselves, and with the model
+        // absent `requiresOnDeviceRecognition = true` produces NO transcription
+        // — silently. We refuse to fall back to Apple's server recognition
+        // (the spoken command would leave the machine, breaking the on-device
+        // guarantee in this file's header), so fail fast with an actionable
+        // message instead of appearing to do nothing.
+        guard recognizer.supportsOnDeviceRecognition else {
+            Self.logger.error(
+                "voice: on-device recognition unsupported for locale \(recognizer.locale.identifier, privacy: .public) — model not installed; refusing server fallback"
+            )
+            onError?("On-device speech model isn’t installed — turn on Dictation for your language in System Settings ▸ Keyboard, then try ⌘L again.")
+            return
+        }
+
         let input = audioEngine.inputNode
         let format = input.outputFormat(forBus: 0)
         // A zero/invalid input format (no or busy mic device) makes installTap
@@ -147,7 +171,7 @@ final class VoiceInput {
         }
 
         Self.logger.info(
-            "voice start: speechAuth=\(SFSpeechRecognizer.authorizationStatus().rawValue, privacy: .public) micAuth=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue, privacy: .public) inFmt=\(format.sampleRate, privacy: .public)Hz x\(format.channelCount, privacy: .public)"
+            "voice start: speechAuth=\(SFSpeechRecognizer.authorizationStatus().rawValue, privacy: .public) micAuth=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue, privacy: .public) onDevice=\(recognizer.supportsOnDeviceRecognition, privacy: .public) locale=\(recognizer.locale.identifier, privacy: .public) inFmt=\(format.sampleRate, privacy: .public)Hz x\(format.channelCount, privacy: .public)"
         )
 
         let holder = self.holder
@@ -179,9 +203,9 @@ final class VoiceInput {
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
-            req.requiresOnDeviceRecognition = true
-        }
+        // `start()` already guaranteed on-device support, so keep recognition
+        // local unconditionally — spoken commands never leave the machine.
+        req.requiresOnDeviceRecognition = true
         holder.set(req)
 
         let recogLogger = Self.logger
@@ -197,7 +221,11 @@ final class VoiceInput {
                 recogLogger.info("recog \(isFinal ? "final" : "partial", privacy: .public): \(text, privacy: .public)")
             }
             if let error {
-                recogLogger.error("recog error: \(error.localizedDescription, privacy: .public)")
+                // Surface domain+code: kLSRErrorDomain 102 / kAFAssistantErrorDomain
+                // 1101/203 mean the on-device model is missing or unusable —
+                // the difference between "mic broken" and "model not installed".
+                let ns = error as NSError
+                recogLogger.error("recog error: domain=\(ns.domain, privacy: .public) code=\(ns.code, privacy: .public) \(error.localizedDescription, privacy: .public)")
             }
             Task { @MainActor in
                 guard let self else { return }

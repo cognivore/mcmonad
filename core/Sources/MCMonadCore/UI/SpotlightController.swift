@@ -770,12 +770,39 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         removeKeyMonitor()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
+            // ⌘L toggles voice from anywhere in the panel.
             if event.modifierFlags.contains(.command),
                event.charactersIgnoringModifiers?.lowercased() == "l" {
                 self.toggleVoice()
                 return nil
             }
-            return event
+            // While the search field's editor holds focus, its
+            // control(_:textView:doCommandBy:) drives navigation — leave it be
+            // so typing and the existing key handling are unchanged.
+            if let editor = self.searchField.currentEditor(),
+               self.panel?.firstResponder === editor {
+                return event
+            }
+            // Focus is elsewhere — typically the results table grabbed first
+            // responder on a mouse click. Route navigation keys here so Enter
+            // activates the (blue) selection, Esc cancels, and arrows/Tab keep
+            // working, instead of the table NSBeep'ing on an unhandled
+            // Return/Escape. This is what made mouse-then-keyboard feel "stuck".
+            switch event.keyCode {
+            case 36, 76:   // Return, keypad Enter
+                self.activateSelection(); return nil
+            case 53:       // Escape
+                self.cancel(); return nil
+            case 125:      // Down arrow
+                self.moveSelection(by: 1); return nil
+            case 126:      // Up arrow
+                self.moveSelection(by: -1); return nil
+            case 48:       // Tab (Shift-Tab cycles back)
+                self.cycleMode(forward: !event.modifierFlags.contains(.shift))
+                return nil
+            default:
+                return event
+            }
         }
     }
 

@@ -226,60 +226,65 @@ text = re.sub(r'/nix/store/[^\"]+/bin/([^\"]+)', r'/usr/bin/\1', text)
 open(sys.argv[1], 'w').write(text)
 " "$GHC_TOPDIR/settings"
 
-    # 4. Merge extra packages from ghcWithPackages into boot package DB
-    echo "  Merging extra package configs..."
-    GWP_PKGDB="$GHC_TOPDIR_SRC/package.conf.d"
-    BUNDLED_PKGDB="$GHC_TOPDIR/lib/package.conf.d"
-    mkdir -p "$GHC_TOPDIR/lib/packages"
+    # 4. Relocate the package DB off /nix/store.
+    #    `cp -rL "$GHC_LIBDIR"` above already placed every package's .hi/.a/.dylib
+    #    in-bundle under topdir/<dyn-platform>/<pkg-id>/ (GHC_LIBDIR is the
+    #    ghcWithPackages MERGED libdir, whose platform dir aggregates them). The
+    #    ONLY thing still wrong is that the .conf files keep pointing import-dirs/
+    #    library-dirs/dynamic-library-dirs at the original /nix/store paths — so
+    #    on a machine without that /nix/store, GHC can't find the library and
+    #    Mod-q silently does nothing. Repoint each .conf to its in-bundle home,
+    #    all relative to ''${pkgroot} (GHC expands it to the dir containing
+    #    package.conf.d == topdir) so the bundle works wherever it's installed.
+    #
+    #    (The previous implementation here was a silent no-op: it read $GWP_PKGDB
+    #    from an undefined $GHC_TOPDIR_SRC and wrote to $GHC_TOPDIR/lib/package.conf.d
+    #    which doesn't exist — so it rewrote zero configs and shipped a GHC whose
+    #    DB was full of dead /nix/store paths. See BUGREPORT-standalone-modq.)
+    echo "  Relocating package DB off /nix/store..."
+    BUNDLED_PKGDB=$(find "$GHC_TOPDIR" -maxdepth 2 -name package.conf.d -type d | head -1)
+    [ -n "$BUNDLED_PKGDB" ] || { echo "FATAL: bundled package.conf.d not found under $GHC_TOPDIR"; exit 1; }
+    echo "    package DB: $BUNDLED_PKGDB"
 
-    for conf in "$GWP_PKGDB"/*.conf; do
-      [ -f "$conf" ] || continue
-      base=$(basename "$conf")
-      if [ ! -f "$BUNDLED_PKGDB/$base" ]; then
-        cp "$conf" "$BUNDLED_PKGDB/$base"
-      fi
-    done
+    # The dynamic platform dir holds every libHS*.dylib (e.g.
+    # aarch64-osx-ghc-9.10.3-cb67). Derive it from a known boot dylib so the
+    # ABI-hash suffix is never hardcoded.
+    DYNDIR=$(basename "$(dirname "$(find "$GHC_TOPDIR" -name 'libHSbase-*.dylib' -type f | head -1)")")
+    [ -n "$DYNDIR" ] || { echo "FATAL: could not locate the dynamic platform dir (libHSbase*.dylib)"; exit 1; }
+    echo "    dynamic platform dir: $DYNDIR"
 
-    # 5. Rewrite all package .conf files: replace Nix store paths with
-    #    ''${pkgroot} relative paths. Boot package libs are already in the
-    #    copied libdir; extra package libs get copied into lib/packages/.
-    echo "  Rewriting package configs and copying libraries..."
-    BOOT_LIB_PREFIX="$GHC_LIBDIR"
-    # Construct the GHC ''${pkgroot} variable as a shell string
-    PKGROOT=''$'\x24{pkgroot}'
+    # literal ''${pkgroot}; GHC expands it at load time. Built via printf so the
+    # ''${ neither triggers nix interpolation nor bash variable expansion.
+    PKGROOT=$(printf '%s{pkgroot}' '$')
 
     for conf in "$BUNDLED_PKGDB"/*.conf; do
       [ -f "$conf" ] || continue
-
-      # Find all Nix store directory paths referenced in this conf
-      nix_paths=$(grep -oE '/nix/store/[a-z0-9]+-[^"]+' "$conf" | sort -u || true)
-
-      for nix_path in $nix_paths; do
-        # Skip non-directory paths (e.g. file references)
-        [ -d "$nix_path" ] || continue
-
-        if [[ "$nix_path" == "$BOOT_LIB_PREFIX/"* ]]; then
-          # Boot package: already in the bundle at the same relative position
-          rel="''${nix_path#"$BOOT_LIB_PREFIX/"}"
-          sed -i '''' "s|$nix_path|$PKGROOT/$rel|g" "$conf"
-        else
-          # Extra package: copy into lib/packages/<dirname>/ and rewrite
-          pkg_leaf=$(basename "$nix_path")
-          pkg_dest="$GHC_TOPDIR/lib/packages/$pkg_leaf"
-          if [ ! -d "$pkg_dest" ]; then
-            mkdir -p "$pkg_dest"
-            cp -rL "$nix_path"/* "$pkg_dest/" 2>/dev/null || true
-          fi
-          sed -i '''' "s|$nix_path|$PKGROOT/packages/$pkg_leaf|g" "$conf"
-        fi
-      done
+      # Four ordered rewrites per conf — (1) before (3) so the 'links' path isn't
+      # half-eaten by the bare '/lib' rule; (2) before (3) so the Haskell
+      # '/lib/ghc-<ver>/lib/' prefix wins:
+      #   (1) ghcWithPackages 'links' aggregate dir -> in-bundle dynamic platform
+      #       dir (holds every libHS*.dylib).
+      #   (2) any '<store>/lib/ghc-<ver>/lib/' Haskell prefix -> ''${pkgroot}
+      #       (topdir mirrors that layout — the files are already here).
+      #   (3) remaining C-library '<store>/lib' dirs -> Contents/Frameworks.
+      #   (4) anything else still under /nix/store (include/data/haddock) -> the
+      #       same Frameworks dir; harmless, and makes the bundle provably /nix-free.
+      # Written to a temp file then mv'd: BSD in-place sed needs an empty backup
+      # arg that is hazardous to quote inside a nix indented string (the previous
+      # form rendered to broken bash and silently no-op'd the whole relocation).
+      sed \
+        -e "s|/nix/store/[^/[:space:]]*-with-packages/lib/links|$PKGROOT/$DYNDIR|g" \
+        -e "s|/nix/store/[^/[:space:]]*/lib/ghc-$GHC_VERSION/lib/|$PKGROOT/|g" \
+        -e "s|/nix/store/[^/[:space:]]*/lib|$PKGROOT/../../Frameworks|g" \
+        -e "s|/nix/store/[^[:space:]]*|$PKGROOT/../../Frameworks|g" \
+        "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
     done
 
-    # 6. Recache the package DB
+    # 5. Recache the relocated DB. Fail loudly — a broken DB here is the exact
+    #    regression that shipped a Mod-q which silently did nothing.
     echo "  Recaching package DB..."
     REAL_GHC_PKG=$(dirname "$REAL_GHC_BIN")/ghc-pkg
-    $REAL_GHC_PKG --global-package-db "$BUNDLED_PKGDB" recache 2>/dev/null || \
-      echo "  Warning: ghc-pkg recache returned non-zero (may be ok)"
+    "$REAL_GHC_PKG" --global-package-db "$BUNDLED_PKGDB" recache
 
     # 7. Collect dylib dependencies for GHC binary + support tools
     echo "  Collecting GHC dylib dependencies..."
@@ -313,11 +318,21 @@ open(sys.argv[1], 'w').write(text)
       rewrite_refs "$dylib"
     done
 
-    # 9. Create GHC wrapper script
+    # 9. Create the GHC wrapper. Beyond -B (the relocated topdir with settings +
+    #    package DB), it injects the bundle's Frameworks and dynamic-platform
+    #    dirs as both link search paths (-L) and runtime rpaths (-optl-Wl,-rpath),
+    #    so a config compiled to ~/.config/mcmonad/ links the bundled C libs
+    #    (X11/Xft/…) and loads them at runtime no matter where the .app is
+    #    installed. $DYNDIR is baked in at build time; \$DIR is resolved at
+    #    runtime from the wrapper's own location.
     cat > "$APP/MacOS/mcmonad-ghc" <<GHCWRAPPER
 #!/bin/bash
 DIR="\$(cd "\$(dirname "\$0")/.." && pwd)"
-exec "\$DIR/GHC/bin/ghc" -B"\$DIR/GHC/topdir" "\$@"
+exec "\$DIR/GHC/bin/ghc" -B"\$DIR/GHC/topdir" \\
+    -L"\$DIR/Frameworks" \\
+    -optl-Wl,-rpath,"\$DIR/Frameworks" \\
+    -optl-Wl,-rpath,"\$DIR/GHC/topdir/$DYNDIR" \\
+    "\$@"
 GHCWRAPPER
     chmod +x "$APP/MacOS/mcmonad-ghc"
 
@@ -399,6 +414,38 @@ GHCWRAPPER
     fi
 
     # ===================================================================
+    # §4 — make the bundled C libs linkable + loadable from an OUT-OF-BUNDLE
+    #      binary (the Mod-q-compiled ~/.config/mcmonad/mcmonad-<arch>-darwin,
+    #      which lives outside the .app). Two problems, two fixes:
+    #   * `ld -lXft` looks for libXft.dylib, but we only ship libXft.2.dylib
+    #     -> add unversioned dev symlinks.
+    #   * @executable_path install names resolve relative to the binary being
+    #     run; for ~/.config/mcmonad/… that's ~/.config/Frameworks (wrong)
+    #     -> give every Frameworks dylib an @rpath id, and have the mcmonad-ghc
+    #        wrapper inject the matching absolute -L/-rpath at link time.
+    #   In-bundle consumers (mcmonad, the GHC tools, topdir dylibs) reference
+    #   these via explicit @executable_path/@loader_path load commands recorded
+    #   at bundle time, which the id change does not disturb.
+    # ===================================================================
+    echo ""
+    echo "=== §4: making Frameworks dylibs linkable from outside the bundle ==="
+    echo "  Adding unversioned dev symlinks (libXft.2.dylib -> libXft.dylib)..."
+    for dylib in "$APP/Frameworks/"*.dylib; do
+      [ -L "$dylib" ] && continue
+      base=$(basename "$dylib")
+      unversioned=$(echo "$base" | sed -E 's/(\.[0-9]+)+\.dylib$/.dylib/')
+      if [ "$unversioned" != "$base" ] && [ ! -e "$APP/Frameworks/$unversioned" ]; then
+        ln -s "$base" "$APP/Frameworks/$unversioned"
+      fi
+    done
+    echo "  Setting @rpath install names on Frameworks dylibs..."
+    for dylib in "$APP/Frameworks/"*.dylib; do
+      [ -L "$dylib" ] && continue
+      base=$(basename "$dylib")
+      install_name_tool -id "@rpath/$base" "$dylib" 2>/dev/null || true
+    done
+
+    # ===================================================================
     # Verify no remaining /nix/store references in load commands
     # ===================================================================
     echo ""
@@ -430,6 +477,28 @@ GHCWRAPPER
       exit 1
     fi
     echo "All clear."
+
+    # --- §3 fix: the otool guard above inspects only Mach-O load commands. The
+    #     ORIGINAL regression — a package DB whose import-dirs all pointed at dead
+    #     /nix/store paths — has no Mach-O footprint, so it sailed through and
+    #     shipped a GHC that silently couldn't compile any config. Guard the DB
+    #     text too, AND prove every package resolves its files in-bundle. ---
+    echo "Verifying the package DB is /nix-free and resolves in-bundle..."
+    DB_NIXREFS=$(grep -l '/nix/store' "$BUNDLED_PKGDB"/*.conf 2>/dev/null || true)
+    if [ -n "$DB_NIXREFS" ]; then
+      echo "FATAL: these package .conf files still reference /nix/store:"
+      echo "$DB_NIXREFS"
+      echo "       A standalone .app would fail to recompile user configs (Mod-q)."
+      exit 1
+    fi
+    DB_BADPKGS=$("$REAL_GHC_PKG" --global-package-db "$BUNDLED_PKGDB" check 2>&1 \
+                   | grep -iE 'cannot find|missing|unusable' || true)
+    if [ -n "$DB_BADPKGS" ]; then
+      echo "FATAL: bundled package DB does not resolve in-bundle:"
+      echo "$DB_BADPKGS"
+      exit 1
+    fi
+    echo "Package DB OK — self-contained."
 
     # --- Info.plist ---
     cat > "$APP/Info.plist" <<'PLIST'
@@ -476,6 +545,7 @@ PLIST
     # signature Nix gave them.
     echo "Codesigning..."
     for f in "$APP/Frameworks/"*.dylib; do
+      [ -L "$f" ] && continue   # skip the unversioned dev symlinks (§4)
       /usr/bin/codesign --force --sign - "$f"
     done
     /usr/bin/codesign --force --sign - "$APP/MacOS/mcmonad"

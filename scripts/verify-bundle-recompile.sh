@@ -31,7 +31,10 @@ if [ -z "$APP" ]; then
   done
 fi
 [ -n "$APP" ] && [ -d "$APP" ] || fail "MCMonad.app not found (pass its path as \$1)"
-APP="${APP%/}"
+# Canonicalize to an ABSOLUTE path: step 2 compiles from `cd /`, so a relative
+# bundle path (e.g. CI's "result/Applications/MCMonad.app") would resolve to
+# /result/... and vanish. cd+pwd is portable (no readlink -f dependency).
+APP="$(cd "$APP" && pwd)"
 CONTENTS="$APP/Contents"
 GHC="$CONTENTS/MacOS/mcmonad-ghc"
 PKGDB="$CONTENTS/GHC/topdir/package.conf.d"

@@ -41,10 +41,19 @@ jobs:
           if [ "$FAIL" -eq 1 ]; then exit 1; fi
           echo "Verification passed"
 
+      - name: Verify standalone recompile works (no /nix needed)
+        run: |
+          chmod +x scripts/verify-bundle-recompile.sh
+          scripts/verify-bundle-recompile.sh result/Applications/MCMonad.app
+
       - name: Package
         run: |
+          # Ship BOTH top-level bundles. MCMonadCore.app is a separate top-level
+          # app (its own TCC identity com.mcmonad.core) — without it the mic /
+          # voice input can't get a Microphone/Speech grant on the user's Mac.
           cp -r result/Applications/MCMonad.app .
-          zip -r "MCMonad-${{ github.ref_name }}-arm64.zip" MCMonad.app
+          cp -r result/Applications/MCMonadCore.app .
+          zip -r "MCMonad-${{ github.ref_name }}-arm64.zip" MCMonad.app MCMonadCore.app
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

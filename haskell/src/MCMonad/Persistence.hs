@@ -45,7 +45,7 @@ import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import qualified XMonad.StackSet as W
 
-import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..))
+import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..), Timer(..))
 
 -- ---------------------------------------------------------------------------
 -- Persistence format
@@ -60,7 +60,7 @@ import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..))
 -- 'ssVersion' on load; any mismatch or parse failure renames the
 -- stale file aside and starts fresh.
 persistenceVersion :: Int
-persistenceVersion = 2
+persistenceVersion = 3
 
 -- | A workspace stack zipper, generalised over the window type.
 -- 'ssUp' is reverse-ordered relative to display order, matching
@@ -85,6 +85,12 @@ data SerialState a = SerialState
       -- ^ Floating window positions as (x, y, w, h) rationals.
     , ssAffinity   :: ![(String, Int)]
       -- ^ Serialised workspace -> screen-id affinity map.
+    , ssTimers     :: ![Timer]
+      -- ^ Running countdown timers, so they resume after a restart.
+      -- Independent of the window type @a@. See "MCMonad.Core".'Timer'.
+    , ssNextTimerId :: !Int
+      -- ^ The brain's monotonic timer-id counter ('MCMonad.Core.nextTimerId'),
+      -- saved so restored ids never collide with freshly-issued ones.
     } deriving (Eq, Show, Read)
 -- Functor/Foldable/Traversable not derivable here because 'a' sits
 -- in the first slot of the 'ssFloating' tuple. We don't need a
@@ -93,13 +99,16 @@ data SerialState a = SerialState
 -- ---------------------------------------------------------------------------
 -- Snapshot
 
--- | Take a 'WindowSet' (plus its affinity map) to a 'SerialState'.
--- All windows are referenced by 'WindowRef' — the on-disk identity.
+-- | Take a 'WindowSet' (plus its affinity map and the running timer
+-- list) to a 'SerialState'. All windows are referenced by 'WindowRef'
+-- — the on-disk identity.
 windowSetToSerial
     :: W.StackSet String l WindowRef ScreenId ScreenDetail
     -> Map.Map String ScreenId
+    -> [Timer]                             -- ^ from @MState.timers@
+    -> Int                                 -- ^ from @MState.nextTimerId@
     -> SerialState WindowRef
-windowSetToSerial ws aff = SerialState
+windowSetToSerial ws aff timers' nextTimerId' = SerialState
     { ssVersion    = persistenceVersion
     , ssStacks     = map serWsp allWsps
     , ssCurrentTag = W.tag (W.workspace (W.current ws))
@@ -108,6 +117,8 @@ windowSetToSerial ws aff = SerialState
         | (w, W.RationalRect rx ry rw rh) <- Map.toList (W.floating ws)
         ]
     , ssAffinity   = [(tag, n) | (tag, S n) <- Map.toList aff]
+    , ssTimers     = timers'
+    , ssNextTimerId = nextTimerId'
     }
   where
     allWsps = map W.workspace (W.current ws : W.visible ws) ++ W.hidden ws

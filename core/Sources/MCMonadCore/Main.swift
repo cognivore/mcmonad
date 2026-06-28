@@ -254,8 +254,35 @@ struct MCMonadCoreApp {
         spotlight.onFocusWindow = { [weak socketServer] wid, pid in
             socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
         }
-        spotlight.onStartTimer = { [weak timerController] seconds, label in
-            timerController?.start(seconds: seconds, label: label)
+        // Starting a timer is a state change: report it to the brain (which
+        // stamps the current workspace, assigns an id, persists it, and pushes
+        // the list back via set-timers). No origin workspace here — the brain
+        // uses whatever is current.
+        spotlight.onStartTimer = { [weak socketServer] seconds, label in
+            socketServer?.send(.timerStart(seconds: seconds, label: label, workspace: nil))
+        }
+
+        // TimerController is a pure renderer/clock; its state arrives via the
+        // set-timers command, and every user action flows back to the brain.
+        executor.onSetTimers = { [weak timerController] timers in
+            timerController?.setTimers(timers)
+        }
+        timerController.onFired = { [weak socketServer] id in
+            socketServer?.send(.timerFired(id: id))
+        }
+        timerController.onCancel = { [weak socketServer] id in
+            socketServer?.send(.timerCancel(id: id))
+        }
+        timerController.onCancelAll = { [weak socketServer] in
+            socketServer?.send(.timerCancelAll)
+        }
+        // Snooze re-arms via the brain so the copy keeps its origin workspace.
+        timerController.onSnooze = { [weak socketServer] seconds, label, workspace in
+            socketServer?.send(.timerStart(seconds: seconds, label: label, workspace: workspace))
+        }
+        // "Jump to workspace" reuses the menubar workspace-switch path.
+        timerController.onJumpToWorkspace = { [weak socketServer] tag in
+            socketServer?.send(.menuViewWorkspace(tag: tag))
         }
         statusBar.onSearchWindows = { [weak spotlight] in
             spotlight?.show(mode: .window)

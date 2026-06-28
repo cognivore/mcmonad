@@ -24,6 +24,10 @@ module MCMonad.Operations
       -- * Restart
     , restart
     , recompile
+      -- * Timers
+    , pushTimers
+    , syncTimers
+    , nowEpoch
       -- * State persistence
     , saveStateIO
     , loadStateIO
@@ -45,6 +49,7 @@ import Data.Monoid (Endo(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Time.Clock (NominalDiffTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
@@ -272,8 +277,10 @@ windows f = do
     when shouldSave $ do
         ws' <- gets windowset
         aff' <- gets affinity
+        ts' <- gets timers
+        nid' <- gets nextTimerId
         modify $ \s -> s { lastSaveAt = Just now }
-        io $ saveStateIO ws' aff'
+        io $ saveStateIO ws' aff' ts' nid'
 
 -- | Maximum frequency for 'windows'-driven persistence writes. The
 -- 'restart' path bypasses this — the final snapshot before Mod-q's
@@ -555,6 +562,49 @@ spawn cmd = io $ void $ forkIO $ void $
         }
 
 -- ---------------------------------------------------------------------------
+-- Timers
+--
+-- Timers are owned by the brain (state of record) but rendered + clocked
+-- by mcmonad-core. The brain holds the canonical list in 'MState.timers';
+-- whenever it changes, 'pushTimers' ships the full list to the daemon (which
+-- redraws the menubar countdown and re-arms its 1-second fire tick) and
+-- 'syncTimers' additionally persists it so the timers survive a Mod-q /
+-- launchd restart. The daemon detects fire from its own wall clock and
+-- reports it back as a 'MCMonad.IPC.TimerFired' event; the handler in
+-- "MCMonad.Main" then drops the timer and re-syncs.
+
+-- | Current wall-clock time as POSIX epoch seconds (UTC). Matches the
+-- daemon's @Date().timeIntervalSince1970@ exactly, so a 'Timer.tmFireAt'
+-- computed here lines up with mcmonad-core's countdown.
+nowEpoch :: IO Double
+nowEpoch = realToFrac <$> getPOSIXTime
+
+-- | Ship the current timer list to mcmonad-core for rendering and firing.
+-- Called on startup (to resume restored timers) and after every timer
+-- mutation. Sends the full list — the daemon treats it as authoritative.
+pushTimers :: M ()
+pushTimers = do
+    conn <- asks connection
+    ts   <- gets timers
+    io $ sendCommand conn (SetTimers ts)
+
+-- | Persist the timer list right now, alongside window state. Unthrottled
+-- (unlike the 'windows' save path): timer edits are infrequent and must
+-- survive an immediate crash or restart.
+saveTimersIO :: M ()
+saveTimersIO = do
+    ws  <- gets windowset
+    aff <- gets affinity
+    ts  <- gets timers
+    nid <- gets nextTimerId
+    io $ saveStateIO ws aff ts nid
+
+-- | Resync after a timer mutation: push the new list to the daemon and
+-- persist it. The single funnel every timer event handler calls.
+syncTimers :: M ()
+syncTimers = pushTimers >> saveTimersIO
+
+-- ---------------------------------------------------------------------------
 -- State persistence
 
 -- | Atomically write the current 'WindowSet' (plus affinity) to
@@ -568,9 +618,11 @@ spawn cmd = io $ void $ forkIO $ void $
 saveStateIO
     :: WindowSet
     -> M.Map String ScreenId
+    -> [Timer]
+    -> Int
     -> IO ()
-saveStateIO ws aff = do
-    let snapshot = windowSetToSerial ws aff
+saveStateIO ws aff timers' nextTimerId' = do
+    let snapshot = windowSetToSerial ws aff timers' nextTimerId'
     sf <- getStateFile
     let tmp = sf ++ ".tmp"
     (do writeFile tmp (show snapshot)
@@ -690,9 +742,11 @@ restart = do
     -- 1. Serialise state
     ws <- gets windowset
     aff <- gets affinity
+    ts <- gets timers
+    nid <- gets nextTimerId
     io $ do
         sf <- getStateFile
-        saveStateIO ws aff
+        saveStateIO ws aff ts nid
         hPutStrLn stderr $ "mcmonad: state written to " ++ sf
 
     -- 2. Recompile

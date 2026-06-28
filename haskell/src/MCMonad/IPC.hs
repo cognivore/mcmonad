@@ -46,7 +46,7 @@ import System.Directory (getHomeDirectory)
 import System.FilePath ((</>))
 import System.IO (hSetBuffering, BufferMode(..), hFlush, hPutStrLn, IOMode(..), stderr)
 
-import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..))
+import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..))
 
 -- ---------------------------------------------------------------------------
 -- Protocol version
@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..))
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 8
+protocolVersion = 9
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -100,6 +100,12 @@ data Command
       -- behaves like 'ShowWindowPicker'. @Tab@ cycles modes once open.
       -- Window selection returns as a 'MenuFocusWindow' event; app launch
       -- and timers are handled daemon-side and need no reply.
+    | SetTimers [Timer]
+      -- ^ Authoritative list of running countdown timers. The brain owns
+      -- timer state and resends the whole list whenever it changes (and
+      -- once on startup, to resume restored timers); the daemon renders
+      -- the menubar countdown from it and fires reminders off its own
+      -- clock. See 'MCMonad.Core.Timer' and 'MCMonad.Operations.pushTimers'.
     deriving (Show, Generic)
 
 -- | One window entry in the menubar / debug overlay snapshot.
@@ -261,6 +267,20 @@ instance Aeson.ToJSON Command where
         [ "cmd"  .= ("show-spotlight" :: Text)
         , "mode" .= mode
         ]
+    toJSON (SetTimers ts) = Aeson.object
+        [ "cmd"    .= ("set-timers" :: Text)
+        , "timers" .= map timerJSON ts
+        ]
+
+-- | Wire encoding of one 'Timer'. 'tmFireAt' is absolute POSIX epoch
+-- seconds so the daemon's countdown matches @Date().timeIntervalSince1970@.
+timerJSON :: Timer -> Aeson.Value
+timerJSON t = Aeson.object
+    [ "id"        .= tmId t
+    , "label"     .= tmLabel t
+    , "fireAt"    .= tmFireAt t
+    , "workspace" .= tmWorkspace t
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Events (Swift -> Haskell)
@@ -291,6 +311,18 @@ data Event
     | MenuToggleDebug
     | MenuFocusWindow !Word32 !Int32
     | MenuViewWorkspace !String
+    | TimerStart !Double !String !(Maybe String)
+      -- ^ Request to start a countdown: @seconds@, @label@, and an
+      -- optional origin workspace tag. The Spotlight launcher omits the
+      -- workspace (the brain stamps the current tag); the reminder HUD's
+      -- Snooze carries the original tag so the snoozed copy keeps it.
+    | TimerFired !Int
+      -- ^ The daemon's clock reached a timer's deadline (by id). The
+      -- brain drops it from state so it doesn't resurrect on restart.
+    | TimerCancel !Int
+      -- ^ The user cancelled a still-running timer from the menubar (by id).
+    | TimerCancelAll
+      -- ^ The user cancelled every running timer from the menubar.
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
@@ -374,6 +406,10 @@ instance Aeson.FromJSON Event where
                 "menu-toggle-debug"    -> pure MenuToggleDebug
                 "menu-focus-window"    -> MenuFocusWindow <$> v .: "windowId" <*> v .: "pid"
                 "menu-view-workspace"  -> MenuViewWorkspace <$> v .: "tag"
+                "timer-start"          -> TimerStart <$> v .: "seconds" <*> v .: "label" <*> v .:? "workspace"
+                "timer-fired"          -> TimerFired <$> v .: "id"
+                "timer-cancel"         -> TimerCancel <$> v .: "id"
+                "timer-cancel-all"     -> pure TimerCancelAll
                 "ready"                -> pure Ready
                 other                  -> pure (IgnoredEvent other)
             (_, Just resp) -> case resp of

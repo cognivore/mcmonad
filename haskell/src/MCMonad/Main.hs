@@ -5,6 +5,7 @@ module MCMonad.Main
 
 import Control.Monad (forever, when)
 import Data.List (find)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
@@ -81,12 +82,13 @@ launch cfg = do
     --    match anything and every window goes through the manage
     --    hook — see 'MCMonad.Persistence' for the design.
     mSaved <- restoreSnapshot cfg screens existingWindows
-    let (ws0, restoredAffinity, unmatchedLives) = case mSaved of
-            Just (ws, aff, leftovers) ->
-                (ws, aff, leftovers)
-            Nothing ->
-                let ws = buildInitialWindowSet cfg screens
-                in  (ws, initialAffinities ws, existingWindows)
+    let (ws0, restoredAffinity, unmatchedLives, restoredTimers, restoredNextTimerId) =
+            case mSaved of
+                Just (ws, aff, leftovers, tms, nid) ->
+                    (ws, aff, leftovers, tms, nid)
+                Nothing ->
+                    let ws = buildInitialWindowSet cfg screens
+                    in  (ws, initialAffinities ws, existingWindows, [], 1)
 
     let mconf = MConf { connection = conn }
         -- Seed the metadata cache from the daemon's enumeration of
@@ -111,6 +113,8 @@ launch cfg = do
                        , windowMetadata = seededMetadata
                        , debugOverlays = False
                        , lastSaveAt = Nothing
+                       , timers = restoredTimers
+                       , nextTimerId = restoredNextTimerId
                        , focusIntent = Nothing
                        }
 
@@ -122,6 +126,13 @@ launch cfg = do
         let hook = manageHook cfg
         mapM_ (\wi -> manageSilent wi hook) unmatchedLives
         windows id
+
+        -- Resume any restored countdown timers: push the persisted list
+        -- to mcmonad-core so the menubar countdown and reminder firing
+        -- pick up where they left off across a Mod-q / launchd restart.
+        -- On a fresh start this sends an empty list, which is a harmless
+        -- no-op (the daemon tears down its timer status item).
+        pushTimers
 
         -- Push the initial debug-overlay state to mcmonad-core. The
         -- daemon defaults to "overlay off" but we send the explicit
@@ -139,10 +150,10 @@ launch cfg = do
 
 -- | Try to restore a previous snapshot.
 --
--- Returns the rebuilt 'WindowSet', the restored affinity map, and
--- the list of live windows that did NOT appear in the saved state
--- (those go through the manage hook). Returns 'Nothing' when no
--- save file exists.
+-- Returns the rebuilt 'WindowSet', the restored affinity map, the
+-- list of live windows that did NOT appear in the saved state (those
+-- go through the manage hook), the restored timer list, and the saved
+-- monotonic timer-id counter. Returns 'Nothing' when no save file exists.
 --
 -- Identity is exact 'WindowRef' equality: a saved window survives
 -- restore iff its @(wid, pid)@ pair appears in the live window list
@@ -155,7 +166,7 @@ restoreSnapshot
     :: MConfig Layout
     -> [ScreenInfo]
     -> [WindowInfo]
-    -> IO (Maybe (WindowSet, Map.Map String ScreenId, [WindowInfo]))
+    -> IO (Maybe (WindowSet, Map.Map String ScreenId, [WindowInfo], [Timer], Int))
 restoreSnapshot cfg screens existingWindows = do
     mSaved <- loadStateIO
     case mSaved of
@@ -196,7 +207,7 @@ restoreSnapshot cfg screens existingWindows = do
                 ++ show (length (W.allWindows ws))
                 ++ " window(s); " ++ show (length staleSaved) ++ " stale; "
                 ++ show (length unmatched) ++ " new"
-            return $ Just (ws, aff, unmatched)
+            return $ Just (ws, aff, unmatched, ssTimers saved, ssNextTimerId saved)
   where
     -- A saved snapshot may carry workspace tags that don't exist in
     -- the current config (the user renamed a workspace). Drop them
@@ -400,6 +411,38 @@ handleEvent debug cfg hotkeyIdMap evt = do
                                      : map W.workspace (W.visible ws)
                                      ++ W.hidden ws)
             when (tag `elem` allTags) $ windows (W.greedyView tag)
+
+        -- Timers. The brain owns timer state; mcmonad-core renders + clocks
+        -- it. All four handlers funnel through 'syncTimers' (push to the
+        -- daemon + persist) so the list survives a Mod-q / launchd restart.
+        TimerStart seconds label mWorkspace -> do
+            now <- io nowEpoch
+            ws  <- gets windowset
+            nid <- gets nextTimerId
+            -- Stamp the origin workspace: the snoozed copy carries the
+            -- original tag; a fresh Spotlight timer inherits whatever is
+            -- current right now (so "Jump to workspace" returns there).
+            let curTag = W.tag (W.workspace (W.current ws))
+                t = Timer { tmId        = nid
+                          , tmLabel     = label
+                          , tmFireAt    = now + seconds
+                          , tmWorkspace = fromMaybe curTag mWorkspace
+                          }
+            modify $ \s -> s { timers = timers s ++ [t]
+                             , nextTimerId = nid + 1 }
+            syncTimers
+
+        TimerFired tid -> do
+            modify $ \s -> s { timers = filter ((/= tid) . tmId) (timers s) }
+            syncTimers
+
+        TimerCancel tid -> do
+            modify $ \s -> s { timers = filter ((/= tid) . tmId) (timers s) }
+            syncTimers
+
+        TimerCancelAll -> do
+            modify $ \s -> s { timers = [] }
+            syncTimers
 
         -- Events that arrive during init or are not actionable
         Ready                   -> return ()

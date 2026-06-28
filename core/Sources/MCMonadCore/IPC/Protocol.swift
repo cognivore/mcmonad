@@ -133,6 +133,21 @@ struct HotkeySpec: Codable, Sendable {
     let modifiers: UInt32
 }
 
+// MARK: - TimerSpec (one running countdown; Haskell -> Swift)
+
+/// One countdown timer in a `set-timers` command. The Haskell brain owns
+/// timer state and is authoritative; the daemon renders the menubar
+/// countdown from this and fires the reminder when `fireAt` passes.
+/// `fireAt` is absolute POSIX epoch seconds (UTC) — directly comparable to
+/// `Date().timeIntervalSince1970`. `workspace` is the tag the timer was
+/// started from, used by the reminder's "Jump to workspace" button.
+struct TimerSpec: Codable, Sendable {
+    let id: Int
+    let label: String
+    let fireAt: Double
+    let workspace: String
+}
+
 // MARK: - Overlay/Menu snapshot (Haskell -> Swift)
 
 /// One window's entry in the workspace tree + debug overlay snapshot.
@@ -257,6 +272,10 @@ enum IPCEvent: Encodable, Sendable {
     case menuFocusWindow(windowId: UInt32, pid: Int32)
     case menuViewWorkspace(tag: String)
     case focusedWindowQueryResponse(windowId: UInt32, pid: Int32)
+    case timerStart(seconds: Double, label: String, workspace: String?)
+    case timerFired(id: Int)
+    case timerCancel(id: Int)
+    case timerCancelAll
     case ready
 
     func encode(to encoder: Encoder) throws {
@@ -319,6 +338,19 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode("focused-window-query-response", forKey: .event)
             try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
+        case .timerStart(let seconds, let label, let workspace):
+            try container.encode("timer-start", forKey: .event)
+            try container.encode(seconds, forKey: .seconds)
+            try container.encode(label, forKey: .label)
+            try container.encodeIfPresent(workspace, forKey: .workspace)
+        case .timerFired(let id):
+            try container.encode("timer-fired", forKey: .event)
+            try container.encode(id, forKey: .id)
+        case .timerCancel(let id):
+            try container.encode("timer-cancel", forKey: .event)
+            try container.encode(id, forKey: .id)
+        case .timerCancelAll:
+            try container.encode("timer-cancel-all", forKey: .event)
         case .ready:
             try container.encode("ready", forKey: .event)
         }
@@ -343,6 +375,7 @@ enum IPCCommand: Decodable, Sendable {
     case queryFocusedWindow
     case showWindowPicker
     case showSpotlight(mode: String)
+    case setTimers(timers: [TimerSpec])
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -360,6 +393,7 @@ enum IPCCommand: Decodable, Sendable {
         case queryFocusedWindow = "query-focused-window"
         case showWindowPicker = "show-window-picker"
         case showSpotlight = "show-spotlight"
+        case setTimers = "set-timers"
     }
 
     init(from decoder: Decoder) throws {
@@ -410,6 +444,9 @@ enum IPCCommand: Decodable, Sendable {
         case .showSpotlight:
             let mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "command"
             self = .showSpotlight(mode: mode)
+        case .setTimers:
+            let timers = try container.decode([TimerSpec].self, forKey: .timers)
+            self = .setTimers(timers: timers)
         }
     }
 }
@@ -459,4 +496,9 @@ private struct DynamicCodingKey: CodingKey {
     static let on = DynamicCodingKey(stringValue: "on")!
     static let snapshot = DynamicCodingKey(stringValue: "snapshot")!
     static let mode = DynamicCodingKey(stringValue: "mode")!
+    static let seconds = DynamicCodingKey(stringValue: "seconds")!
+    static let label = DynamicCodingKey(stringValue: "label")!
+    static let workspace = DynamicCodingKey(stringValue: "workspace")!
+    static let id = DynamicCodingKey(stringValue: "id")!
+    static let timers = DynamicCodingKey(stringValue: "timers")!
 }

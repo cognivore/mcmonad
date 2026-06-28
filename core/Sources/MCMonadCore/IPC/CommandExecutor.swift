@@ -31,6 +31,10 @@ final class CommandExecutor {
     /// ("command" or "window"). Wired in Main to the SpotlightController.
     var onShowSpotlight: ((String) -> Void)?
 
+    /// Invoked when Haskell pushes the authoritative timer list (the
+    /// `set-timers` command). Wired in Main to TimerController.setTimers.
+    var onSetTimers: (([TimerSpec]) -> Void)?
+
     private let encoder = JSONEncoder()
 
     init(
@@ -79,6 +83,8 @@ final class CommandExecutor {
             onShowWindowPicker?()
         case .showSpotlight(let mode):
             onShowSpotlight?(mode)
+        case .setTimers(let timers):
+            onSetTimers?(timers)
         }
     }
 

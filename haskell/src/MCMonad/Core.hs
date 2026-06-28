@@ -17,6 +17,8 @@ module MCMonad.Core
     , WindowSet, WindowSpace
       -- * Window metadata cache
     , WindowMetadata(..)
+      -- * Timers
+    , Timer(..)
       -- * Layout system
     , Layout(..)
     , LayoutClass(..)
@@ -93,6 +95,37 @@ data WindowMetadata = WindowMetadata
     , wmTitle    :: !(Maybe Text)
     , wmBundleId :: !(Maybe Text)
     , wmSubrole  :: !(Maybe Text)
+    } deriving (Eq, Show, Read, Generic)
+
+-- ---------------------------------------------------------------------------
+-- Timers
+--
+-- A countdown reminder owned by the Haskell brain (not the Swift daemon).
+-- The brain is the source of truth: it assigns ids, stamps the origin
+-- workspace, persists the list across Mod-q\/launchd restarts, and tells
+-- mcmonad-core what to render. The daemon keeps the wall clock (a 1-second
+-- tick) and the UI (menubar countdown + reminder HUD); when a timer's
+-- 'tmFireAt' passes it fires a reminder and reports the fire back so the
+-- brain drops it from state. See 'MCMonad.Operations.pushTimers' and the
+-- timer event handlers in "MCMonad.Main".
+
+-- | One running countdown timer.
+data Timer = Timer
+    { tmId        :: !Int
+      -- ^ Monotonic id assigned by the brain ('MCMonad.Core.nextTimerId').
+      -- Never reused, so the daemon's fired-id guard can't collide.
+    , tmLabel     :: !String
+      -- ^ User-authored reminder text, shown in the menubar dropdown and
+      -- the \"time's up\" HUD. This is deliberate display text (not a
+      -- sniffed window title), so it is persisted verbatim.
+    , tmFireAt    :: !Double
+      -- ^ Absolute fire time as POSIX epoch seconds (UTC), matching the
+      -- daemon's @Date().timeIntervalSince1970@. Absolute (not a
+      -- remaining-duration) so a timer fires at the right wall-clock
+      -- moment regardless of how long a restart took.
+    , tmWorkspace :: !String
+      -- ^ Tag of the workspace that was current when the timer was
+      -- started. Drives the reminder HUD's \"Jump to workspace\" button.
     } deriving (Eq, Show, Read, Generic)
 
 instance FromJSON WindowRef where
@@ -275,6 +308,15 @@ data MState = MState
       -- doesn't fan out to a save per call. 'restart' bypasses the
       -- throttle so a Mod-q reload still writes the freshest snapshot
       -- before 'exec'.
+    , timers           :: ![Timer]
+      -- ^ All running countdown timers. Owned here (the brain is the
+      -- source of truth), persisted across restart via
+      -- 'MCMonad.Persistence.SerialState', and pushed to mcmonad-core
+      -- for rendering by 'MCMonad.Operations.pushTimers'. See 'Timer'.
+    , nextTimerId      :: !Int
+      -- ^ Monotonic counter for the next 'Timer' id. Persisted alongside
+      -- 'timers' so ids never repeat across a restart — the daemon's
+      -- fired-id guard relies on uniqueness.
     , focusIntent      :: !(Maybe FocusIntent)
       -- ^ The window 'MCMonad.Operations.windows' most-recently told
       -- macOS to focus. While set, mcmonad's StackSet is the source of

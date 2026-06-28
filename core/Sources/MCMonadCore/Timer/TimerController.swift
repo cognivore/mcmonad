@@ -3,22 +3,31 @@ import os
 
 /// The menu-bar countdown timer widget.
 ///
-/// Owns its own `NSStatusItem`, separate from the main mcmonad workspace
-/// indicator, that appears only while at least one timer is running and shows
-/// the soonest-to-fire countdown live (e.g. "⏱ 14:32"). Its dropdown lists
-/// every running timer with a cancel action.
+/// Timer *state* lives in the Haskell brain — the list of running timers,
+/// their ids, labels, fire times, and origin workspaces are owned there,
+/// persisted across Mod-q / launchd restart, and pushed here as a
+/// `set-timers` command (`setTimers`). This controller is the *renderer +
+/// clock*: it owns an `NSStatusItem` (separate from the workspace
+/// indicator) that shows the soonest countdown live (e.g. "⏱ 14:32"), and
+/// fires the "time's up" reminder when a deadline passes. It never invents
+/// or mutates timer state on its own — every user action (start, snooze,
+/// cancel, jump) is reported back over IPC and returns as a fresh
+/// `setTimers`.
 ///
 /// Timers are driven by a single 1-second tick rather than one
 /// `scheduledTimer` per countdown: the tick both refreshes the displayed
-/// remaining time and fires any timer whose deadline has passed. That keeps
-/// fire-handling in one place and avoids the double-fire/drift pitfalls of
-/// juggling many one-shot timers.
+/// remaining time and fires any timer whose `fireAt` has passed. Fire is
+/// detected against the absolute epoch `fireAt`, so a timer fires at the
+/// correct wall-clock moment even if it was restored mid-flight after a
+/// restart (and fires immediately if its deadline already passed while
+/// mcmonad was down).
 ///
 /// On fire: a system sound plays and a transient, non-activating HUD panel
-/// announces "time's up". We deliberately avoid `UNUserNotificationCenter`
-/// (which needs a fully-registered bundle + entitlements that a bare,
-/// directly-exec'd daemon binary doesn't reliably have) — the sound + HUD
-/// path works regardless of how the daemon was launched.
+/// announces "time's up" with Snooze / Jump-to-workspace / Dismiss. We
+/// deliberately avoid `UNUserNotificationCenter` (which needs a
+/// fully-registered bundle + entitlements that a bare, directly-exec'd
+/// daemon binary doesn't reliably have) — the sound + HUD path works
+/// regardless of how the daemon was launched.
 @MainActor
 final class TimerController: NSObject, NSMenuDelegate {
     private static let logger = Logger(
@@ -26,35 +35,52 @@ final class TimerController: NSObject, NSMenuDelegate {
         category: "Timer"
     )
 
-    private struct ActiveTimer {
-        let id: Int
-        let label: String
-        let fireDate: Date
-        let total: TimeInterval
-    }
-
     /// A fired-timer reminder card: a persistent, interactive HUD that stays on
-    /// screen until dismissed or snoozed. `label` is kept so Snooze can re-arm
-    /// the same timer.
+    /// screen until dismissed, snoozed, or jumped-from. `label` and `workspace`
+    /// are kept so Snooze can re-arm the same timer (preserving its origin) and
+    /// Jump can switch to where it was started.
     private struct Reminder {
         let id: Int
         let panel: NSPanel
         let label: String
+        let workspace: String
     }
+
+    // MARK: - Callbacks (wired in Main to socket events)
+
+    /// A timer's deadline passed (by id). The brain drops it from state.
+    var onFired: ((Int) -> Void)?
+    /// The user cancelled one running timer from the menubar (by id).
+    var onCancel: ((Int) -> Void)?
+    /// The user cancelled every running timer from the menubar.
+    var onCancelAll: (() -> Void)?
+    /// The user hit Snooze: start a fresh timer (seconds, label, origin
+    /// workspace) — routed back to the brain so it keeps the original origin.
+    var onSnooze: ((TimeInterval, String, String) -> Void)?
+    /// The user hit "Jump to workspace": switch to the timer's origin tag.
+    var onJumpToWorkspace: ((String) -> Void)?
+
+    // MARK: - State (mirror of the brain's authoritative list)
 
     private var statusItem: NSStatusItem?
     private let menu = NSMenu()
-    private var timers: [ActiveTimer] = []
-    private var nextId = 1
+    /// The full timer list as last pushed by the brain.
+    private var timers: [TimerSpec] = []
+    /// Ids we've already fired this daemon session. Guards against a timer
+    /// re-firing in the window between our fire (which optimistically leaves
+    /// it in `timers`) and the brain's next `setTimers` removing it. Pruned
+    /// to the ids actually present whenever a list arrives, so monotonic ids
+    /// keep it bounded and never block a genuinely-new timer.
+    private var firedIds: Set<Int> = []
     private var tick: Timer?
 
     /// Fired-timer reminders, oldest first. Each stays up until the user clicks
-    /// Dismiss or Snooze — a missed timer must never silently vanish. Relaid
-    /// out on add/remove so the stack has no gaps.
+    /// Dismiss, Snooze, or Jump — a missed timer must never silently vanish.
+    /// Relaid out on add/remove so the stack has no gaps.
     private var reminders: [Reminder] = []
     private var nextReminderId = 1
 
-    private static let reminderWidth: CGFloat = 460
+    private static let reminderWidth: CGFloat = 480
     private static let reminderHeight: CGFloat = 92
     private static let reminderGap: CGFloat = 10
     private static let snoozeSeconds: TimeInterval = 5 * 60
@@ -65,30 +91,36 @@ final class TimerController: NSObject, NSMenuDelegate {
         menu.autoenablesItems = false
     }
 
-    // MARK: - Public API
+    // MARK: - Public API (driven by the brain)
 
-    /// Start a countdown. `label` is optional free text shown in the dropdown
-    /// and the "time's up" HUD.
-    func start(seconds: TimeInterval, label: String) {
-        let clamped = max(1, seconds)
-        let t = ActiveTimer(
-            id: nextId,
-            label: label.trimmingCharacters(in: .whitespacesAndNewlines),
-            fireDate: Date().addingTimeInterval(clamped),
-            total: clamped
-        )
-        nextId += 1
-        timers.append(t)
-        Self.logger.info(
-            "timer #\(t.id) started: \(Int(clamped), privacy: .public)s label=\(t.label, privacy: .public)"
-        )
-        ensureStatusItem()
-        ensureTick()
-        updateDisplay()
+    /// Replace the rendered timer list with the brain's authoritative one.
+    /// Idempotent: an empty list tears the widget down; a non-empty list
+    /// (re)creates the status item and tick. Called on startup (to resume
+    /// restored timers) and after every brain-side timer mutation.
+    func setTimers(_ list: [TimerSpec]) {
+        self.timers = list
+        // Drop fired-id bookkeeping for timers no longer in the list.
+        firedIds.formIntersection(Set(list.map { $0.id }))
+        // Reconcile a rare cross-restart race: a timer the brain still
+        // considers pending that we already fired (our fired-notice was lost
+        // because the brain was mid-restart). Re-report it so the brain drops
+        // it; we don't re-show the reminder (it already fired once).
+        for t in list where firedIds.contains(t.id) {
+            onFired?(t.id)
+        }
+        if pending.isEmpty {
+            teardown()
+        } else {
+            ensureStatusItem()
+            ensureTick()
+            updateDisplay()
+        }
     }
 
-    /// Number of timers currently running.
-    var activeCount: Int { timers.count }
+    /// Timers not yet fired — what the menubar counts down and the tick fires.
+    private var pending: [TimerSpec] {
+        timers.filter { !firedIds.contains($0.id) }
+    }
 
     // MARK: - Tick / fire
 
@@ -100,23 +132,25 @@ final class TimerController: NSObject, NSMenuDelegate {
     }
 
     private func onTick() {
-        let now = Date()
-        let fired = timers.filter { $0.fireDate <= now }
-        if !fired.isEmpty {
-            timers.removeAll { $0.fireDate <= now }
-            for t in fired { fire(t) }
+        let now = Date().timeIntervalSince1970
+        for t in timers where t.fireAt <= now && !firedIds.contains(t.id) {
+            firedIds.insert(t.id)
+            fire(t)
+            // Tell the brain so it drops the timer from persisted state; the
+            // brain answers with a fresh setTimers that no longer carries it.
+            onFired?(t.id)
         }
-        if timers.isEmpty {
+        if pending.isEmpty {
             teardown()
         } else {
             updateDisplay()
         }
     }
 
-    private func fire(_ t: ActiveTimer) {
+    private func fire(_ t: TimerSpec) {
         Self.logger.info("timer #\(t.id) fired: \(t.label, privacy: .public)")
         playSound()
-        showReminder(label: t.label)
+        showReminder(label: t.label, workspace: t.workspace)
     }
 
     private func teardown() {
@@ -138,10 +172,14 @@ final class TimerController: NSObject, NSMenuDelegate {
     }
 
     private func updateDisplay() {
-        guard let soonest = timers.min(by: { $0.fireDate < $1.fireDate }) else { return }
-        let remaining = max(0, soonest.fireDate.timeIntervalSinceNow)
+        let p = pending
+        guard let soonest = p.min(by: { $0.fireAt < $1.fireAt }) else {
+            teardown()
+            return
+        }
+        let remaining = max(0, soonest.fireAt - Date().timeIntervalSince1970)
         var title = "⏱ " + Self.format(remaining)
-        if timers.count > 1 { title += " +\(timers.count - 1)" }
+        if p.count > 1 { title += " +\(p.count - 1)" }
         statusItem?.button?.title = title
     }
 
@@ -167,18 +205,21 @@ final class TimerController: NSObject, NSMenuDelegate {
         menu.addItem(header)
         menu.addItem(NSMenuItem.separator())
 
-        if timers.isEmpty {
+        let running = pending
+        if running.isEmpty {
             let none = NSMenuItem(title: "(none running)", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
             return
         }
 
-        for t in timers.sorted(by: { $0.fireDate < $1.fireDate }) {
-            let remaining = max(0, t.fireDate.timeIntervalSinceNow)
+        let now = Date().timeIntervalSince1970
+        for t in running.sorted(by: { $0.fireAt < $1.fireAt }) {
+            let remaining = max(0, t.fireAt - now)
             let name = t.label.isEmpty ? "Timer" : t.label
+            let suffix = t.workspace.isEmpty ? "" : "  ·  \(t.workspace)"
             let item = NSMenuItem(
-                title: "\(Self.format(remaining))  —  \(name)",
+                title: "\(Self.format(remaining))  —  \(name)\(suffix)",
                 action: #selector(cancelClicked(_:)),
                 keyEquivalent: ""
             )
@@ -199,13 +240,13 @@ final class TimerController: NSObject, NSMenuDelegate {
 
     @objc private func cancelClicked(_ sender: NSMenuItem) {
         guard let id = (sender.representedObject as? NSNumber)?.intValue else { return }
-        timers.removeAll { $0.id == id }
-        if timers.isEmpty { teardown() } else { updateDisplay() }
+        // The brain owns the list: report the cancel and let the resulting
+        // setTimers update what we render.
+        onCancel?(id)
     }
 
     @objc private func cancelAllClicked(_ sender: Any?) {
-        timers.removeAll()
-        teardown()
+        onCancelAll?()
     }
 
     // MARK: - Feedback (sound + HUD)
@@ -220,11 +261,12 @@ final class TimerController: NSObject, NSMenuDelegate {
 
     /// Show a persistent reminder card for a fired timer. Unlike a toast it does
     /// NOT auto-dismiss: a missed timer stays on screen, stacked under any other
-    /// fired reminders, until the user clicks Dismiss or Snooze. The card is a
-    /// non-activating `popUpMenu`-level HUD, so it floats above other windows,
-    /// takes clicks on its buttons without stealing focus, and is ignored by the
-    /// tiling engine (its window level is outside the managed {0,3,8} set).
-    private func showReminder(label rawLabel: String) {
+    /// fired reminders, until the user clicks Dismiss, Snooze, or Jump. The card
+    /// is a non-activating `popUpMenu`-level HUD, so it floats above other
+    /// windows, takes clicks on its buttons without stealing focus, and is
+    /// ignored by the tiling engine (its window level is outside the managed
+    /// {0,3,8} set).
+    private func showReminder(label rawLabel: String, workspace: String) {
         let id = nextReminderId
         nextReminderId += 1
         let trimmed = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -267,24 +309,40 @@ final class TimerController: NSObject, NSMenuDelegate {
                                width: Self.reminderWidth - 32, height: 28)
         container.addSubview(message)
 
-        let buttonW: CGFloat = 150
+        // Three buttons, centred as a row: Snooze · Jump to workspace · Dismiss.
+        // The Jump button is omitted only when the timer has no recorded origin
+        // (which shouldn't happen — the brain always stamps the current tag).
+        let hasWorkspace = !workspace.isEmpty
         let buttonH: CGFloat = 30
         let buttonY: CGFloat = 14
-        let gap: CGFloat = 12
+        let gap: CGFloat = 10
+        let buttonW: CGFloat = 150
+        let count = hasWorkspace ? 3 : 2
+        let totalW = CGFloat(count) * buttonW + CGFloat(count - 1) * gap
+        var x = (Self.reminderWidth - totalW) / 2
 
-        let snooze = NSButton(frame: NSRect(
-            x: Self.reminderWidth / 2 - buttonW - gap / 2,
-            y: buttonY, width: buttonW, height: buttonH))
+        let snooze = NSButton(frame: NSRect(x: x, y: buttonY, width: buttonW, height: buttonH))
         snooze.bezelStyle = .rounded
         snooze.title = "Snooze 5 min"
         snooze.tag = id
         snooze.target = self
         snooze.action = #selector(snoozeReminderClicked(_:))
         container.addSubview(snooze)
+        x += buttonW + gap
 
-        let dismiss = NSButton(frame: NSRect(
-            x: Self.reminderWidth / 2 + gap / 2,
-            y: buttonY, width: buttonW, height: buttonH))
+        if hasWorkspace {
+            let jump = NSButton(frame: NSRect(x: x, y: buttonY, width: buttonW, height: buttonH))
+            jump.bezelStyle = .rounded
+            jump.title = "Jump to \(workspace)"
+            jump.toolTip = "Switch to the workspace this timer was started from"
+            jump.tag = id
+            jump.target = self
+            jump.action = #selector(jumpReminderClicked(_:))
+            container.addSubview(jump)
+            x += buttonW + gap
+        }
+
+        let dismiss = NSButton(frame: NSRect(x: x, y: buttonY, width: buttonW, height: buttonH))
         dismiss.bezelStyle = .rounded
         dismiss.title = "Dismiss"
         dismiss.tag = id
@@ -292,7 +350,7 @@ final class TimerController: NSObject, NSMenuDelegate {
         dismiss.action = #selector(dismissReminderClicked(_:))
         container.addSubview(dismiss)
 
-        reminders.append(Reminder(id: id, panel: panel, label: rawLabel))
+        reminders.append(Reminder(id: id, panel: panel, label: rawLabel, workspace: workspace))
         relayoutReminders()
         panel.orderFrontRegardless()
     }
@@ -313,10 +371,18 @@ final class TimerController: NSObject, NSMenuDelegate {
     @objc private func snoozeReminderClicked(_ sender: NSButton) {
         guard let r = reminders.first(where: { $0.id == sender.tag }) else { return }
         let label = r.label
+        let workspace = r.workspace
         dismissReminder(id: sender.tag)
-        // Re-arm the same timer; it fires (and shows a fresh reminder) again
-        // after the snooze interval.
-        start(seconds: Self.snoozeSeconds, label: label)
+        // Re-arm via the brain so the snoozed copy keeps the original origin
+        // workspace; it fires (and shows a fresh reminder) after the interval.
+        onSnooze?(Self.snoozeSeconds, label, workspace)
+    }
+
+    @objc private func jumpReminderClicked(_ sender: NSButton) {
+        guard let r = reminders.first(where: { $0.id == sender.tag }) else { return }
+        let workspace = r.workspace
+        dismissReminder(id: sender.tag)
+        onJumpToWorkspace?(workspace)
     }
 
     @objc private func dismissReminderClicked(_ sender: NSButton) {

@@ -616,6 +616,8 @@ buildSavedState [wrL1, wrL2, wrR1] = SerialState
     , ssCurrentTag = "L"
     , ssFloating   = []
     , ssAffinity   = [("L", 0), ("R", 1)]
+    , ssTimers     = []
+    , ssNextTimerId = 1
     }
 buildSavedState _ = error "buildSavedState: expected 3 saved refs"
 
@@ -718,6 +720,8 @@ prop_serialToWindowSet_respects_affinity_two_screens currentIsLeft =
             , ssCurrentTag = if currentIsLeft then tagL else tagR
             , ssFloating   = []
             , ssAffinity   = [(tagL, 0), (tagR, 1)]
+            , ssTimers     = []
+            , ssNextTimerId = 1
             }
         ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
         ws = serialToWindowSet (0 :: Int) allTags screens saved
@@ -750,6 +754,8 @@ prop_serialToWindowSet_preserves_current_tag currentIsLeft =
             , ssCurrentTag = cur
             , ssFloating   = []
             , ssAffinity   = [(tagL, 0), (tagR, 1)]
+            , ssTimers     = []
+            , ssNextTimerId = 1
             }
         ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
         ws = serialToWindowSet (0 :: Int) allTags screens saved
@@ -769,6 +775,8 @@ prop_serialToWindowSet_no_affinity_falls_back =
             , ssCurrentTag = "b"
             , ssFloating   = []
             , ssAffinity   = []        -- no affinity hints
+            , ssTimers     = []
+            , ssNextTimerId = 1
             }
         ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
         ws = serialToWindowSet (0 :: Int) allTags screens saved

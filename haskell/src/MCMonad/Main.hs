@@ -5,7 +5,6 @@ module MCMonad.Main
 
 import Control.Monad (forever, when)
 import Data.List (find)
-import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
@@ -413,36 +412,53 @@ handleEvent debug cfg hotkeyIdMap evt = do
             when (tag `elem` allTags) $ windows (W.greedyView tag)
 
         -- Timers. The brain owns timer state; mcmonad-core renders + clocks
-        -- it. All four handlers funnel through 'syncTimers' (push to the
-        -- daemon + persist) so the list survives a Mod-q / launchd restart.
-        TimerStart seconds label mWorkspace -> do
-            now <- io nowEpoch
-            ws  <- gets windowset
-            nid <- gets nextTimerId
-            -- Stamp the origin workspace: the snoozed copy carries the
-            -- original tag; a fresh Spotlight timer inherits whatever is
-            -- current right now (so "Jump to workspace" returns there).
+        -- it. State mutations funnel through 'syncTimers' (push to the daemon
+        -- + persist) so the list survives a Mod-q / launchd restart, and
+        -- every lifecycle event is appended to the activity journal.
+        TimerStart seconds label -> do
+            -- Fresh timer from Spotlight: origin = whatever is current now,
+            -- so "Jump to workspace" later returns here.
+            ws <- gets windowset
             let curTag = W.tag (W.workspace (W.current ws))
-                t = Timer { tmId        = nid
-                          , tmLabel     = label
-                          , tmFireAt    = now + seconds
-                          , tmWorkspace = fromMaybe curTag mWorkspace
-                          }
-            modify $ \s -> s { timers = timers s ++ [t]
-                             , nextTimerId = nid + 1 }
-            syncTimers
+            t <- addTimer seconds label curTag
+            journalStarted seconds t
+
+        TimerSnooze seconds label workspace -> do
+            -- Re-arm from a reminder card: keep the original origin workspace.
+            t <- addTimer seconds label workspace
+            journalSnoozed seconds t
 
         TimerFired tid -> do
+            ts <- gets timers
+            whenJust (find ((== tid) . tmId) ts) journalFired
             modify $ \s -> s { timers = filter ((/= tid) . tmId) (timers s) }
             syncTimers
 
         TimerCancel tid -> do
+            ts <- gets timers
+            whenJust (find ((== tid) . tmId) ts) journalCancelled
             modify $ \s -> s { timers = filter ((/= tid) . tmId) (timers s) }
             syncTimers
 
         TimerCancelAll -> do
+            ts <- gets timers
+            mapM_ journalCancelled ts
             modify $ \s -> s { timers = [] }
             syncTimers
+
+        -- Reminder-card actions for an already-fired timer: no state change
+        -- (it left 'timers' on fire), just a journal entry — and, for jump,
+        -- the workspace switch.
+        TimerDismiss label workspace ->
+            journalDismissed label workspace
+
+        TimerJump label workspace -> do
+            ws <- gets windowset
+            let allTags = map W.tag (W.workspace (W.current ws)
+                                     : map W.workspace (W.visible ws)
+                                     ++ W.hidden ws)
+            journalJumped label workspace
+            when (workspace `elem` allTags) $ windows (W.greedyView workspace)
 
         -- Events that arrive during init or are not actionable
         Ready                   -> return ()
@@ -550,3 +566,17 @@ pushBackFocus i = do
 -- | Find a WindowRef by its CGWindowID in a list.
 findByWindowId :: Word32 -> [WindowRef] -> Maybe WindowRef
 findByWindowId wid = find (\w -> wrWindowId w == wid)
+
+-- | Insert a new timer (fireAt = now + seconds, with the given label and
+-- origin workspace), push it to the daemon + persist, and return it so the
+-- caller can write the matching journal entry. Shared by the 'TimerStart'
+-- and 'TimerSnooze' handlers.
+addTimer :: Double -> String -> String -> M Timer
+addTimer seconds label ws = do
+    now <- io nowEpoch
+    nid <- gets nextTimerId
+    let t = Timer { tmId = nid, tmLabel = label
+                  , tmFireAt = now + seconds, tmWorkspace = ws }
+    modify $ \s -> s { timers = timers s ++ [t], nextTimerId = nid + 1 }
+    syncTimers
+    return t

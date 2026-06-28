@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module MCMonad.Operations
     ( -- * Core state transition
       windows
@@ -28,6 +30,13 @@ module MCMonad.Operations
     , pushTimers
     , syncTimers
     , nowEpoch
+      -- * Timer activity journal
+    , journalStarted
+    , journalSnoozed
+    , journalFired
+    , journalCancelled
+    , journalDismissed
+    , journalJumped
       -- * State persistence
     , saveStateIO
     , loadStateIO
@@ -44,16 +53,21 @@ module MCMonad.Operations
 import Control.Concurrent (forkIO)
 import Control.Exception (IOException, catch)
 import Control.Monad (forM, void, unless, when)
+import Data.Aeson ((.=))
+import qualified Data.Aeson as Aeson
+import Data.Aeson.Types (Pair)
+import qualified Data.ByteString.Lazy as LBS
 import Data.List (find)
 import Data.Monoid (Endo(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Time.Clock (NominalDiffTime, diffUTCTime, getCurrentTime)
-import Data.Time.Clock.POSIX (getPOSIXTime)
-import System.Directory (doesFileExist, getHomeDirectory)
+import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
+import System.Directory (doesFileExist, getHomeDirectory, createDirectoryIfMissing)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.IO (hPutStrLn, stderr)
 import System.Info (arch, os)
 import qualified System.Posix.Files as Posix
@@ -603,6 +617,83 @@ saveTimersIO = do
 -- persist it. The single funnel every timer event handler calls.
 syncTimers :: M ()
 syncTimers = pushTimers >> saveTimersIO
+
+-- ---------------------------------------------------------------------------
+-- Timer activity journal
+--
+-- An append-only JSONL log of every timer lifecycle event, written to
+-- @~/.local/state/mcmonad/timers.jsonl@. Unlike the state file (a snapshot,
+-- overwritten on each save) this is a permanent history, so the user can
+-- reconstruct what they were doing at the computer after the fact. One
+-- self-contained JSON object per line: a UTC @ts@, the @event@ name, and
+-- the event-specific fields (label, workspace, durations). Best-effort —
+-- a write failure is logged but never raised, so journalling can't take
+-- down the WM (same discipline as 'saveStateIO').
+
+-- | Path to the timer activity journal (XDG state dir).
+getTimerJournalFile :: IO FilePath
+getTimerJournalFile = do
+    home <- getHomeDirectory
+    return (home </> ".local" </> "state" </> "mcmonad" </> "timers.jsonl")
+
+-- | Format an absolute POSIX-epoch-seconds timestamp (as carried by
+-- 'MCMonad.Core.Timer.tmFireAt') as an ISO-8601 UTC string.
+isoFromEpoch :: Double -> String
+isoFromEpoch = iso8601Show . posixSecondsToUTCTime . realToFrac
+
+-- | Append one timer event to the journal: a UTC @ts@, the @event@ name,
+-- then the supplied fields. The single low-level writer the typed
+-- @journal*@ helpers funnel through.
+journalTimer :: String -> [Pair] -> M ()
+journalTimer event extra = io $ do
+    now <- getCurrentTime
+    let obj  = Aeson.object (("ts" .= iso8601Show now) : ("event" .= event) : extra)
+        line = Aeson.encode obj <> LBS.singleton 0x0A  -- one object per line
+    (do f <- getTimerJournalFile
+        createDirectoryIfMissing True (takeDirectory f)
+        LBS.appendFile f line)
+        `catch` \e ->
+            hPutStrLn stderr $ "mcmonad: timer journal write failed: "
+                ++ show (e :: IOException)
+
+-- | Common identity fields shared by most journal events.
+timerIdentity :: Timer -> [Pair]
+timerIdentity t =
+    [ "id" .= tmId t, "label" .= tmLabel t, "workspace" .= tmWorkspace t ]
+
+-- | A fresh countdown was set from Spotlight. Carries the requested
+-- duration and the absolute fire time.
+journalStarted :: Double -> Timer -> M ()
+journalStarted secs t = journalTimer "started" $
+    timerIdentity t ++
+    [ "durationSec" .= (round secs :: Int), "fireAt" .= isoFromEpoch (tmFireAt t) ]
+
+-- | A fired timer was re-armed from its reminder card.
+journalSnoozed :: Double -> Timer -> M ()
+journalSnoozed secs t = journalTimer "snoozed" $
+    timerIdentity t ++
+    [ "durationSec" .= (round secs :: Int), "fireAt" .= isoFromEpoch (tmFireAt t) ]
+
+-- | A timer reached its deadline.
+journalFired :: Timer -> M ()
+journalFired t = journalTimer "fired" (timerIdentity t)
+
+-- | A still-running timer was cancelled; records how much time was left.
+journalCancelled :: Timer -> M ()
+journalCancelled t = do
+    now <- io nowEpoch
+    journalTimer "cancelled" $
+        timerIdentity t ++ [ "remainingSec" .= (round (max 0 (tmFireAt t - now)) :: Int) ]
+
+-- | A reminder card was dismissed (the timer had already fired).
+journalDismissed :: String -> String -> M ()
+journalDismissed lbl ws =
+    journalTimer "dismissed" [ "label" .= lbl, "workspace" .= ws ]
+
+-- | The user jumped to a timer's origin workspace from its reminder card.
+journalJumped :: String -> String -> M ()
+journalJumped lbl ws =
+    journalTimer "jumped" [ "label" .= lbl, "workspace" .= ws ]
 
 -- ---------------------------------------------------------------------------
 -- State persistence

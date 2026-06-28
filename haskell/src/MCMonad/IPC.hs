@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 9
+protocolVersion = 10
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -311,18 +311,33 @@ data Event
     | MenuToggleDebug
     | MenuFocusWindow !Word32 !Int32
     | MenuViewWorkspace !String
-    | TimerStart !Double !String !(Maybe String)
-      -- ^ Request to start a countdown: @seconds@, @label@, and an
-      -- optional origin workspace tag. The Spotlight launcher omits the
-      -- workspace (the brain stamps the current tag); the reminder HUD's
-      -- Snooze carries the original tag so the snoozed copy keeps it.
+    | TimerStart !Double !String
+      -- ^ Start a fresh countdown from the Spotlight launcher: @seconds@,
+      -- @label@. The brain stamps the current workspace as the origin and
+      -- journals a @started@ event.
+    | TimerSnooze !Double !String !String
+      -- ^ Re-arm a fired timer from its reminder card: @seconds@, @label@,
+      -- and the original origin @workspace@ (carried forward, not the
+      -- current one). Journals a @snoozed@ event. Split from 'TimerStart'
+      -- so the journal can tell a fresh timer from a snooze.
     | TimerFired !Int
-      -- ^ The daemon's clock reached a timer's deadline (by id). The
-      -- brain drops it from state so it doesn't resurrect on restart.
+      -- ^ The daemon's clock reached a timer's deadline (by id). The brain
+      -- journals @fired@ and drops it from state so it can't resurrect.
     | TimerCancel !Int
       -- ^ The user cancelled a still-running timer from the menubar (by id).
+      -- Journals @cancelled@.
     | TimerCancelAll
-      -- ^ The user cancelled every running timer from the menubar.
+      -- ^ The user cancelled every running timer from the menubar. Journals
+      -- one @cancelled@ per timer.
+    | TimerDismiss !String !String
+      -- ^ The user clicked Dismiss on a reminder card: @label@, @workspace@.
+      -- The timer is already gone from state (it fired), so the card carries
+      -- its own data. Journals @dismissed@; no state change.
+    | TimerJump !String !String
+      -- ^ The user clicked "Jump to workspace" on a reminder card: @label@,
+      -- origin @workspace@. The brain switches to that workspace and journals
+      -- @jumped@. (Distinct from 'MenuViewWorkspace' so the journal can
+      -- attribute the switch to a timer.)
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
@@ -406,10 +421,13 @@ instance Aeson.FromJSON Event where
                 "menu-toggle-debug"    -> pure MenuToggleDebug
                 "menu-focus-window"    -> MenuFocusWindow <$> v .: "windowId" <*> v .: "pid"
                 "menu-view-workspace"  -> MenuViewWorkspace <$> v .: "tag"
-                "timer-start"          -> TimerStart <$> v .: "seconds" <*> v .: "label" <*> v .:? "workspace"
+                "timer-start"          -> TimerStart <$> v .: "seconds" <*> v .: "label"
+                "timer-snooze"         -> TimerSnooze <$> v .: "seconds" <*> v .: "label" <*> v .: "workspace"
                 "timer-fired"          -> TimerFired <$> v .: "id"
                 "timer-cancel"         -> TimerCancel <$> v .: "id"
                 "timer-cancel-all"     -> pure TimerCancelAll
+                "timer-dismiss"        -> TimerDismiss <$> v .: "label" <*> v .: "workspace"
+                "timer-jump"           -> TimerJump <$> v .: "label" <*> v .: "workspace"
                 "ready"                -> pure Ready
                 other                  -> pure (IgnoredEvent other)
             (_, Just resp) -> case resp of

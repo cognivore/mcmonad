@@ -272,10 +272,13 @@ enum IPCEvent: Encodable, Sendable {
     case menuFocusWindow(windowId: UInt32, pid: Int32)
     case menuViewWorkspace(tag: String)
     case focusedWindowQueryResponse(windowId: UInt32, pid: Int32)
-    case timerStart(seconds: Double, label: String, workspace: String?)
+    case timerStart(seconds: Double, label: String)
+    case timerSnooze(seconds: Double, label: String, workspace: String)
     case timerFired(id: Int)
     case timerCancel(id: Int)
     case timerCancelAll
+    case timerDismiss(label: String, workspace: String)
+    case timerJump(label: String, workspace: String)
     case ready
 
     func encode(to encoder: Encoder) throws {
@@ -338,11 +341,15 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode("focused-window-query-response", forKey: .event)
             try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
-        case .timerStart(let seconds, let label, let workspace):
+        case .timerStart(let seconds, let label):
             try container.encode("timer-start", forKey: .event)
             try container.encode(seconds, forKey: .seconds)
             try container.encode(label, forKey: .label)
-            try container.encodeIfPresent(workspace, forKey: .workspace)
+        case .timerSnooze(let seconds, let label, let workspace):
+            try container.encode("timer-snooze", forKey: .event)
+            try container.encode(seconds, forKey: .seconds)
+            try container.encode(label, forKey: .label)
+            try container.encode(workspace, forKey: .workspace)
         case .timerFired(let id):
             try container.encode("timer-fired", forKey: .event)
             try container.encode(id, forKey: .id)
@@ -351,6 +358,14 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode(id, forKey: .id)
         case .timerCancelAll:
             try container.encode("timer-cancel-all", forKey: .event)
+        case .timerDismiss(let label, let workspace):
+            try container.encode("timer-dismiss", forKey: .event)
+            try container.encode(label, forKey: .label)
+            try container.encode(workspace, forKey: .workspace)
+        case .timerJump(let label, let workspace):
+            try container.encode("timer-jump", forKey: .event)
+            try container.encode(label, forKey: .label)
+            try container.encode(workspace, forKey: .workspace)
         case .ready:
             try container.encode("ready", forKey: .event)
         }

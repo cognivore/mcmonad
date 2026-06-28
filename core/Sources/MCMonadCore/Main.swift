@@ -259,7 +259,7 @@ struct MCMonadCoreApp {
         // the list back via set-timers). No origin workspace here — the brain
         // uses whatever is current.
         spotlight.onStartTimer = { [weak socketServer] seconds, label in
-            socketServer?.send(.timerStart(seconds: seconds, label: label, workspace: nil))
+            socketServer?.send(.timerStart(seconds: seconds, label: label))
         }
 
         // TimerController is a pure renderer/clock; its state arrives via the
@@ -278,11 +278,15 @@ struct MCMonadCoreApp {
         }
         // Snooze re-arms via the brain so the copy keeps its origin workspace.
         timerController.onSnooze = { [weak socketServer] seconds, label, workspace in
-            socketServer?.send(.timerStart(seconds: seconds, label: label, workspace: workspace))
+            socketServer?.send(.timerSnooze(seconds: seconds, label: label, workspace: workspace))
         }
-        // "Jump to workspace" reuses the menubar workspace-switch path.
-        timerController.onJumpToWorkspace = { [weak socketServer] tag in
-            socketServer?.send(.menuViewWorkspace(tag: tag))
+        // "Jump to workspace": the brain switches there AND journals the jump.
+        timerController.onJump = { [weak socketServer] label, workspace in
+            socketServer?.send(.timerJump(label: label, workspace: workspace))
+        }
+        // Dismiss: reported purely so the brain can journal it (no state change).
+        timerController.onDismiss = { [weak socketServer] label, workspace in
+            socketServer?.send(.timerDismiss(label: label, workspace: workspace))
         }
         statusBar.onSearchWindows = { [weak spotlight] in
             spotlight?.show(mode: .window)

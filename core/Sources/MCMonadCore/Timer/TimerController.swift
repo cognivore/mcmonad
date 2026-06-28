@@ -58,7 +58,12 @@ final class TimerController: NSObject, NSMenuDelegate {
     /// workspace) — routed back to the brain so it keeps the original origin.
     var onSnooze: ((TimeInterval, String, String) -> Void)?
     /// The user hit "Jump to workspace": switch to the timer's origin tag.
-    var onJumpToWorkspace: ((String) -> Void)?
+    /// Carries (label, workspace) so the brain can journal the jump.
+    var onJump: ((String, String) -> Void)?
+    /// The user hit "Dismiss" on a reminder card: (label, workspace), for
+    /// the journal. (Snooze/Jump close the card too but report their own
+    /// events, so this fires only for an explicit Dismiss.)
+    var onDismiss: ((String, String) -> Void)?
 
     // MARK: - State (mirror of the brain's authoritative list)
 
@@ -380,13 +385,18 @@ final class TimerController: NSObject, NSMenuDelegate {
 
     @objc private func jumpReminderClicked(_ sender: NSButton) {
         guard let r = reminders.first(where: { $0.id == sender.tag }) else { return }
+        let label = r.label
         let workspace = r.workspace
         dismissReminder(id: sender.tag)
-        onJumpToWorkspace?(workspace)
+        onJump?(label, workspace)
     }
 
     @objc private func dismissReminderClicked(_ sender: NSButton) {
+        guard let r = reminders.first(where: { $0.id == sender.tag }) else { return }
+        let label = r.label
+        let workspace = r.workspace
         dismissReminder(id: sender.tag)
+        onDismiss?(label, workspace)
     }
 
     private func dismissReminder(id: Int) {

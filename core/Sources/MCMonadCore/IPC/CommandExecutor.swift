@@ -131,6 +131,20 @@ final class CommandExecutor {
             }
         }
 
+        // Suppress AXEnhancedUserInterface on every involved app for the
+        // duration of the writes AND the phase-5 readback. The hide path
+        // already gets this via AXWindowService.setFrame; without it here,
+        // a browser that has flipped the flag on (Chrome/LibreWolf do once
+        // their a11y engine engages — a native-fullscreen round-trip is a
+        // reliable trigger) has these tile/unpark writes acknowledged but
+        // animated-and-dropped, wedging the window wherever it happens to
+        // be: on top of every workspace, or lost as the 1px sliver in the
+        // park corner.
+        let suppressedEUI = AXWindowService.suppressEnhancedUserInterface(
+            pids: Set(resolved.map { $0.0.pid })
+        )
+        defer { AXWindowService.restoreEnhancedUserInterface(suppressedEUI) }
+
         skylight.disableUpdate()
 
         // Phase 1: Set all sizes (prevents overlaps that clamp sizes)

@@ -207,16 +207,8 @@ enum AXWindowService {
         // lives on the *app* element, not the window — matching yabai's
         // AX_ENHANCED_UI_WORKAROUND. Without this, Chrome/Electron/Firefox (and
         // anything running while VoiceOver is on) animate or mis-place the move.
-        let appElement = AXUIElementCreateApplication(pid)
-        let hadEnhancedUI = enhancedUserInterfaceEnabled(appElement)
-        if hadEnhancedUI {
-            AXUIElementSetAttributeValue(appElement, kAXEnhancedUserInterface, kCFBooleanFalse)
-        }
-        defer {
-            if hadEnhancedUI {
-                AXUIElementSetAttributeValue(appElement, kAXEnhancedUserInterface, kCFBooleanTrue)
-            }
-        }
+        let suppressed = suppressEnhancedUserInterface(pids: [pid])
+        defer { restoreEnhancedUserInterface(suppressed) }
 
         let isGrowing: Bool
         if let hint = currentHint {
@@ -388,6 +380,37 @@ enum AXWindowService {
               CFGetTypeID(valueRef) == CFBooleanGetTypeID()
         else { return false }
         return CFBooleanGetValue((valueRef as! CFBoolean))
+    }
+
+    /// Clear AXEnhancedUserInterface on every app in `pids` where it is
+    /// currently set, returning the app elements that were cleared so the
+    /// caller can hand them to 'restoreEnhancedUserInterface' when its
+    /// geometry writes are done. While the flag is set, Chrome/Electron/
+    /// Gecko route AX geometry writes through an animated path: the write
+    /// is acknowledged but applies late — or never, for a window whose
+    /// compositing is throttled (fully occluded, e.g. parked in the hide
+    /// corner). With the flag cleared, writes apply synchronously.
+    static func suppressEnhancedUserInterface(
+        pids: some Sequence<pid_t>
+    ) -> [AXUIElement] {
+        var suppressed: [AXUIElement] = []
+        for pid in pids {
+            let app = AXUIElementCreateApplication(pid)
+            if enhancedUserInterfaceEnabled(app) {
+                AXUIElementSetAttributeValue(app, kAXEnhancedUserInterface, kCFBooleanFalse)
+                suppressed.append(app)
+            }
+        }
+        return suppressed
+    }
+
+    /// Re-set AXEnhancedUserInterface on app elements previously cleared by
+    /// 'suppressEnhancedUserInterface'. Restoring matters: VoiceOver relies
+    /// on the flag being left the way its owner set it.
+    static func restoreEnhancedUserInterface(_ apps: [AXUIElement]) {
+        for app in apps {
+            AXUIElementSetAttributeValue(app, kAXEnhancedUserInterface, kCFBooleanTrue)
+        }
     }
 
     // MARK: - Internal: find AX element for window

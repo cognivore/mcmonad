@@ -11,6 +11,7 @@ import MCMonad.Core
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
+    , windowSetToSerial
     )
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
@@ -641,7 +642,7 @@ prop_persistence_round_trip = forAll genPersistCase $ \(savedRefs, kept, extras)
         ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
         liveSet = Set.fromList [WindowRef (wiWindowId wi) (wiPid wi) | wi <- lives]
         stale = filter (`Set.notMember` liveSet) (W.allWindows ws0)
-        ws = foldr W.delete' ws0 stale
+        ws = foldr W.delete ws0 stale
         present = W.allWindows ws
         staleRefs = filter (`notElem` kept) savedRefs
     in counterexample ("kept=" ++ show kept ++ " stale=" ++ show staleRefs
@@ -660,7 +661,7 @@ prop_persistence_unmatched_are_new = forAll genPersistCase $ \(savedRefs, kept, 
         ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
         liveSet = Set.fromList [WindowRef (wiWindowId wi) (wiPid wi) | wi <- lives]
         stale = filter (`Set.notMember` liveSet) (W.allWindows ws0)
-        ws = foldr W.delete' ws0 stale
+        ws = foldr W.delete ws0 stale
         inWs wi = let wr = WindowRef (wiWindowId wi) (wiPid wi) in W.member wr ws
         unmatched = filter (not . inWs) lives
         expectedNew = [ WindowRef (wiWindowId wi) (wiPid wi) | wi <- unmatched ]
@@ -677,7 +678,7 @@ prop_persistence_workspace_preserved = forAll genPersistCase $ \(savedRefs, kept
         ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
         liveSet = Set.fromList kept
         stale = filter (`Set.notMember` liveSet) (W.allWindows ws0)
-        ws = foldr W.delete' ws0 stale
+        ws = foldr W.delete ws0 stale
         -- Expected: "L" holds wrL1 and/or wrL2; "R" holds wrR1.
         [wrL1, wrL2, wrR1] = savedRefs
         windowsOn tag = case lookup tag [(W.tag w, W.integrate' (W.stack w))
@@ -694,6 +695,69 @@ prop_persistence_workspace_preserved = forAll genPersistCase $ \(savedRefs, kept
         , counterexample ("wrR1 on R? kept=" ++ show kept)
             ((wrR1 `elem` kept) === (wrR1 `elem` rWins))
         ]
+
+-- === FLOATING-MAP HYGIENE (the mcmonad.state leak) ===
+--
+-- 'W.float' inserts into the floating map unconditionally and
+-- 'W.delete'' deliberately skips it (xmonad keeps the entry for
+-- temporary removals), so float-only entries for dead windows used to
+-- accumulate in mcmonad.state forever (~480 observed on 2026-07-17).
+-- Three guards now enforce the invariant floating ⊆ allWindows:
+-- restore prunes, save filters, and the unmanage / stale-window paths
+-- use the full 'W.delete'.
+
+-- Restoring a snapshot whose ssFloating carries entries for windows
+-- absent from every stack drops exactly those entries.
+prop_floating_pruned_on_restore :: Property
+prop_floating_pruned_on_restore = forAll genPersistCase $ \(savedRefs, _, _) ->
+    let wrL1 = head savedRefs
+        garbage = WindowRef 9999 9999
+        saved = (buildSavedState savedRefs)
+            { ssFloating = [ (wrL1,    (0.1, 0.1, 0.5, 0.5))
+                           , (garbage, (0.2, 0.2, 0.5, 0.5))
+                           ]
+            }
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) twoTags twoScreens saved
+    in counterexample ("floating=" ++ show (Map.keys (W.floating ws))) $
+       Map.member wrL1 (W.floating ws)
+       .&&. not (Map.member garbage (W.floating ws))
+
+-- Saving keeps floating entries for members and never emits one for a
+-- float-only (leaked) window.
+prop_floating_pruned_on_save :: Property
+prop_floating_pruned_on_save = forAll genPersistCase $ \(savedRefs, _, _) ->
+    let wrL1 = head savedRefs
+        garbage = WindowRef 9999 9999
+        ws0 :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens
+                                (buildSavedState savedRefs)
+        ws  = ws0 { W.floating = Map.fromList
+                        [ (wrL1,    W.RationalRect 0.1 0.1 0.5 0.5)
+                        , (garbage, W.RationalRect 0.2 0.2 0.5 0.5)
+                        ]
+                  }
+        ser = windowSetToSerial ws Map.empty [] 1
+        savedFloats = map fst (ssFloating ser)
+    in counterexample ("ssFloating=" ++ show savedFloats) $
+       (wrL1 `elem` savedFloats) .&&. (garbage `notElem` savedFloats)
+
+-- The stale-window reconciliation at restore uses the full 'W.delete':
+-- a floated stale window loses its floating entry along with its stack
+-- slot.
+prop_stale_delete_clears_floating :: Property
+prop_stale_delete_clears_floating = forAll genPersistCase $ \(savedRefs, _, _) ->
+    let wrL1 = head savedRefs
+        saved = (buildSavedState savedRefs)
+            { ssFloating = [ (wrL1, (0.1, 0.1, 0.5, 0.5)) ] }
+        ws0 :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws0 = serialToWindowSet (0 :: Int) twoTags twoScreens saved
+        -- wrL1 died while mcmonad was down: reconcile exactly as
+        -- 'restoreSnapshot' does.
+        ws = foldr W.delete ws0 [wrL1]
+    in counterexample ("floating=" ++ show (Map.keys (W.floating ws))) $
+       not (W.member wrL1 ws)
+       .&&. not (Map.member wrL1 (W.floating ws))
 
 -- === serialToWindowSet RESPECTS ssAffinity ===
 --
@@ -857,6 +921,10 @@ allProperties =
     , ("persistence: kept saved survives, stale dropped", property prop_persistence_round_trip)
     , ("persistence: live-not-saved becomes 'new'",       property prop_persistence_unmatched_are_new)
     , ("persistence: surviving windows stay on workspace",property prop_persistence_workspace_preserved)
+    -- Floating-map hygiene (the mcmonad.state leak)
+    , ("floating: restore prunes float-only entries",  property prop_floating_pruned_on_restore)
+    , ("floating: save filters float-only entries",    property prop_floating_pruned_on_save)
+    , ("floating: stale delete clears floating",       property prop_stale_delete_clears_floating)
     -- serialToWindowSet restoring per-screen workspace assignment
     , ("serialToWindowSet respects ssAffinity",       property prop_serialToWindowSet_respects_affinity_two_screens)
     , ("serialToWindowSet preserves current tag",     property prop_serialToWindowSet_preserves_current_tag)

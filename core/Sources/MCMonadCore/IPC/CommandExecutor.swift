@@ -222,6 +222,10 @@ final class CommandExecutor {
                          + "delta=(\(fmtCoord(dx)),\(fmtCoord(dy)),"
                          + "\(fmtCoord(dw)),\(fmtCoord(dh)))"
                 )
+                if !obeyed {
+                    scheduleReverify(windowId: a.windowId, pid: a.pid,
+                                     want: a.frame)
+                }
             } else {
                 FrameLog.emit(source: .verified,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
@@ -234,6 +238,42 @@ final class CommandExecutor {
     private func fmtCoord(_ d: CGFloat) -> String {
         let s = String(format: "%.1f", Double(d))
         return s.hasSuffix(".0") ? String(s.dropLast(2)) : s
+    }
+
+    /// A DEFIED verdict from the synchronous phase-5 readback is a false
+    /// positive for apps that apply AX geometry writes asynchronously
+    /// (Gecko once its a11y engine has engaged — even with
+    /// AXEnhancedUserInterface suppressed around the write, the app
+    /// processes the queued setter on its own time). Re-read once after a
+    /// grace period and log the ground truth so DEFIED lines can be told
+    /// apart from genuinely refused moves without hand-correlating later
+    /// `observed` events. Observability only — the brain's declarative
+    /// re-assertion is the corrective path.
+    private func scheduleReverify(windowId: UInt32, pid: Int32, want: CGRect) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let tHash = TitleHash.hash(windowId: windowId, pid: pid)
+            let wantStr = "want=(\(fmtCoord(want.origin.x)),"
+                        + "\(fmtCoord(want.origin.y)),"
+                        + "\(fmtCoord(want.width)),"
+                        + "\(fmtCoord(want.height))) graceMs=500"
+            guard let actual = SkyLight.shared.getWindowBounds(windowId) else {
+                FrameLog.emit(source: .reverified, windowId: windowId,
+                              pid: pid, tHash: tHash, result: "no-bounds",
+                              extra: wantStr)
+                return
+            }
+            let obeyed = abs(actual.origin.x - want.origin.x) < 1.5
+                      && abs(actual.origin.y - want.origin.y) < 1.5
+                      && abs(actual.width - want.width) < 1.5
+                      && abs(actual.height - want.height) < 1.5
+            FrameLog.emit(
+                source: .reverified,
+                windowId: windowId, pid: pid, rect: actual, tHash: tHash,
+                result: obeyed ? "obeyed-late" : "still-defied",
+                extra: wantStr
+            )
+        }
     }
 
     private func executeFocusWindow(windowId: UInt32, pid: Int32) {
@@ -313,6 +353,8 @@ final class CommandExecutor {
         fputs("CMD: hide-windows ids=\(windowIds)\n", stderr)
         guard !windowIds.isEmpty else { return }
 
+        let allScreens = displayManager.currentScreens()
+
         // Park each window 1px inside the bottom-right corner of the screen it
         // is on, leaving only a ~1px sliver visible. The origin MUST stay
         // inside the display union: a window placed *fully* off-screen gets
@@ -333,13 +375,19 @@ final class CommandExecutor {
                 continue
             }
             let corner = CGPoint(x: screen.frame.maxX - 1, y: screen.frame.maxY - 1)
-            // Already parked: x pinned at the corner (macOS' titlebar clamp
+            // Already parked: x pinned at a corner (macOS' titlebar clamp
             // only pulls y back, so x is the discriminator). Skip the AX
             // write — this makes hide re-assertion idempotent-cheap, and the
             // brain leans on that by re-sending the full park list on every
-            // front-app change to heal the silent bulk un-park macOS
-            // performs on hidden windows during fullscreen Space transitions.
-            if snap.frame.origin.x >= screen.frame.maxX - 2 {
+            // front-app change / drift report to heal the silent bulk
+            // un-park macOS performs on hidden windows during fullscreen
+            // Space transitions. Checked against EVERY screen's right edge,
+            // not the resolved `screen`: a parked frame hangs almost
+            // entirely off its own display, so on multi-monitor setups
+            // `screen(forFrame:)` resolves the neighbour and a
+            // single-screen check would re-park (and slowly migrate) the
+            // window on every re-assert.
+            if allScreens.contains(where: { snap.frame.origin.x >= $0.frame.maxX - 2 }) {
                 continue
             }
             let target = CGRect(origin: corner, size: snap.frame.size)

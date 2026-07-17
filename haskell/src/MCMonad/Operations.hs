@@ -9,6 +9,7 @@ module MCMonad.Operations
     , manage
     , manageSilent
     , unmanage
+    , unmanagedOriginTTL
       -- * Overlay snapshot
     , buildOverlaySnapshot
     , pushOverlaySnapshot
@@ -59,11 +60,13 @@ import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Pair)
 import qualified Data.ByteString.Lazy as LBS
-import Data.List (find)
+import Data.Int (Int32)
+import Data.List (find, sortBy)
 import Data.Monoid (Endo(..))
+import Data.Ord (Down(..), comparing)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
-import Data.Time.Clock (NominalDiffTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
 import System.Directory (doesFileExist, getHomeDirectory, createDirectoryIfMissing)
@@ -469,6 +472,35 @@ findScreenForWindow w ws =
 -- ---------------------------------------------------------------------------
 -- Window lifecycle
 
+-- | How long a destroyed last-window's workspace stays authoritative for
+-- the pid's next window (see 'unmanagedOrigin'). A native-fullscreen
+-- session spans the whole destroy→recreate gap — Gecko kills the normal
+-- window on ENTER and only recreates it on exit — so this must be hours,
+-- not seconds. It is still bounded so a browser whose last window was
+-- closed on workspace X today doesn't teleport a fresh window there
+-- tomorrow.
+unmanagedOriginTTL :: NominalDiffTime
+unmanagedOriginTTL = 4 * 3600
+
+-- | Upper bound on remembered destroy-origins; pathological churn of
+-- single-window apps must not grow the map without limit.
+unmanagedOriginCap :: Int
+unmanagedOriginCap = 64
+
+-- | Drop expired origin entries and enforce the size cap (newest kept).
+pruneOrigins
+    :: UTCTime
+    -> M.Map Int32 (String, UTCTime)
+    -> M.Map Int32 (String, UTCTime)
+pruneOrigins now m
+    | M.size fresh <= unmanagedOriginCap = fresh
+    | otherwise = M.fromList
+        . take unmanagedOriginCap
+        . sortBy (comparing (Down . snd . snd))
+        . M.toList $ fresh
+  where
+    fresh = M.filter (\(_, at) -> diffUTCTime now at <= unmanagedOriginTTL) m
+
 -- | Manage a new window: run the manage hook, insert it into the current
 -- workspace, and apply any hook-specified transformations (float, shift, etc.).
 manage :: WindowInfo -> ManageHook -> M ()
@@ -478,9 +510,35 @@ manage wi hook = do
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
+        -- Destroy/recreate affinity: if this pid's last window was
+        -- destroyed recently ('unmanagedOrigin'), this window is its
+        -- replacement — Gecko destroys and recreates the NSWindow
+        -- across a native-fullscreen round-trip — so route it back to
+        -- the workspace the destroyed window lived on. The route runs
+        -- before the manage hook's transform, so an explicit doShift
+        -- in the user's config still wins.
+        now <- io getCurrentTime
+        origins <- gets unmanagedOrigin
+        let allTags = map W.tag (W.workspace (W.current ws)
+                                 : map W.workspace (W.visible ws)
+                                 ++ W.hidden ws)
+            originTag = case M.lookup (wiPid wi) origins of
+                Just (tag, at)
+                    | diffUTCTime now at <= unmanagedOriginTTL
+                    , tag `elem` allTags -> Just tag
+                _ -> Nothing
+            route = maybe id (`W.shiftWin` wr) originTag
         modify $ \s -> s
-            { windowMetadata = M.insert wr (metadataFromInfo wi) (windowMetadata s) }
-        windows (transform . W.insertUp wr)
+            { windowMetadata  = M.insert wr (metadataFromInfo wi) (windowMetadata s)
+            , unmanagedOrigin = M.delete (wiPid wi) (unmanagedOrigin s)
+            }
+        windows (transform . route . W.insertUp wr)
+        -- A window routed to a hidden workspace never enters the
+        -- visible set, so the 'windows' call above did not change it
+        -- and issued no hides — the new window would sit on screen at
+        -- whatever frame its app chose. Park it (and any other
+        -- straggler) explicitly.
+        whenJust originTag $ \_ -> reassertHiddenWindows
 
 -- | Insert a window into the StackSet without triggering layout.
 -- Used during startup to batch-insert all existing windows.
@@ -500,13 +558,34 @@ unmanage :: WindowRef -> M ()
 unmanage w = do
     ws <- gets windowset
     when (W.member w ws) $ do
+        -- Remember where the pid's LAST window lived so 'manage' can
+        -- route a destroy/recreate replacement (Gecko's fullscreen
+        -- round-trip) back to it. Multi-window apps skip this: the
+        -- surviving windows make "which workspace" ambiguous, and a
+        -- genuinely new window of a running app belongs on the current
+        -- workspace anyway.
+        now <- io getCurrentTime
+        let lastOfPid = not (any (\o -> o /= w && wrPid o == wrPid w)
+                                 (W.allWindows ws))
+        case W.findTag w ws of
+            Just tag | lastOfPid -> modify $ \s -> s
+                { unmanagedOrigin =
+                    M.insert (wrPid w) (tag, now)
+                             (pruneOrigins now (unmanagedOrigin s))
+                }
+            _ -> return ()
         -- Clean from sticky, scratchpads, and metadata before removing
         modify $ \s -> s
             { sticky         = S.delete w (sticky s)
             , scratchpads    = M.filter (/= w) (scratchpads s)
             , windowMetadata = M.delete w (windowMetadata s)
             }
-        windows (W.delete' w)
+        -- W.delete, not W.delete': delete' deliberately leaves the
+        -- floating entry behind (xmonad keeps it for temporary
+        -- removals), but a destroyed CGWindowID never comes back —
+        -- the leaked entries accumulated in mcmonad.state by the
+        -- hundreds before this used the full delete.
+        windows (W.delete w)
 
 -- ---------------------------------------------------------------------------
 -- Layout messages

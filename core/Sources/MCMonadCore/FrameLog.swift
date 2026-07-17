@@ -55,6 +55,14 @@ enum FrameLog {
         // survives disableUpdate and tells us per-assignment whether
         // each window obeyed the move.
         case verified
+
+        // Grace-period follow-up to a DEFIED 'verified' line. Apps whose
+        // AX geometry writes apply asynchronously (Gecko with its a11y
+        // engine engaged) make the synchronous readback race the apply;
+        // this re-read ~500ms later records whether the move landed after
+        // all (result=obeyed-late) or was genuinely refused
+        // (result=still-defied).
+        case reverified
     }
 
     private static let lock = NSLock()

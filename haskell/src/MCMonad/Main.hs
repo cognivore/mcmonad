@@ -115,6 +115,7 @@ launch cfg = do
                        , timers = restoredTimers
                        , nextTimerId = restoredNextTimerId
                        , focusIntent = Nothing
+                       , unmanagedOrigin = Map.empty
                        }
 
     _ <- runM mconf mst0 $ do
@@ -187,9 +188,13 @@ restoreSnapshot cfg screens existingWindows = do
                     | wi <- existingWindows
                     ]
                 -- Saved windows whose (wid, pid) isn't in the live set
-                -- — these died while mcmonad was down. Drop them.
+                -- — these died while mcmonad was down. Drop them with
+                -- the full 'W.delete' (not 'W.delete''), which also
+                -- clears their floating entries — dead windows never
+                -- come back under the same id, and 'delete'' here was
+                -- one of the leaks that bloated mcmonad.state.
                 staleSaved = filter (`Set.notMember` liveSet) (W.allWindows ws0)
-                ws = foldr W.delete' ws0 staleSaved
+                ws = foldr W.delete ws0 staleSaved
                 -- Live windows we don't have in the saved set go
                 -- through the manage hook.
                 inWs wi =
@@ -362,8 +367,22 @@ handleEvent debug cfg hotkeyIdMap evt = do
                     rh = toRational (rect_h rect / rect_h screenR)
                 windows (W.float wr (W.RationalRect rx ry rw rh))
 
-        FocusedWindowChanged wid pid ->
+        FocusedWindowChanged wid pid -> do
             handleFocusedWindowChanged wid pid
+            -- A should-be-hidden window receiving AX focus means the
+            -- user reached it on screen — it drifted (fullscreen-
+            -- transition sweep, app self-move) and is lying around as
+            -- a "background". FrontAppChanged below heals cross-app
+            -- clicks; this covers a drifted window of the app that is
+            -- already frontmost. Also fires on macOS' post-switch
+            -- focus bounces for freshly hidden windows, where it is a
+            -- cheap no-op (the daemon skips windows already parked).
+            ws <- gets windowset
+            mappedSet <- gets mapped
+            case findByWindowId wid (W.allWindows ws) of
+                Just wref | not (Set.member wref mappedSet) ->
+                    reassertHiddenWindows
+                _ -> return ()
 
         FocusedWindowQueryResponse wid pid -> do
             -- Answer to our own 'QueryFocusedWindow' (the Mod-Cmd-Shift-J

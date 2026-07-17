@@ -41,7 +41,6 @@ module MCMonad.Persistence
     , serialToWindowSet
     ) where
 
-import Data.List (foldl')
 import qualified Data.Map.Strict as Map
 import qualified XMonad.StackSet as W
 
@@ -115,6 +114,12 @@ windowSetToSerial ws aff timers' nextTimerId' = SerialState
     , ssFloating   =
         [ (w, (rx, ry, rw, rh))
         | (w, W.RationalRect rx ry rw rh) <- Map.toList (W.floating ws)
+        -- Never persist a floating entry for a window that isn't in
+        -- some stack. Float-only entries are leaks ('W.float' inserts
+        -- unconditionally; historical 'W.delete'' call sites skipped
+        -- the floating map) and grew mcmonad.state by hundreds of dead
+        -- windows before this guard existed.
+        , W.member w ws
         ]
     , ssAffinity   = [(tag, n) | (tag, S n) <- Map.toList aff]
     , ssTimers     = timers'
@@ -149,8 +154,9 @@ serialToWindowSet
     -> [(ScreenId, ScreenDetail)]          -- ^ live screen geometry
     -> SerialState WindowRef
     -> W.StackSet String l WindowRef ScreenId ScreenDetail
-serialToWindowSet layout allTags screens saved =
-    W.StackSet
+serialToWindowSet layout allTags screens saved = pruneFloating built
+  where
+    built = W.StackSet
         { W.current  = currentSc
         , W.visible  = visibleScs
         , W.hidden   = hiddenWSs
@@ -159,7 +165,16 @@ serialToWindowSet layout allTags screens saved =
             | (w, (rx, ry, rw, rh)) <- ssFloating saved
             ]
         }
-  where
+
+    -- Mirror of the save-side guard in 'windowSetToSerial': a snapshot
+    -- written by an older binary (or one whose stacks were filtered to
+    -- the current config's tags) may carry floating entries for windows
+    -- that appear in no stack. Restoring them would resurrect the leak,
+    -- so keep only entries whose window is a member of the rebuilt set.
+    pruneFloating ws = ws
+        { W.floating = Map.filterWithKey (\w _ -> W.member w ws)
+                                         (W.floating ws)
+        }
     savedMap = Map.fromList (ssStacks saved)
     mkWorkspace tag = W.Workspace tag layout $ case Map.lookup tag savedMap of
         Just (Just s) -> Just (W.Stack (ssFocus s) (ssUp s) (ssDown s))

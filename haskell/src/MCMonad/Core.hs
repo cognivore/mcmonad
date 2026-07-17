@@ -329,6 +329,20 @@ data MState = MState
       -- looping forever in a pathological case and lets user-initiated
       -- focus changes from outside mcmonad eventually take effect.
       -- See the 'FocusIntent' note at the end of this module.
+    , unmanagedOrigin  :: !(Map.Map Int32 (String, UTCTime))
+      -- ^ pid → (workspace tag, time) of the pid's most recently
+      -- destroyed *last* window. Some apps (Gecko\/LibreWolf) destroy
+      -- and recreate their NSWindow across a native-fullscreen
+      -- round-trip, so the replacement arrives as a brand-new
+      -- CGWindowID; 'MCMonad.Operations.manage' consults this map to
+      -- route it back to the workspace the destroyed window lived on
+      -- instead of dropping it on whatever workspace happens to be
+      -- current. Recorded only when the destroyed window was the pid's
+      -- last (multi-window apps keep the plain current-workspace
+      -- placement), consumed on first use, and entries expire after
+      -- 'MCMonad.Operations.unmanagedOriginTTL'. Deliberately not
+      -- persisted: pids don't survive the reboots that persistence
+      -- exists for, and a Mod-q mid-fullscreen is a corner we accept.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's

@@ -3,6 +3,8 @@
 module MCMonad.Operations
     ( -- * Core state transition
       windows
+    , reassertHiddenWindows
+    , frameAtParkCorner
       -- * Window lifecycle
     , manage
     , manageSilent
@@ -316,6 +318,40 @@ allManagedWindows :: WindowSet -> [WindowRef]
 allManagedWindows ws =
     concatMap (W.integrate' . W.stack)
               (map W.workspace (W.current ws : W.visible ws) ++ W.hidden ws)
+
+-- | Re-send the park command for every managed window that should not be
+-- on screen. macOS un-parks hidden windows in bulk during native-fullscreen
+-- Space transitions: each corner-parked window is silently re-constrained
+-- fully on-screen at (screenRight - width, menubar bottom), with no
+-- per-window move event for the sweep itself — the "background flood" on
+-- every workspace after a fullscreen round-trip. Since there is no event
+-- for the sweep, the heal is declarative re-assertion from whatever
+-- signals do arrive afterwards (front-app changes, a straggler's own
+-- frame event). Safe to call liberally: mcmonad-core skips the AX write
+-- for windows already at the park corner, so a re-assert where nothing
+-- drifted costs one IPC message and a SkyLight read per hidden window.
+reassertHiddenWindows :: M ()
+reassertHiddenWindows = do
+    ws <- gets windowset
+    stickySet <- gets sticky
+    let visible = allVisibleWindows ws
+        toHide = filter (\w -> w `notElem` visible && not (S.member w stickySet))
+                        (allManagedWindows ws)
+    unless (null toHide) $ do
+        conn <- asks connection
+        io $ sendCommand conn (HideWindows (map wrWindowId toHide))
+
+-- | Is this frame at (or clamped near) some screen's park corner? Parks
+-- pin the origin's x to screenRight - 1, and macOS' ordinary titlebar
+-- clamp only pulls y back on-screen — x is the discriminator. The
+-- fullscreen-transition sweep instead re-fits windows fully on-screen
+-- (x = screenRight - width), which this rejects.
+frameAtParkCorner :: Rectangle -> WindowSet -> Bool
+frameAtParkCorner r ws = any nearRightEdge screenRects
+  where
+    screenRects = [ screenRect (W.screenDetail scr)
+                  | scr <- W.current ws : W.visible ws ]
+    nearRightEdge sr = rect_x r >= rect_x sr + rect_w sr - 2
 
 -- | Convert a (WindowRef, Rectangle) pair to a FrameAssignment.
 toFrameAssignment :: (WindowRef, Rectangle) -> FrameAssignment

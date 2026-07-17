@@ -333,6 +333,15 @@ final class CommandExecutor {
                 continue
             }
             let corner = CGPoint(x: screen.frame.maxX - 1, y: screen.frame.maxY - 1)
+            // Already parked: x pinned at the corner (macOS' titlebar clamp
+            // only pulls y back, so x is the discriminator). Skip the AX
+            // write — this makes hide re-assertion idempotent-cheap, and the
+            // brain leans on that by re-sending the full park list on every
+            // front-app change to heal the silent bulk un-park macOS
+            // performs on hidden windows during fullscreen Space transitions.
+            if snap.frame.origin.x >= screen.frame.maxX - 2 {
+                continue
+            }
             let target = CGRect(origin: corner, size: snap.frame.size)
             FrameLog.emit(source: .cmdHideMove,
                           windowId: wid, pid: snap.pid, rect: target,

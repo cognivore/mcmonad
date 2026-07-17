@@ -332,11 +332,22 @@ handleEvent debug cfg hotkeyIdMap evt = do
             let mref = findByWindowId wid (W.allWindows ws)
             whenJust mref $ \wref -> unmanage wref
 
-        WindowFrameChanged _wid _rect ->
+        WindowFrameChanged wid rect -> do
             -- SkyLight frame-change events fire constantly (including from our
-            -- own SetFrames). Ignore them — drag completion is handled by the
-            -- explicit WindowDragCompleted event below.
-            return ()
+            -- own SetFrames); drag completion is handled by the explicit
+            -- WindowDragCompleted event below. The one report we act on: a
+            -- window that should be parked showing up with an on-screen
+            -- frame. macOS un-parks every hidden window in one silent sweep
+            -- during native-fullscreen Space transitions (no move events for
+            -- the sweep itself), so a single straggler's drift report
+            -- triggers a full re-park, not a one-window fix.
+            ws <- gets windowset
+            mappedSet <- gets mapped
+            case findByWindowId wid (W.allWindows ws) of
+                Just wref | not (Set.member wref mappedSet)
+                          , not (frameAtParkCorner rect ws)
+                    -> reassertHiddenWindows
+                _   -> return ()
 
         WindowDragCompleted wid pid rect -> do
             -- User finished an Option+drag move/resize. Auto-float the window
@@ -365,8 +376,14 @@ handleEvent debug cfg hotkeyIdMap evt = do
             let wr = WindowRef wid pid
             when (W.member wr ws) $ windows (W.focusWindow wr)
 
-        FrontAppChanged pid ->
+        FrontAppChanged pid -> do
             handleFrontAppChanged pid
+            -- The first front-app change after a native-fullscreen Space
+            -- transition is the earliest reliable moment to heal the silent
+            -- un-park sweep (see WindowFrameChanged above) — the sweep
+            -- itself emits nothing. Idempotent-cheap: mcmonad-core skips
+            -- windows already at the park corner.
+            reassertHiddenWindows
 
         MouseEnteredWindow wid _pid ->
             when (focusFollowsMouse cfg) $ do

@@ -387,7 +387,15 @@ final class CommandExecutor {
             // `screen(forFrame:)` resolves the neighbour and a
             // single-screen check would re-park (and slowly migrate) the
             // window on every re-assert.
-            if allScreens.contains(where: { snap.frame.origin.x >= $0.frame.maxX - 2 }) {
+            //
+            // The right-edge test alone is NOT sufficient: on a horizontal
+            // multi-monitor layout the right screen's minX equals the left
+            // screen's maxX, so every ordinary window tiled on the right
+            // display sits at x >= (left screen's maxX) - 2 and would be
+            // mistaken for parked — leaving the second monitor's windows
+            // permanently unhideable. Pair it with the sliver test: a truly
+            // parked window shows at most a ~1px column on any display.
+            if isAlreadyParked(snap.frame, screens: allScreens) {
                 continue
             }
             let target = CGRect(origin: corner, size: snap.frame.size)
@@ -413,4 +421,23 @@ final class CommandExecutor {
         fputs("CMD: show-windows ids=\(windowIds)\n", stderr)
         // SetFrames follows immediately and repositions windows correctly.
     }
+}
+
+/// Is this frame already parked in some screen's bottom-right corner?
+///
+/// Two conditions, both required. The origin must be pinned at a screen's
+/// right edge (parks set x = maxX - 1; macOS' titlebar clamp only pulls y
+/// back on-screen, so x survives), AND the frame must show no more than a
+/// sliver on any display. The second half is what keeps adjacent monitors
+/// apart: on a side-by-side layout the right display's minX *is* the left
+/// display's maxX, so an ordinary window tiled at the right screen's left
+/// edge passes the edge test while still being fully visible.
+func isAlreadyParked(_ frame: CGRect, screens: [ScreenInfo]) -> Bool {
+    let atRightEdge = screens.contains { frame.origin.x >= $0.frame.maxX - 2 }
+    guard atRightEdge else { return false }
+    let widestExposure = screens
+        .map { $0.frame.intersection(frame) }
+        .map { $0.isNull ? 0 : $0.width }
+        .max() ?? 0
+    return widestExposure <= 2
 }

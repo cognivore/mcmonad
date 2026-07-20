@@ -13,6 +13,7 @@ import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     , windowSetToSerial
     )
+import MCMonad.Operations (frameAtParkCorner, reassignScreens)
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
@@ -337,6 +338,19 @@ currentWorkspaceWindowsForTest :: TestStackSet -> [WindowRef]
 currentWorkspaceWindowsForTest ss =
     W.integrate' (W.stack (W.workspace (W.current ss)))
 
+-- Mirror of 'MCMonad.Core.visibleScreenWindows': everything displayed on
+-- some monitor. This is the reach of the focus resolvers.
+visibleScreenWindowsForTest :: TestStackSet -> [WindowRef]
+visibleScreenWindowsForTest ss =
+    concatMap (W.integrate' . W.stack . W.workspace)
+              (W.current ss : W.visible ss)
+
+-- Windows parked on a hidden workspace. Permanently out of reach: no
+-- macOS focus signal may change *what is displayed*.
+hiddenWindowsForTest :: TestStackSet -> [WindowRef]
+hiddenWindowsForTest ss =
+    concatMap (W.integrate' . W.stack) (W.hidden ss)
+
 -- For any window on the *current* workspace, asking resolveFocusedWindow
 -- for it results in that exact window being focused — regardless of
 -- whether other windows share its PID. This is the within-workspace
@@ -357,25 +371,44 @@ prop_focusedWindow_picks_exact ss = case currentWorkspaceWindowsForTest ss of
 -- the current screen anywhere the user didn't ask.
 prop_focusedWindow_off_workspace_is_no_op :: TestStackSet -> Property
 prop_focusedWindow_off_workspace_is_no_op ss =
-    let curWins = currentWorkspaceWindowsForTest ss
-        offWorkspace = filter (`notElem` curWins) (W.allWindows ss)
-    in case offWorkspace of
+    case hiddenWindowsForTest ss of
         [] -> property True
         wins -> forAll (elements wins) $ \wr ->
             property $ isNothing
                      $ resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss
 
--- resolveFocusedWindow never changes the current tag. With the
--- current-workspace restriction this is now an absolute invariant:
--- any focus the helper accepts is already on the current workspace,
--- so 'W.focusWindow' is a within-stack reorder, not a 'view'.
-prop_focusedWindow_never_switches_workspace :: TestStackSet -> Property
-prop_focusedWindow_never_switches_workspace ss = case W.allWindows ss of
+-- resolveFocusedWindow never *displays* a workspace that wasn't already
+-- displayed. It may move the current screen to a secondary monitor
+-- (that's "active workspace follows focus"), so the current tag can
+-- change — but only to a tag that was already on a monitor, and the set
+-- of displayed tags is untouched.
+prop_focusedWindow_never_changes_displayed_set :: TestStackSet -> Property
+prop_focusedWindow_never_changes_displayed_set ss = case W.allWindows ss of
     [] -> property True
     wins -> forAll (elements wins) $ \wr ->
         case resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss of
             Nothing  -> property True
-            Just ss' -> W.currentTag ss' === W.currentTag ss
+            Just ss' -> displayedTags ss' === displayedTags ss
+  where
+    displayedTags s =
+        L.sort (map (W.tag . W.workspace) (W.current s : W.visible s))
+
+-- The point of the widening: a window on a secondary monitor can be
+-- focused, and doing so makes that monitor current. Clicking a window
+-- on the other screen moves mcmonad's notion of "here".
+prop_focusedWindow_follows_to_other_screen :: TestStackSet -> Property
+prop_focusedWindow_follows_to_other_screen ss =
+    let secondary = concatMap (W.integrate' . W.stack . W.workspace)
+                              (W.visible ss)
+    in case secondary of
+        [] -> property True
+        wins -> forAll (elements wins) $ \wr ->
+            case resolveFocusedWindow (wrWindowId wr) (wrPid wr) ss of
+                Nothing  -> property False  -- displayed window must resolve
+                Just ss' -> conjoin
+                    [ W.peek ss' === Just wr
+                    , W.findTag wr ss' === Just (W.currentTag ss')
+                    ]
 
 -- resolveFocusedWindow preserves the no-duplicates invariant.
 prop_focusedWindow_invariant :: TestStackSet -> Property
@@ -440,16 +473,67 @@ prop_frontApp_switches_within_workspace ss = case W.peek ss of
                 Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
                 Nothing  -> property False  -- a current-workspace window of pid p exists; must switch
 
--- resolveFrontApp never changes the current tag.
-prop_frontApp_never_switches_workspace :: TestStackSet -> Property
-prop_frontApp_never_switches_workspace ss =
+-- resolveFrontApp never displays a workspace that wasn't displayed. As
+-- with the AX path it may move the current screen, but only among
+-- monitors that are already showing those workspaces.
+prop_frontApp_never_changes_displayed_set :: TestStackSet -> Property
+prop_frontApp_never_changes_displayed_set ss =
     let pids = L.nub $ map wrPid (W.allWindows ss)
     in case pids of
         [] -> property True
         _  -> forAll (elements pids) $ \p ->
             case resolveFrontApp p ss of
                 Nothing  -> property True
+                Just ss' -> displayedTags ss' === displayedTags ss
+  where
+    displayedTags s =
+        L.sort (map (W.tag . W.workspace) (W.current s : W.visible s))
+
+-- An app whose windows are ALL on hidden workspaces is never followed:
+-- activating it must not haul a hidden workspace onto a monitor.
+prop_frontApp_ignores_hidden_only_app :: TestStackSet -> Property
+prop_frontApp_ignores_hidden_only_app ss =
+    let visiblePids = map wrPid (visibleScreenWindowsForTest ss)
+        hiddenOnly  = L.nub [ wrPid w | w <- hiddenWindowsForTest ss
+                            , wrPid w `notElem` visiblePids ]
+    in case hiddenOnly of
+        [] -> property True
+        ps -> forAll (elements ps) $ \p ->
+            property $ isNothing (resolveFrontApp p ss)
+
+-- A PID says nothing about *which* window was activated, so an app with
+-- a window on the current screen resolves to that one — activating
+-- LibreWolf must not fling the current screen to whichever monitor
+-- happens to hold LibreWolf's first window in stack order.
+prop_frontApp_prefers_current_screen :: TestStackSet -> Property
+prop_frontApp_prefers_current_screen ss =
+    let here = currentWorkspaceWindowsForTest ss
+        candidates = L.nub [ wrPid w | w <- here
+                           , Just (wrPid w) /= fmap wrPid (W.peek ss) ]
+    in case candidates of
+        [] -> property True
+        ps -> forAll (elements ps) $ \p ->
+            case resolveFrontApp p ss of
+                Nothing  -> property False  -- an app window is right here
                 Just ss' -> W.currentTag ss' === W.currentTag ss
+
+-- ...but when the app has no window on this screen at all, focus does
+-- follow it to the monitor that has one.
+prop_frontApp_follows_to_other_screen :: TestStackSet -> Property
+prop_frontApp_follows_to_other_screen ss =
+    let herePids = map wrPid (currentWorkspaceWindowsForTest ss)
+        elsewhere = L.nub
+            [ wrPid w
+            | scr <- W.visible ss
+            , w <- W.integrate' (W.stack (W.workspace scr))
+            , wrPid w `notElem` herePids
+            ]
+    in case elsewhere of
+        [] -> property True
+        ps -> forAll (elements ps) $ \p ->
+            case resolveFrontApp p ss of
+                Nothing  -> property False  -- displayed app must resolve
+                Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
 
 -- === FOCUS AUTHORITY (FocusIntent / armingIntent / isFocusIntentTarget) ===
 --
@@ -846,6 +930,165 @@ prop_serialToWindowSet_no_affinity_falls_back =
         ws = serialToWindowSet (0 :: Int) allTags screens saved
     in W.currentTag ws === "b"
 
+-- === PARK-CORNER DETECTION (multi-monitor) ===
+--
+-- 'frameAtParkCorner' answers "is this should-be-hidden window still
+-- parked, or has it drifted back on-screen?" A false "yes" means the
+-- window never gets re-parked and stays visible.
+--
+-- The regression these pin: the test used to be "x is at or past SOME
+-- screen's right edge", which on a side-by-side layout is satisfied by
+-- every ordinary window on the right-hand display — its left edge IS the
+-- left display's right edge. Windows tiled on the second monitor were
+-- therefore reported as parked and never hidden on a workspace switch.
+
+-- The real septnesis layout: 3440-wide ultrawide at the origin, laptop
+-- display butted against its right edge.
+twoScreenSet :: TestStackSet
+twoScreenSet = W.StackSet
+    { W.current = W.Screen (wsp "a") (S 0) (SD (Rectangle 0 30 3440 1410))
+    , W.visible = [W.Screen (wsp "b") (S 1) (SD (Rectangle 3440 147 1728 1085))]
+    , W.hidden  = [wsp "c"]
+    , W.floating = Map.empty
+    }
+  where wsp t = W.Workspace t (0 :: TestLayout) Nothing
+
+-- A window filling the second monitor is NOT parked, even though its
+-- origin sits exactly on the first monitor's right edge.
+prop_parkCorner_tiled_on_second_screen :: Property
+prop_parkCorner_tiled_on_second_screen =
+    frameAtParkCorner (Rectangle 3440 147 1728 1085) twoScreenSet === False
+
+-- Neither is a half-width tile on the second monitor.
+prop_parkCorner_half_tile_on_second_screen :: Property
+prop_parkCorner_half_tile_on_second_screen =
+    frameAtParkCorner (Rectangle 4304 147 864 1085) twoScreenSet === False
+
+-- A window parked in the first screen's corner IS parked: only a 1px
+-- column overlaps, and the frame hangs below the second display.
+prop_parkCorner_parked_on_first_screen :: Property
+prop_parkCorner_parked_on_first_screen =
+    frameAtParkCorner (Rectangle 3439 1439 3440 1410) twoScreenSet === True
+
+-- So is one parked in the second screen's corner.
+prop_parkCorner_parked_on_second_screen :: Property
+prop_parkCorner_parked_on_second_screen =
+    frameAtParkCorner (Rectangle 5167 1231 1728 1085) twoScreenSet === True
+
+-- The fullscreen-transition sweep re-fits a window flush against a
+-- screen's right edge (x = screenRight - width). That is drift, not a
+-- park, and must trigger a re-assert.
+prop_parkCorner_rejects_unpark_sweep :: Property
+prop_parkCorner_rejects_unpark_sweep =
+    frameAtParkCorner (Rectangle 0 33 3440 1410) twoScreenSet === False
+
+-- === RESCREEN (display reconfiguration) ===
+--
+-- 'reassignScreens' runs on every macOS
+-- @didChangeScreenParametersNotification@ — which fires for resolution
+-- changes, display sleep and menu-bar geometry, not just plug/unplug.
+-- It therefore has to be a no-op when the screen set is unchanged. The
+-- regression these pin: the old implementation rebuilt the assignment
+-- from @current : visible ++ hidden@ and gave the head to screen 0, so
+-- with focus on the secondary monitor every notification swapped the
+-- two displays' workspaces, and windows ping-ponged between monitors.
+
+detailsOf :: TestStackSet -> [(ScreenId, ScreenDetail)]
+detailsOf ss = [ (W.screen s, W.screenDetail s) | s <- W.current ss : W.visible ss ]
+
+-- Re-running with the screen set unchanged changes nothing at all.
+prop_reassignScreens_unchanged_is_identity :: TestStackSet -> Property
+prop_reassignScreens_unchanged_is_identity ss =
+    let details = L.sortOn fst (detailsOf ss)
+    in case reassignScreens details ss of
+        Nothing  -> property False
+        Just ss' -> conjoin
+            [ W.currentTag ss' === W.currentTag ss
+            , W.screen (W.current ss') === W.screen (W.current ss)
+            , screenAssignment ss' === screenAssignment ss
+            ]
+
+-- Every surviving screen id keeps the workspace it was displaying —
+-- the property the ping-pong bug violated.
+prop_reassignScreens_preserves_assignment :: TestStackSet -> Property
+prop_reassignScreens_preserves_assignment ss =
+    let details = L.sortOn fst (detailsOf ss)
+    in case reassignScreens details ss of
+        Nothing  -> property False
+        Just ss' -> screenAssignment ss' === screenAssignment ss
+
+-- No window is lost or duplicated across a reconfiguration.
+prop_reassignScreens_invariant :: TestStackSet -> Property
+prop_reassignScreens_invariant ss =
+    let details = L.sortOn fst (detailsOf ss)
+    in case reassignScreens details ss of
+        Nothing  -> property False
+        Just ss' -> conjoin
+            [ property (invariant ss')
+            , L.sort (W.allWindows ss') === L.sort (W.allWindows ss)
+            ]
+
+-- Unplugging the focused monitor must still leave exactly one current
+-- screen, drawn from the survivors, with nothing lost.
+prop_reassignScreens_drop_focused_screen :: TestStackSet -> Property
+prop_reassignScreens_drop_focused_screen ss =
+    let details = L.sortOn fst (detailsOf ss)
+        survivors = filter ((/= W.screen (W.current ss)) . fst) details
+    in not (null survivors) ==>
+        case reassignScreens survivors ss of
+            Nothing  -> property False
+            Just ss' -> conjoin
+                [ property (invariant ss')
+                , L.sort (W.allWindows ss') === L.sort (W.allWindows ss)
+                , property (W.screen (W.current ss') `elem` map fst survivors)
+                , L.sort (map W.screen (W.current ss' : W.visible ss'))
+                    === L.sort (map fst survivors)
+                ]
+
+-- (screenId, workspace tag) for every displayed screen.
+screenAssignment :: TestStackSet -> [(ScreenId, String)]
+screenAssignment ss = L.sort
+    [ (W.screen s, W.tag (W.workspace s)) | s <- W.current ss : W.visible ss ]
+
+-- | The historic (broken) rescreen assignment, kept so the
+-- bug-reproduction property below has something to fail against.
+-- Rebuilds from @current : visible ++ hidden@ and hands the head to the
+-- first screen — position-based, so the focused workspace is dragged to
+-- screen 0 no matter which monitor it was on.
+reassignScreensBroken
+    :: [(ScreenId, ScreenDetail)] -> TestStackSet -> Maybe TestStackSet
+reassignScreensBroken newDetails ss =
+    case (screenWsps, newDetails) of
+        (w:restWsps, (sid, sd):restDetails) -> Just ss
+            { W.current = W.Screen w sid sd
+            , W.visible = zipWith (\wsp (s, d) -> W.Screen wsp s d)
+                                  restWsps restDetails
+            , W.hidden  = newHidden
+            }
+        _ -> Nothing
+  where
+    allWsps = W.workspace (W.current ss)
+            : map W.workspace (W.visible ss)
+           ++ W.hidden ss
+    (screenWsps, newHidden) = splitAt (length newDetails) allWsps
+
+-- THE BUG REPRO. With focus on a monitor other than the first, the old
+-- assignment moves the focused workspace to screen 0 — i.e. a bare
+-- "screen parameters changed" notification teleports windows between
+-- displays. The fixed 'reassignScreens' leaves the assignment alone.
+prop_reassignScreens_fixes_the_swap :: TestStackSet -> Property
+prop_reassignScreens_fixes_the_swap ss =
+    let details = L.sortOn fst (detailsOf ss)
+        focusedElsewhere = W.screen (W.current ss) /= fst (head details)
+    in not (null details) && focusedElsewhere ==> conjoin
+        [ counterexample "old code should have swapped the assignment"
+            $ fmap screenAssignment (reassignScreensBroken details ss)
+                =/= Just (screenAssignment ss)
+        , counterexample "new code must preserve the assignment"
+            $ fmap screenAssignment (reassignScreens details ss)
+                === Just (screenAssignment ss)
+        ]
+
 -- Collect all properties
 allProperties :: [(String, Property)]
 allProperties =
@@ -899,15 +1142,19 @@ allProperties =
     , ("viewOnScreen places workspace", property prop_viewOnScreen_places_workspace)
     -- Focus resolution (multi-window-per-app focus fix)
     , ("focusedWindow picks exact",                  property prop_focusedWindow_picks_exact)
-    , ("focusedWindow off-workspace is no-op",       property prop_focusedWindow_off_workspace_is_no_op)
-    , ("focusedWindow never switches workspace",     property prop_focusedWindow_never_switches_workspace)
+    , ("focusedWindow hidden is no-op",              property prop_focusedWindow_off_workspace_is_no_op)
+    , ("focusedWindow keeps displayed set",          property prop_focusedWindow_never_changes_displayed_set)
+    , ("focusedWindow follows to other screen",      property prop_focusedWindow_follows_to_other_screen)
     , ("focusedWindow invariant",                    property prop_focusedWindow_invariant)
     , ("focusedWindow unknown is no-op",             property prop_focusedWindow_unknown_noop)
     , ("focusedWindow distinguishes shared-PID",     property prop_focusedWindow_distinguishes_shared_pid)
     , ("broken PID-only is indistinguishable",       property prop_brokenPidOnly_indistinguishable)
     , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
     , ("frontApp switches within workspace",         property prop_frontApp_switches_within_workspace)
-    , ("frontApp never switches workspace",          property prop_frontApp_never_switches_workspace)
+    , ("frontApp keeps displayed set",               property prop_frontApp_never_changes_displayed_set)
+    , ("frontApp ignores hidden-only app",           property prop_frontApp_ignores_hidden_only_app)
+    , ("frontApp prefers current screen",            property prop_frontApp_prefers_current_screen)
+    , ("frontApp follows to other screen",           property prop_frontApp_follows_to_other_screen)
 
     , ("armingIntent arms with target",                property prop_armingIntent_arms_when_target)
     , ("armingIntent Nothing clears",                  property prop_armingIntent_nothing_clears)
@@ -929,4 +1176,16 @@ allProperties =
     , ("serialToWindowSet respects ssAffinity",       property prop_serialToWindowSet_respects_affinity_two_screens)
     , ("serialToWindowSet preserves current tag",     property prop_serialToWindowSet_preserves_current_tag)
     , ("serialToWindowSet no affinity falls back",    property prop_serialToWindowSet_no_affinity_falls_back)
+    -- Park-corner detection on side-by-side displays
+    , ("park: second-screen tile is not parked",      property prop_parkCorner_tiled_on_second_screen)
+    , ("park: second-screen half tile is not parked", property prop_parkCorner_half_tile_on_second_screen)
+    , ("park: first-screen corner is parked",         property prop_parkCorner_parked_on_first_screen)
+    , ("park: second-screen corner is parked",        property prop_parkCorner_parked_on_second_screen)
+    , ("park: un-park sweep is drift",                property prop_parkCorner_rejects_unpark_sweep)
+    -- Display reconfiguration
+    , ("rescreen: unchanged is identity",             property prop_reassignScreens_unchanged_is_identity)
+    , ("rescreen: preserves screen assignment",       property prop_reassignScreens_preserves_assignment)
+    , ("rescreen: invariant + no window lost",        property prop_reassignScreens_invariant)
+    , ("rescreen: focused monitor unplugged",         property prop_reassignScreens_drop_focused_screen)
+    , ("rescreen: broken version swapped displays",   property prop_reassignScreens_fixes_the_swap)
     ]

@@ -407,7 +407,11 @@ handleEvent debug cfg hotkeyIdMap evt = do
         MouseEnteredWindow wid _pid ->
             when (focusFollowsMouse cfg) $ do
                 ws <- gets windowset
-                let mref = findByWindowId wid (W.allWindows ws)
+                -- Scoped to displayed workspaces, same rule as the AX
+                -- focus path: 'W.allWindows' would let the cursor
+                -- brushing a parked window's 1px corner sliver drag its
+                -- whole hidden workspace onto this screen.
+                let mref = findByWindowId wid (visibleScreenWindows ws)
                 whenJust mref $ \wref ->
                     -- Only change focus, don't relayout (avoid feedback loop)
                     when (W.peek ws /= Just wref) $
@@ -557,11 +561,16 @@ handleFocusedWindowChanged wid pid = do
             -- No intent armed. AX is authoritative.
             applyClean
   where
+    -- No 'windows' call: every candidate 'resolveFocusedWindow' can
+    -- return is already displayed, on this screen or a secondary one,
+    -- so nothing needs laying out or re-parking. What *can* change is
+    -- which screen is current — hence the explicit save.
     applyClean = do
         ws <- gets windowset
         whenJust (resolveFocusedWindow wid pid ws) $ \ws' -> do
             modify $ \s -> s { windowset = ws' }
             pushOverlaySnapshot
+            maybeSaveState
     applyAndClearIntent = do
         modify $ \s -> s { focusIntent = Nothing }
         applyClean
@@ -584,6 +593,7 @@ handleFrontAppChanged pid = do
         whenJust (resolveFrontApp pid ws) $ \ws' -> do
             modify $ \s -> s { windowset = ws' }
             pushOverlaySnapshot
+            maybeSaveState
 
 -- | An event arrived that contradicts our 'FocusIntent'. macOS' focus
 -- has drifted from where mcmonad put it; push focus back onto the

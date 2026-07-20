@@ -42,12 +42,14 @@ module MCMonad.Operations
     , journalJumped
       -- * State persistence
     , saveStateIO
+    , maybeSaveState
     , loadStateIO
     , getConfigDir
     , getStateFile
       -- * Screens
     , screenWorkspace
     , rescreen
+    , reassignScreens
       -- * Utilities
     , whenJust
     , findScreenForWindow
@@ -186,8 +188,12 @@ windows f = do
     unless (null toShow) $
         io $ sendCommand conn (ShowWindows (map wrWindowId toShow))
 
-    -- 4. Run layouts for each visible screen
-    allRects <- fmap concat $ forM (W.current ws : W.visible ws) $ \scr -> do
+    -- 4. Run layouts for each visible screen. Lay out
+    --    'currentAfterSticky', not the raw @f old@: step 1b may have
+    --    shifted sticky windows onto the workspaces now displayed, and
+    --    laying out the pre-sticky value would compute frames for a
+    --    stack the state no longer has.
+    allRects <- fmap concat $ forM (screensOf currentAfterSticky) $ \scr -> do
         currentWS <- gets windowset
         let wsp  = W.workspace scr
             tag  = W.tag wsp
@@ -288,6 +294,18 @@ windows f = do
     --     by calling 'saveStateIO' directly before 'exec'.
     --     Errors inside saveStateIO are caught and logged, so a
     --     transient disk hiccup never reaches the event loop.
+    maybeSaveState
+
+-- | Persist the current state, at most once per 'saveThrottleSeconds'.
+--
+-- Called at the end of 'windows', and also from the focus-resolution
+-- path in "MCMonad.Main", which mutates the windowset directly (a
+-- focus change across already-displayed workspaces moves no frames, so
+-- it deliberately skips the whole 'windows' cycle — but it *does*
+-- change which workspace is current, and that has to survive a
+-- restart).
+maybeSaveState :: M ()
+maybeSaveState = do
     now <- io getCurrentTime
     last' <- gets lastSaveAt
     let shouldSave = case last' of
@@ -307,12 +325,16 @@ windows f = do
 saveThrottleSeconds :: NominalDiffTime
 saveThrottleSeconds = 0.25
 
+-- | Every screen that is currently displaying a workspace: the focused
+-- one first, then the secondary monitors.
+screensOf :: W.StackSet i l a sid sd -> [W.Screen i l a sid sd]
+screensOf ws = W.current ws : W.visible ws
+
 -- | All windows visible on any screen (current + visible), including
 -- floating windows.
 allVisibleWindows :: WindowSet -> [WindowRef]
 allVisibleWindows ws =
-    concatMap (W.integrate' . W.stack . W.workspace)
-              (W.current ws : W.visible ws)
+    concatMap (W.integrate' . W.stack . W.workspace) (screensOf ws)
 
 -- | Every managed window across all workspaces — current, visible, and
 -- hidden. Used to hide declaratively: anything here that is not in
@@ -349,12 +371,30 @@ reassertHiddenWindows = do
 -- clamp only pulls y back on-screen — x is the discriminator. The
 -- fullscreen-transition sweep instead re-fits windows fully on-screen
 -- (x = screenRight - width), which this rejects.
-frameAtParkCorner :: Rectangle -> WindowSet -> Bool
-frameAtParkCorner r ws = any nearRightEdge screenRects
+--
+-- The right-edge test alone is not enough on multi-monitor: side-by-side
+-- displays share a boundary, so the right screen's left edge *is* the left
+-- screen's @screenRight@, and every ordinary window tiled there would read
+-- as parked. Require in addition that the frame expose no more than a
+-- sliver on any display — a real park leaves ~1px. Mirrors
+-- @isAlreadyParked@ in mcmonad-core; the two must agree or a window is
+-- either re-parked forever or never re-parked at all.
+--
+-- Generic in everything but 'ScreenDetail': only the screen rectangles are
+-- read, and keeping it that way lets the properties exercise it directly.
+frameAtParkCorner :: Rectangle -> W.StackSet i l a sid ScreenDetail -> Bool
+frameAtParkCorner r ws = any nearRightEdge screenRects && widestExposure <= 2
   where
-    screenRects = [ screenRect (W.screenDetail scr)
-                  | scr <- W.current ws : W.visible ws ]
+    screenRects = map (screenRect . W.screenDetail) (screensOf ws)
     nearRightEdge sr = rect_x r >= rect_x sr + rect_w sr - 2
+    widestExposure = maximum (0 : map overlapWidth screenRects)
+    -- Width of the 2D intersection: a park sits *below* a neighbouring
+    -- display as well as to its right, so the vertical span has to be
+    -- taken into account or the neighbour reads as fully exposed.
+    overlapWidth sr
+        | span_ (rect_y r) (rect_h r) (rect_y sr) (rect_h sr) <= 0 = 0
+        | otherwise = span_ (rect_x r) (rect_w r) (rect_x sr) (rect_w sr)
+    span_ a la b lb = max 0 (min (a + la) (b + lb) - max a b)
 
 -- | Convert a (WindowRef, Rectangle) pair to a FrameAssignment.
 toFrameAssignment :: (WindowRef, Rectangle) -> FrameAssignment
@@ -1000,38 +1040,86 @@ screenWorkspace sc = do
 
 -- | Handle a change in screen configuration. Redistributes workspaces
 -- across the new set of screens, preserving as much state as possible.
+--
+-- Screen *identity* is what gets preserved, not list position. An
+-- earlier version rebuilt the assignment from
+-- @current : visible ++ hidden@ and handed the head to @S 0@, which
+-- meant that whenever the focused screen was not @S 0@, every
+-- @didChangeScreenParameters@ notification swapped the monitors'
+-- workspaces — and that notification fires for far more than
+-- plug/unplug (resolution changes, display sleep, menu-bar geometry).
+-- The visible symptom was windows ping-ponging between displays.
+--
+-- The rule now: a screen id that still exists keeps whatever workspace
+-- it was showing, and the focused screen stays focused if it survived.
+-- Only genuinely orphaned workspaces (their monitor went away) get
+-- redistributed, and they fill vacancies before the hidden pool does,
+-- so unplugging a display doesn't strand its workspace.
 rescreen :: [ScreenInfo] -> M ()
 rescreen newScreens = do
     ws <- gets windowset
-    let -- Gather all workspaces in order: current screen, visible screens, hidden
-        allWsps = W.workspace (W.current ws)
-                : map W.workspace (W.visible ws)
-               ++ W.hidden ws
-
-        -- Build new screen details from ScreenInfo
-        newDetails = zipWith (\i si -> (S i, SD (siFrame si)))
+    let newDetails = zipWith (\i si -> (S i, SD (siFrame si)))
                              [0 :: Int ..] newScreens
-
-        -- Assign one workspace per new screen, rest become hidden
-        nScreens = length newDetails
-        (screenWsps, newHidden) = splitAt nScreens allWsps
-
-    case (screenWsps, newDetails) of
-        (w:restWsps, (sid, sd):restDetails) -> do
-            let newCurrent = W.Screen w sid sd
-                newVisible = zipWith (\wsp (s, d) -> W.Screen wsp s d)
-                                     restWsps restDetails
-                ws' = ws { W.current = newCurrent
-                         , W.visible = newVisible
-                         , W.hidden  = newHidden
-                         }
-            modify $ \s -> s { windowset = ws' }
-            -- Clean affinities that refer to screens no longer present
-            let liveScreens = S.fromList [sid' | (sid', _) <- newDetails]
-            modify $ \s -> s { affinity = M.filter (`S.member` liveScreens) (affinity s) }
+        liveSids   = S.fromList (map fst newDetails)
+    case reassignScreens newDetails ws of
+        Nothing  -> return ()   -- no screens at all: nothing sensible to do
+        Just ws' -> do
+            modify $ \s -> s
+                { windowset = ws'
+                -- Drop affinities pointing at screens that no longer exist.
+                , affinity  = M.filter (`S.member` liveSids) (affinity s)
+                }
             windows id  -- trigger relayout
-        -- Edge cases: no workspaces or no screens should not happen in practice
-        _ -> return ()
+
+-- | The pure half of 'rescreen': map the new @(ScreenId, ScreenDetail)@
+-- list onto the existing workspaces. 'Nothing' when there are no
+-- screens to assign to.
+--
+-- Generic over the workspace/window types so the properties can drive
+-- it directly.
+reassignScreens
+    :: (Eq i, Eq sid, Ord sid)
+    => [(sid, sd)]
+    -> W.StackSet i l a sid sd
+    -> Maybe (W.StackSet i l a sid sd)
+reassignScreens newDetails ws = case assigned of
+    []           -> Nothing
+    (firstScr:_) ->
+        let newCurrent = case find ((== oldCurrentSid) . W.screen) assigned of
+                Just scr -> scr
+                Nothing  -> firstScr   -- focused monitor was unplugged
+        in Just ws { W.current = newCurrent
+                   , W.visible = filter ((/= W.screen newCurrent) . W.screen)
+                                        assigned
+                   , W.hidden  = newHidden
+                   }
+  where
+    liveSids      = S.fromList (map fst newDetails)
+    oldScreens    = screensOf ws
+    oldCurrentSid = W.screen (W.current ws)
+    heldBySid     = M.fromList [ (W.screen s, W.workspace s) | s <- oldScreens ]
+
+    -- Workspaces whose monitor disappeared, then the hidden pool.
+    -- Orphans first: they were on a screen a moment ago, so they are the
+    -- better candidates for a newly-appeared one.
+    orphans = [ W.workspace s | s <- oldScreens
+              , not (W.screen s `S.member` liveSids) ]
+    pool    = orphans ++ W.hidden ws
+
+    -- Walk the new screen list, giving each id back its own workspace
+    -- where possible and drawing from the pool otherwise.
+    (assigned, newHidden) = assign newDetails pool
+    assign []               leftover = ([], leftover)
+    assign ((sid, sd):rest) leftover =
+        case M.lookup sid heldBySid of
+            Just wsp ->
+                let (done, rest') = assign rest leftover
+                in (W.Screen wsp sid sd : done, rest')
+            Nothing -> case leftover of
+                (wsp:leftover') ->
+                    let (done, rest') = assign rest leftover'
+                    in (W.Screen wsp sid sd : done, rest')
+                [] -> assign rest []   -- no workspace to spare
 
 -- ---------------------------------------------------------------------------
 -- Utilities

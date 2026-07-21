@@ -9,31 +9,6 @@ private final class KeyablePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// An `NSTextField` cell that vertically centres its text within tall bounds,
-/// both when drawing and while editing. A plain cell top-aligns, which made a
-/// large Spotlight font look clipped.
-private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
-    private func centered(_ rect: NSRect) -> NSRect {
-        let h = cellSize(forBounds: rect).height
-        guard h < rect.height else { return rect }
-        let dy = (rect.height - h) / 2
-        return NSRect(x: rect.minX, y: rect.minY + dy, width: rect.width, height: h)
-    }
-    override func drawingRect(forBounds rect: NSRect) -> NSRect {
-        super.drawingRect(forBounds: centered(rect))
-    }
-    override func edit(withFrame rect: NSRect, in controlView: NSView,
-                       editor: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: centered(rect), in: controlView,
-                   editor: editor, delegate: delegate, event: event)
-    }
-    override func select(withFrame rect: NSRect, in controlView: NSView,
-                         editor: NSText, delegate: Any?, start: Int, length: Int) {
-        super.select(withFrame: centered(rect), in: controlView,
-                     editor: editor, delegate: delegate, start: start, length: length)
-    }
-}
-
 /// The Spotlight-style launcher.
 ///
 /// One floating key panel with switchable **modes**, cycled with `Tab`:
@@ -389,14 +364,26 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         self.modeLabel = modeLbl
 
         // Search field.
+        //
+        // Sized to its natural single-line height and centred in the band
+        // with the same arithmetic as the glyph and the mic, rather than
+        // stretched to the full band height with a cell subclass doing the
+        // centring. That subclass overrode NSTextFieldCell.drawingRect(
+        // forBounds:) — an @objc override on a @MainActor-isolated type,
+        // which AppKit calls from inside a CATransaction commit. The @objc
+        // thunk runs a dynamic actor-isolation check on that path and the
+        // check intermittently segfaulted inside
+        // swift_task_isCurrentExecutorWithFlags, taking the whole daemon
+        // down. Opening this panel was a coin flip. No override, no thunk,
+        // no check.
         let fieldX = glyph.frame.maxX + 12
+        let fieldW = modeLbl.frame.minX - fieldX - 8
         let field = NSTextField(frame: NSRect(
             x: fieldX,
             y: Self.panelHeight - Self.bandHeight,
-            width: modeLbl.frame.minX - fieldX - 8,
+            width: fieldW,
             height: Self.bandHeight
         ))
-        field.cell = VerticallyCenteredTextFieldCell()
         field.isEditable = true
         field.isSelectable = true
         field.isBordered = false
@@ -409,6 +396,22 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         field.cell?.isScrollable = true
         field.lineBreakMode = .byTruncatingTail
         field.delegate = self
+
+        // Measure the natural line height off a sample with both an
+        // ascender and a descender, so the result doesn't depend on what
+        // the user has typed (an empty field measures short), then centre
+        // that height in the band.
+        field.stringValue = "Ag"
+        field.sizeToFit()
+        let fieldH = ceil(field.frame.height)
+        field.stringValue = ""
+        field.frame = NSRect(
+            x: fieldX,
+            y: Self.panelHeight - Self.bandHeight / 2 - fieldH / 2,
+            width: fieldW,
+            height: fieldH
+        )
+
         container.addSubview(field)
         self.searchField = field
 

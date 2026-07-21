@@ -17,6 +17,28 @@ final class EventBridge: SkyLightEventDelegate {
     /// untrackApp so the AX observer for an app exists exactly when at
     /// least one of its windows is managed.
     private var pidWindowIds: [pid_t: Set<UInt32>] = [:]
+    /// Negative cache for `adoptOrphanWindows`: window id -> the sweep
+    /// tick at which AX classification last rejected it.
+    ///
+    /// Without this the sweep would re-run a cross-process AX round-trip
+    /// every 2s, forever, for every window that SkyLight considers
+    /// visible but AX classifies as unmanageable (palettes, helper
+    /// windows, anything without a close button) — of which a busy
+    /// desktop has many. Entries are retried on a backoff rather than
+    /// blacklisted permanently, because an AX read can fail transiently
+    /// when the owning app is busy and a window that was genuinely
+    /// unmanageable at one moment may not be at the next.
+    private var rejectedWindowIds: [UInt32: Int] = [:]
+    /// Monotonic sweep counter, the clock for `rejectedWindowIds`.
+    private var sweepTick = 0
+
+    /// Sweeps to wait before re-testing a window AX previously rejected.
+    /// 15 ticks x 2s = ~30s, so the steady-state cost of a permanently
+    /// unmanageable window is one AX call per 30s instead of one per 2s.
+    private static let rejectRetryTicks = 15
+    /// Upper bound on the negative cache. Purely a leak guard: entries
+    /// are normally evicted when their window is destroyed.
+    private static let rejectCacheCap = 1024
 
     init(socketServer: SocketServer, focusTracker: AXFocusTracker) {
         self.socketServer = socketServer
@@ -62,50 +84,127 @@ final class EventBridge: SkyLightEventDelegate {
         }
     }
 
+    /// The periodic reconcile, run on a 2s timer from `main`.
+    ///
+    /// Two halves that must stay paired. `validateWindows` retires
+    /// windows that are gone; `adoptOrphanWindows` picks up windows that
+    /// exist and are manageable but that the brain has never been told
+    /// about. Before the adopt half existed, *any* way of losing a
+    /// window — a spurious destroy, a missed SkyLight 1325, an IPC write
+    /// that landed while the brain was restarting — was permanent: the
+    /// window stayed alive and on screen with nobody to park it. Now the
+    /// worst case is a ~2s glitch.
+    func reconcileWindows() {
+        sweepTick &+= 1
+        validateWindows()
+        adoptOrphanWindows()
+    }
+
     /// Check all managed windows still exist in the window server.
     /// Fire windowDestroyed for any that have vanished.
     func validateWindows() {
         let stale = managedWindowIds.filter { wid in
-            SkyLightQuery.queryWindow(wid) == nil
+            !SkyLightQuery.windowExists(wid)
         }
         for wid in stale {
+            let pid = windowIdToPid[wid].map { String($0) } ?? "-"
             removeManagedWindow(windowId: wid)
+            rejectedWindowIds.removeValue(forKey: wid)
             socketServer.send(.windowDestroyed(windowId: wid))
+            fputs("RECONCILE: retire wid=\(wid) pid=\(pid) reason=gone\n", stderr)
         }
     }
 
+    /// Report any manageable window the brain has never heard about.
+    ///
+    /// `managedWindowIds` is the dedupe key: it means "reported to the
+    /// brain and not yet retracted", so a window the brain's manage hook
+    /// deliberately ignored is still in it and is never re-offered. That
+    /// is what stops this sweep from re-running the manage hook — and
+    /// the whole layout pass behind it — every 2 seconds.
+    func adoptOrphanWindows() {
+        let ownPid = getpid()
+        for snap in SkyLightQuery.queryAllVisibleWindows() {
+            guard snap.pid != ownPid else { continue }
+            guard !managedWindowIds.contains(snap.windowId) else { continue }
+            if let rejectedAt = rejectedWindowIds[snap.windowId],
+               sweepTick - rejectedAt < Self.rejectRetryTicks {
+                continue
+            }
+            adoptWindow(snap, viaSweep: true)
+        }
+    }
+
+    /// Classify a SkyLight snapshot with AX and, if it is manageable,
+    /// register it and tell the brain. Shared by the SkyLight `created`
+    /// event and the orphan sweep so both apply exactly the same filter.
+    private func adoptWindow(_ snap: WindowSnapshot, viaSweep: Bool = false) {
+        // Never manage our own panels and overlays.
+        guard snap.pid != getpid() else { return }
+
+        guard let info = AXWindowService.info(
+            windowId: snap.windowId,
+            pid: snap.pid
+        ) else {
+            // Can't read AX info — menus, tooltips, or a busy app.
+            noteRejected(snap.windowId)
+            return
+        }
+
+        // Only manage windows that have a close button — this filters
+        // out context menus, tooltips, popups, and other transient UI
+        guard info.hasCloseButton else {
+            noteRejected(snap.windowId)
+            return
+        }
+
+        rejectedWindowIds.removeValue(forKey: snap.windowId)
+        _ = SkyLightEventObserver.shared.subscribeToWindows([snap.windowId])
+        addManagedWindow(windowId: snap.windowId, pid: snap.pid)
+        socketServer.send(.windowCreated(info))
+        if viaSweep {
+            // Should be rare. A run of these means windows are being lost
+            // somewhere upstream and the sweep is papering over it.
+            fputs(
+                "RECONCILE: adopt wid=\(snap.windowId) pid=\(snap.pid) "
+                    + "tHash=\(TitleHash.hash(windowId: snap.windowId, pid: snap.pid))\n",
+                stderr
+            )
+        }
+    }
+
+    /// Record an AX-classification rejection, evicting the oldest
+    /// entries if the cache has grown past its cap.
+    private func noteRejected(_ windowId: UInt32) {
+        rejectedWindowIds[windowId] = sweepTick
+        guard rejectedWindowIds.count > Self.rejectCacheCap else { return }
+        let keep = rejectedWindowIds
+            .sorted { $0.value > $1.value }
+            .prefix(Self.rejectCacheCap)
+            .map { ($0.key, $0.value) }
+        rejectedWindowIds = Dictionary(uniqueKeysWithValues: keep)
+    }
+
     func skyLightEventObserver(
-        _ observer: SkyLightEventObserver,
+        _: SkyLightEventObserver,
         didReceive event: CGSWindowEvent
     ) {
         switch event {
         case .created(let windowId, _):
             // Query SkyLight for the snapshot, then enrich with AX
             if let snap = SkyLightQuery.queryWindow(windowId) {
-                guard let info = AXWindowService.info(
-                    windowId: snap.windowId,
-                    pid: snap.pid
-                ) else {
-                    // Can't read AX info — skip (menus, tooltips, etc.)
-                    return
-                }
-
-                // Only manage windows that have a close button — this filters
-                // out context menus, tooltips, popups, and other transient UI
-                guard info.hasCloseButton else { return }
-
-                observer.subscribeToWindows([windowId])
-                addManagedWindow(windowId: windowId, pid: snap.pid)
-                socketServer.send(.windowCreated(info))
+                adoptWindow(snap)
             }
 
         case .destroyed(let windowId, _):
             removeManagedWindow(windowId: windowId)
+            rejectedWindowIds.removeValue(forKey: windowId)
             TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .closed(let windowId):
             removeManagedWindow(windowId: windowId)
+            rejectedWindowIds.removeValue(forKey: windowId)
             TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
@@ -411,12 +510,13 @@ struct MCMonadCoreApp {
         }
         mouseDownMonitor.start()
 
-        // Periodic window validation — catches windows that vanish without
-        // firing SkyLight 804/1326 (e.g. quickly closed system dialogs).
+        // Periodic reconcile — retires windows that vanished without
+        // firing SkyLight 804/1326 (e.g. quickly closed system dialogs),
+        // and adopts manageable windows the brain was never told about.
         // Runs every 2 seconds on the main run loop.
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
             Task { @MainActor in
-                eventBridge.validateWindows()
+                eventBridge.reconcileWindows()
             }
         }
 

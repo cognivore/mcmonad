@@ -83,6 +83,48 @@ enum SkyLightQuery {
         return results
     }
 
+    /// Pure liveness: does the window server still have *any* record of
+    /// this window id?
+    ///
+    /// Deliberately applies **none** of `queryWindow`'s classification
+    /// guards. Those answer a different question — "does this currently
+    /// look like a manageable document window" — and their answer is
+    /// transiently `false` for a perfectly alive window: a native
+    /// fullscreen Space transition clears the visible attribute and
+    /// reshuffles the tag bits mid-flight.
+    ///
+    /// `validateWindows` used the filtered query as its liveness test,
+    /// so a window merely mid-transition was reported to the brain as
+    /// destroyed. The brain unmanaged it, nothing ever parked it again,
+    /// and there was no path back in — SkyLight only fires `created`
+    /// for windows that genuinely appear. That is the "LibreWolf is a
+    /// background on every workspace" flood.
+    static func windowExists(_ windowId: UInt32) -> Bool {
+        let skyLight = SkyLight.shared
+        let cid = skyLight.getMainConnectionID()
+        guard cid != 0 else { return false }
+
+        var widValue = Int32(windowId)
+        guard let widNumber = CFNumberCreate(nil, .sInt32Type, &widValue) else {
+            return false
+        }
+        let windowArray = [widNumber] as CFArray
+
+        guard let query = skyLight.queryWindows(
+            connectionId: cid,
+            windowArray: windowArray,
+            flags: 1
+        ) else { return false }
+        defer { skyLight.releaseCF(query) }
+
+        guard let iterator = skyLight.queryResultCopyWindows(query) else {
+            return false
+        }
+        defer { skyLight.releaseCF(iterator) }
+
+        return skyLight.iteratorAdvance(iterator)
+    }
+
     /// Query a single window by ID. Returns nil if not found.
     static func queryWindow(_ windowId: UInt32) -> WindowSnapshot? {
         let skyLight = SkyLight.shared

@@ -64,4 +64,5 @@ test-suite properties
     xmonad,
     QuickCheck >= 2.14,
     containers,
-    text
+    text,
+    time

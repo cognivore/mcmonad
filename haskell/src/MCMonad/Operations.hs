@@ -10,6 +10,10 @@ module MCMonad.Operations
     , manageSilent
     , unmanage
     , unmanagedOriginTTL
+    , reclaimOriginTTL
+    , reclaimOriginCap
+    , pruneReclaims
+    , chooseOriginTag
       -- * Overlay snapshot
     , buildOverlaySnapshot
     , pushOverlaySnapshot
@@ -55,6 +59,7 @@ module MCMonad.Operations
     , findScreenForWindow
     ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO)
 import Control.Exception (IOException, catch)
 import Control.Monad (forM, void, unless, when)
@@ -541,6 +546,68 @@ pruneOrigins now m
   where
     fresh = M.filter (\(_, at) -> diffUTCTime now at <= unmanagedOriginTTL) m
 
+-- | How long an exact window's workspace stays authoritative for a
+-- re-offer of that same CGWindowID (see 'reclaimOrigin'). Short on
+-- purpose: mcmonad-core's reconcile sweep runs every 2s, so a genuine
+-- reclaim lands within one or two ticks, and keeping the window narrow
+-- bounds the (already remote) chance that macOS recycles a CGWindowID
+-- onto a stale entry.
+reclaimOriginTTL :: NominalDiffTime
+reclaimOriginTTL = 30
+
+-- | Upper bound on remembered exact-window origins. Sized for "every
+-- window on the desktop churned at once", which is what a fullscreen
+-- Space transition can look like.
+reclaimOriginCap :: Int
+reclaimOriginCap = 256
+
+-- | Which workspace does a window entering 'manage' belong on?
+--
+-- 'Nothing' means "no opinion" — the caller leaves it on the current
+-- workspace, which is right for a genuinely new window.
+--
+-- Precedence matters. An exact-window hit in @reclaims@ means this same
+-- CGWindowID came back, which only happens when the window never really
+-- died: mcmonad-core's reconcile sweep re-offering something a bogus
+-- destroy took away. That is certain knowledge and beats the pid
+-- heuristic in @origins@, which is an inference ("this app's last window
+-- died recently, so this is probably its replacement") and deliberately
+-- only fires for single-window apps.
+--
+-- Both sources are ignored once stale, and a tag that no longer exists
+-- (the user renamed a workspace) is discarded rather than resurrected.
+chooseOriginTag
+    :: UTCTime
+    -> [String]
+    -> WindowRef
+    -> Int32
+    -> M.Map WindowRef (String, UTCTime)
+    -> M.Map Int32 (String, UTCTime)
+    -> Maybe String
+chooseOriginTag now liveTags wr pid reclaims origins =
+    fresh reclaimOriginTTL (M.lookup wr reclaims)
+        <|> fresh unmanagedOriginTTL (M.lookup pid origins)
+  where
+    fresh ttl entry = case entry of
+        Just (tag, at)
+            | diffUTCTime now at <= ttl
+            , tag `elem` liveTags -> Just tag
+        _ -> Nothing
+
+-- | Drop expired reclaim entries and enforce the size cap (newest kept).
+pruneReclaims
+    :: UTCTime
+    -> M.Map WindowRef (String, UTCTime)
+    -> M.Map WindowRef (String, UTCTime)
+pruneReclaims now m
+    | M.size fresh <= reclaimOriginCap = fresh
+    | otherwise = M.fromList
+        . take reclaimOriginCap
+        . sortBy (comparing (Down . snd . snd))
+        . M.toList $ fresh
+  where
+    fresh = M.filter (\(_, at) -> diffUTCTime now at <= reclaimOriginTTL) m
+
 -- | Manage a new window: run the manage hook, insert it into the current
 -- workspace, and apply any hook-specified transformations (float, shift, etc.).
 manage :: WindowInfo -> ManageHook -> M ()
@@ -559,18 +626,17 @@ manage wi hook = do
         -- in the user's config still wins.
         now <- io getCurrentTime
         origins <- gets unmanagedOrigin
+        reclaims <- gets reclaimOrigin
         let allTags = map W.tag (W.workspace (W.current ws)
                                  : map W.workspace (W.visible ws)
                                  ++ W.hidden ws)
-            originTag = case M.lookup (wiPid wi) origins of
-                Just (tag, at)
-                    | diffUTCTime now at <= unmanagedOriginTTL
-                    , tag `elem` allTags -> Just tag
-                _ -> Nothing
+            originTag =
+                chooseOriginTag now allTags wr (wiPid wi) reclaims origins
             route = maybe id (`W.shiftWin` wr) originTag
         modify $ \s -> s
             { windowMetadata  = M.insert wr (metadataFromInfo wi) (windowMetadata s)
             , unmanagedOrigin = M.delete (wiPid wi) (unmanagedOrigin s)
+            , reclaimOrigin   = M.delete wr (pruneReclaims now (reclaimOrigin s))
             }
         windows (transform . route . W.insertUp wr)
         -- A window routed to a hidden workspace never enters the
@@ -608,12 +674,21 @@ unmanage w = do
         let lastOfPid = not (any (\o -> o /= w && wrPid o == wrPid w)
                                  (W.allWindows ws))
         case W.findTag w ws of
-            Just tag | lastOfPid -> modify $ \s -> s
-                { unmanagedOrigin =
-                    M.insert (wrPid w) (tag, now)
-                             (pruneOrigins now (unmanagedOrigin s))
-                }
-            _ -> return ()
+            Just tag -> do
+                -- Exact-window origin, recorded unconditionally: if this
+                -- window comes back under the same CGWindowID it never
+                -- died, and it belongs exactly here.
+                modify $ \s -> s
+                    { reclaimOrigin =
+                        M.insert w (tag, now)
+                                 (pruneReclaims now (reclaimOrigin s))
+                    }
+                when lastOfPid $ modify $ \s -> s
+                    { unmanagedOrigin =
+                        M.insert (wrPid w) (tag, now)
+                                 (pruneOrigins now (unmanagedOrigin s))
+                    }
+            Nothing -> return ()
         -- Clean from sticky, scratchpads, and metadata before removing
         modify $ \s -> s
             { sticky         = S.delete w (sticky s)

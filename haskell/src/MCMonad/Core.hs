@@ -344,6 +344,28 @@ data MState = MState
       -- 'MCMonad.Operations.unmanagedOriginTTL'. Deliberately not
       -- persisted: pids don't survive the reboots that persistence
       -- exists for, and a Mod-q mid-fullscreen is a corner we accept.
+    , reclaimOrigin    :: !(Map.Map WindowRef (String, UTCTime))
+      -- ^ Exact window → (workspace tag, time) for /every/ window that
+      -- leaves management, not just a pid's last one.
+      --
+      -- mcmonad-core's reconcile sweep re-offers any live, manageable
+      -- window the brain isn't holding, which closes the hole where a
+      -- window lost to a bogus destroy stayed on screen forever with
+      -- nobody to park it. But a re-offer arrives as a plain
+      -- 'WindowCreated', so without this map the window would come back
+      -- on whatever workspace happens to be current — the same window,
+      -- same CGWindowID, teleported. 'unmanagedOrigin' can't cover it:
+      -- that one is keyed by pid and deliberately skips multi-window
+      -- apps, because a genuinely new window of a running app does
+      -- belong on the current workspace.
+      --
+      -- Keyed by 'WindowRef', so a hit means /this exact window/ came
+      -- back, which is only possible when it never really died. Short
+      -- TTL ('MCMonad.Operations.reclaimOriginTTL') — the sweep runs
+      -- every 2s, so a real reclaim lands almost immediately, and a tight
+      -- window bounds any chance of a recycled CGWindowID matching a
+      -- stale entry. Consumed on first use. Not persisted, for the same
+      -- reason as 'unmanagedOrigin'.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's

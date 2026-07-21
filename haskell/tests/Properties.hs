@@ -13,12 +13,17 @@ import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     , windowSetToSerial
     )
-import MCMonad.Operations (frameAtParkCorner, reassignScreens)
+import MCMonad.Operations
+    ( frameAtParkCorner, reassignScreens
+    , chooseOriginTag, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
+    )
 import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Maybe (isNothing)
+import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Int (Int32)
 import Data.Word (Word32)
 import Control.Monad (foldM)
@@ -1089,6 +1094,97 @@ prop_reassignScreens_fixes_the_swap ss =
                 === Just (screenAssignment ss)
         ]
 
+-- ---------------------------------------------------------------------------
+-- Re-manage routing: reclaimOrigin / unmanagedOrigin
+--
+-- mcmonad-core's reconcile sweep re-offers any live, manageable window
+-- the brain isn't holding, so 'manage' now runs for windows that were
+-- never really gone. 'chooseOriginTag' decides where such a window
+-- lands. Getting it wrong is user-visible in both directions: too eager
+-- and an unrelated window teleports onto a stale tag, too lax and every
+-- reclaimed window piles onto whatever workspace is current.
+
+originBase :: UTCTime
+originBase = posixSecondsToUTCTime 1700000000
+
+-- | An entry that is @age@ seconds old relative to 'originBase'.
+aged :: String -> Int -> (String, UTCTime)
+aged tag age = (tag, addUTCTime (negate (fromIntegral age)) originBase)
+
+liveTags :: [String]
+liveTags = ["1", "2", "3", "web", "chat"]
+
+-- An exact-window reclaim beats the pid heuristic: the same CGWindowID
+-- coming back is proof the window never died, whereas the pid entry is
+-- only ever an inference about a *replacement* window.
+prop_chooseOrigin_reclaim_beats_pid :: WindowRef -> Property
+prop_chooseOrigin_reclaim_beats_pid wr =
+    chooseOriginTag originBase liveTags wr (wrPid wr)
+        (Map.singleton wr (aged "web" 1))
+        (Map.singleton (wrPid wr) (aged "chat" 1))
+        === Just "web"
+
+-- With no reclaim entry the pid heuristic still applies — this is the
+-- Gecko destroy/recreate path, which must keep working.
+prop_chooseOrigin_pid_when_no_reclaim :: WindowRef -> Property
+prop_chooseOrigin_pid_when_no_reclaim wr =
+    chooseOriginTag originBase liveTags wr (wrPid wr)
+        Map.empty
+        (Map.singleton (wrPid wr) (aged "chat" 1))
+        === Just "chat"
+
+-- A reclaim older than its TTL is not merely deprioritised, it is gone:
+-- fall through to the pid entry rather than honouring a stale tag.
+prop_chooseOrigin_expired_reclaim_falls_through :: WindowRef -> Property
+prop_chooseOrigin_expired_reclaim_falls_through wr =
+    chooseOriginTag originBase liveTags wr (wrPid wr)
+        (Map.singleton wr (aged "web" (round reclaimOriginTTL + 1)))
+        (Map.singleton (wrPid wr) (aged "chat" 1))
+        === Just "chat"
+
+-- A tag the config no longer has must never be resurrected.
+prop_chooseOrigin_rejects_dead_tag :: WindowRef -> Property
+prop_chooseOrigin_rejects_dead_tag wr =
+    chooseOriginTag originBase liveTags wr (wrPid wr)
+        (Map.singleton wr (aged "renamed-away" 1))
+        Map.empty
+        === Nothing
+
+-- No opinion for a genuinely new window.
+prop_chooseOrigin_empty_is_nothing :: WindowRef -> Property
+prop_chooseOrigin_empty_is_nothing wr =
+    chooseOriginTag originBase liveTags wr (wrPid wr) Map.empty Map.empty
+        === Nothing
+
+mkReclaims :: [(WindowRef, Int)] -> Map.Map WindowRef (String, UTCTime)
+mkReclaims entries =
+    Map.fromList [ (w, aged "1" (abs age)) | (w, age) <- entries ]
+
+-- 'reclaimOrigin' is fed by *every* unmanage, so pruning must actually
+-- bound it — a fullscreen Space transition can churn the whole desktop.
+prop_pruneReclaims_respects_cap :: [(WindowRef, Int)] -> Property
+prop_pruneReclaims_respects_cap entries =
+    property $
+        Map.size (pruneReclaims originBase (mkReclaims entries))
+            <= reclaimOriginCap
+
+prop_pruneReclaims_drops_expired :: [(WindowRef, Int)] -> Property
+prop_pruneReclaims_drops_expired entries =
+    property $ all withinTTL
+        (Map.elems (pruneReclaims originBase (mkReclaims entries)))
+  where
+    withinTTL (_, at) = diffUTCTime originBase at <= reclaimOriginTTL
+
+-- Pruning is not allowed to lose a fresh entry that fits under the cap;
+-- a dropped reclaim silently degrades to "lands on the current
+-- workspace", which is the bug this map exists to prevent.
+prop_pruneReclaims_keeps_fresh :: [WindowRef] -> Property
+prop_pruneReclaims_keeps_fresh ws =
+    length ws <= reclaimOriginCap ==>
+        pruneReclaims originBase m === m
+  where
+    m = mkReclaims [ (w, 0) | w <- ws ]
+
 -- Collect all properties
 allProperties :: [(String, Property)]
 allProperties =
@@ -1188,4 +1284,13 @@ allProperties =
     , ("rescreen: invariant + no window lost",        property prop_reassignScreens_invariant)
     , ("rescreen: focused monitor unplugged",         property prop_reassignScreens_drop_focused_screen)
     , ("rescreen: broken version swapped displays",   property prop_reassignScreens_fixes_the_swap)
+    -- Re-manage routing after a reconcile-sweep reclaim
+    , ("origin: exact reclaim beats pid guess",       property prop_chooseOrigin_reclaim_beats_pid)
+    , ("origin: pid guess when no reclaim",           property prop_chooseOrigin_pid_when_no_reclaim)
+    , ("origin: expired reclaim falls through",       property prop_chooseOrigin_expired_reclaim_falls_through)
+    , ("origin: dead tag is not resurrected",         property prop_chooseOrigin_rejects_dead_tag)
+    , ("origin: nothing known means no opinion",      property prop_chooseOrigin_empty_is_nothing)
+    , ("reclaim: prune respects cap",                 property prop_pruneReclaims_respects_cap)
+    , ("reclaim: prune drops expired",                property prop_pruneReclaims_drops_expired)
+    , ("reclaim: prune keeps fresh entries",          property prop_pruneReclaims_keeps_fresh)
     ]

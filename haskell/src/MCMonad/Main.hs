@@ -116,6 +116,7 @@ launch cfg = do
                        , nextTimerId = restoredNextTimerId
                        , focusIntent = Nothing
                        , unmanagedOrigin = Map.empty
+                       , reclaimOrigin  = Map.empty
                        }
 
     _ <- runM mconf mst0 $ do

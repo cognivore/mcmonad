@@ -31,6 +31,10 @@ final class EventBridge: SkyLightEventDelegate {
     private var rejectedWindowIds: [UInt32: Int] = [:]
     /// Monotonic sweep counter, the clock for `rejectedWindowIds`.
     private var sweepTick = 0
+    /// Managed window id -> number of consecutive reconcile sweeps it has
+    /// existed in the window server but failed the manage-eligibility
+    /// filter. See `validateWindows`.
+    private var ineligibleStreak: [UInt32: Int] = [:]
 
     /// Sweeps to wait before re-testing a window AX previously rejected.
     /// 15 ticks x 2s = ~30s, so the steady-state cost of a permanently
@@ -39,6 +43,14 @@ final class EventBridge: SkyLightEventDelegate {
     /// Upper bound on the negative cache. Purely a leak guard: entries
     /// are normally evicted when their window is destroyed.
     private static let rejectCacheCap = 1024
+    /// Consecutive sweeps a managed window may exist-but-fail-eligibility
+    /// before it is retired. A native fullscreen Space transition makes a
+    /// live window fail eligibility for a fraction of a second (well under
+    /// one 2s sweep); an app that hid its window instead of destroying it
+    /// (Adobe's around-quit panels) fails it indefinitely. 5 x 2s = 10s
+    /// cleanly separates the two: the transition never accrues a streak,
+    /// the hidden window always crosses the threshold.
+    private static let ineligibleRetireStreak = 5
 
     init(socketServer: SocketServer, focusTracker: AXFocusTracker) {
         self.socketServer = socketServer
@@ -100,19 +112,58 @@ final class EventBridge: SkyLightEventDelegate {
         adoptOrphanWindows()
     }
 
-    /// Check all managed windows still exist in the window server.
-    /// Fire windowDestroyed for any that have vanished.
+    /// Retire managed windows that are gone, or that have persistently
+    /// stopped being manageable.
+    ///
+    /// Two retirement reasons, separated by *time*, because no single
+    /// SkyLight bit tells them apart:
+    ///
+    ///   `gone`  — the window server has no record at all. Retire at once.
+    ///     `windowExists` is unfiltered on purpose: a live window mid
+    ///     native-fullscreen transition transiently fails the eligibility
+    ///     filter (visible attribute cleared, tags reshuffled), and the
+    ///     old code — which used the *filtered* query as its liveness
+    ///     test — retired those, orphaning them with no way back. That was
+    ///     the "LibreWolf/Chrome as a background on every workspace" flood.
+    ///
+    ///   `hidden` — the record exists but the window has failed the
+    ///     manage-eligibility filter for `ineligibleRetireStreak`
+    ///     consecutive sweeps (~10s). Some apps hide a window instead of
+    ///     destroying it (Adobe's around-quit Creative Cloud panels), so
+    ///     it lingers forever, eligible for a layout tile it can never
+    ///     fill — a ghost. A fullscreen transition never lasts a whole
+    ///     2s sweep, so it never accrues a streak; a genuinely hidden
+    ///     window always crosses the threshold. `windowExists` was too
+    ///     permissive on its own; this is the missing upper bound.
     func validateWindows() {
-        let stale = managedWindowIds.filter { wid in
-            !SkyLightQuery.windowExists(wid)
+        // Snapshot: `retire` mutates `managedWindowIds`.
+        for wid in Array(managedWindowIds) {
+            if !SkyLightQuery.windowExists(wid) {
+                retire(wid, reason: "gone")
+                continue
+            }
+            // Present in the server. Is it still a manageable window?
+            if SkyLightQuery.queryWindow(wid) != nil {
+                ineligibleStreak.removeValue(forKey: wid)
+                continue
+            }
+            let streak = (ineligibleStreak[wid] ?? 0) + 1
+            if streak >= Self.ineligibleRetireStreak {
+                retire(wid, reason: "hidden")
+            } else {
+                ineligibleStreak[wid] = streak
+            }
         }
-        for wid in stale {
-            let pid = windowIdToPid[wid].map { String($0) } ?? "-"
-            removeManagedWindow(windowId: wid)
-            rejectedWindowIds.removeValue(forKey: wid)
-            socketServer.send(.windowDestroyed(windowId: wid))
-            fputs("RECONCILE: retire wid=\(wid) pid=\(pid) reason=gone\n", stderr)
-        }
+    }
+
+    /// Retract a managed window from the brain and clear its bookkeeping.
+    private func retire(_ wid: UInt32, reason: String) {
+        let pid = windowIdToPid[wid].map { String($0) } ?? "-"
+        removeManagedWindow(windowId: wid)
+        rejectedWindowIds.removeValue(forKey: wid)
+        ineligibleStreak.removeValue(forKey: wid)
+        socketServer.send(.windowDestroyed(windowId: wid))
+        fputs("RECONCILE: retire wid=\(wid) pid=\(pid) reason=\(reason)\n", stderr)
     }
 
     /// Report any manageable window the brain has never heard about.
@@ -199,12 +250,14 @@ final class EventBridge: SkyLightEventDelegate {
         case .destroyed(let windowId, _):
             removeManagedWindow(windowId: windowId)
             rejectedWindowIds.removeValue(forKey: windowId)
+            ineligibleStreak.removeValue(forKey: windowId)
             TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .closed(let windowId):
             removeManagedWindow(windowId: windowId)
             rejectedWindowIds.removeValue(forKey: windowId)
+            ineligibleStreak.removeValue(forKey: windowId)
             TitleHash.invalidate(windowId: windowId)
             socketServer.send(.windowDestroyed(windowId: windowId))
 

@@ -582,12 +582,34 @@ instance Arbitrary SameAppPair where
 prop_armingIntent_arms_when_target :: WindowRef -> Bool
 prop_armingIntent_arms_when_target w =
     case armingIntent originBase Set.empty (Just w) of
-        Just i  -> fiTarget i == w
+        Just i  -> fiTarget i == Just w
         Nothing -> False
 
--- armingIntent does not arm when the focus is cleared (empty workspace).
-prop_armingIntent_nothing_clears :: Bool
-prop_armingIntent_nothing_clears = armingIntent originBase Set.empty Nothing == Nothing
+-- Viewing an EMPTY workspace must still arm — target-less. The old
+-- behavior (clearing the intent) is pinned OUT: it left zero
+-- suppression at the exact moment macOS focus necessarily remained on
+-- another screen's window, so that window's first ambient echo yanked
+-- the current screen back across monitors, and the user's next
+-- workspace view executed on the stolen screen (the "jumped to empty
+-- workspace, pressed a view key, it all happened on the wrong screen"
+-- bug of 2026-07-24).
+prop_armingIntent_nothing_arms_targetless :: [WindowRef] -> Bool
+prop_armingIntent_nothing_arms_targetless ws =
+    case armingIntent originBase (Set.fromList ws) Nothing of
+        Nothing -> False
+        Just i  -> fiTarget i == Nothing
+                   && all (\w -> isSettlingEcho (wrWindowId w) (wrPid w) i) ws
+                   && withinSettleWindow originBase i
+
+-- A target-less intent never reads as a confirmation of anything: both
+-- confirmation predicates must reject every window/pid, so the handler
+-- can only settle-suppress or follow — never push back.
+prop_targetless_never_confirms :: WindowRef -> Bool
+prop_targetless_never_confirms w =
+    case armingIntent originBase (Set.singleton w) Nothing of
+        Nothing -> False
+        Just i  -> not (isFocusIntentTarget (wrWindowId w) (wrPid w) i)
+                   && not (isIntentTargetPid (wrPid w) i)
 
 -- isFocusIntentTarget identifies the exact (wid, pid) of the intent's
 -- target — the AX confirmation signal — and only that pair.
@@ -1316,7 +1338,8 @@ allProperties =
     , ("frontApp follows to other screen",           property prop_frontApp_follows_to_other_screen)
 
     , ("armingIntent arms with target",                property prop_armingIntent_arms_when_target)
-    , ("armingIntent Nothing clears",                  property prop_armingIntent_nothing_clears)
+    , ("armingIntent Nothing arms target-less",        property prop_armingIntent_nothing_arms_targetless)
+    , ("target-less intent never confirms",            property prop_targetless_never_confirms)
     , ("isFocusIntentTarget recognises target",        property prop_isFocusIntentTarget_recognises_target)
     , ("isFocusIntentTarget distinguishes others",     property prop_isFocusIntentTarget_distinguishes)
     , ("isIntentTargetPid matches same pid",           property prop_isIntentTargetPid_matches_same_pid)

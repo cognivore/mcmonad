@@ -3,7 +3,7 @@ module MCMonad.Main
     , launch
     ) where
 
-import Control.Monad (forever, when)
+import Control.Monad (forever, unless, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -406,18 +406,30 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- windows already at the park corner.
             reassertHiddenWindows
 
-        MouseEnteredWindow wid _pid ->
+        MouseEnteredWindow wid pid ->
             when (focusFollowsMouse cfg) $ do
                 ws <- gets windowset
-                -- Scoped to displayed workspaces, same rule as the AX
-                -- focus path: 'W.allWindows' would let the cursor
-                -- brushing a parked window's 1px corner sliver drag its
-                -- whole hidden workspace onto this screen.
-                let mref = findByWindowId wid (visibleScreenWindows ws)
-                whenJust mref $ \wref ->
-                    -- Only change focus, don't relayout (avoid feedback loop)
-                    when (W.peek ws /= Just wref) $
-                        windows (W.focusWindow wref)
+                fi <- gets focusIntent
+                now <- io getCurrentTime
+                -- A layout pass rearranges windows UNDER a stationary
+                -- cursor, which fires enter events indistinguishable
+                -- from real mouse motion. Same discriminator as the AX
+                -- path: an enter for a window we just moved, within the
+                -- settle grace, is our own doing — not the user's hand.
+                let settlingEnter = case fi of
+                        Just i  -> withinSettleWindow now i
+                                       && isSettlingEcho wid pid i
+                        Nothing -> False
+                unless settlingEnter $ do
+                    -- Scoped to displayed workspaces, same rule as the AX
+                    -- focus path: 'W.allWindows' would let the cursor
+                    -- brushing a parked window's 1px corner sliver drag its
+                    -- whole hidden workspace onto this screen.
+                    let mref = findByWindowId wid (visibleScreenWindows ws)
+                    whenJust mref $ \wref ->
+                        -- Only change focus, don't relayout (avoid feedback loop)
+                        when (W.peek ws /= Just wref) $
+                            windows (W.focusWindow wref)
 
         UserMouseDown ->
             -- A physical click happened somewhere on the system. This
@@ -566,11 +578,19 @@ handleFocusedWindowChanged wid pid = do
             -- clicking another window in the same app. Accept it and
             -- clear the intent.
             applyAndClearIntent
-        Just i ->
+        Just i | Just _ <- fiTarget i ->
             -- Cross-app divergence: bounce or spurious AX event from a
             -- third app. mcmonad's view stands; push macOS back to the
             -- target and decrement the budget.
             pushBackFocus i
+        Just _ ->
+            -- Target-less intent (the user is deliberately viewing an
+            -- empty workspace) and the event is neither a settling echo
+            -- nor inside the grace. There is no window to push macOS
+            -- back onto and no reason left to distrust the event — a
+            -- genuine later switch (Cmd-Tab, Dock click) must be free
+            -- to move the current screen. Follow it.
+            applyAndClearIntent
         Nothing ->
             -- No intent armed. AX is authoritative.
             applyClean
@@ -603,9 +623,14 @@ handleFrontAppChanged pid = do
             -- without spending the budget (see 'handleFocusedWindowChanged').
             -- Time-bounded, so a real Cmd-Tab later still follows.
             return ()
-        Just i ->
+        Just i | Just _ <- fiTarget i ->
             -- Different app activated — bounce or spurious. Push back.
             pushBackFocus i
+        Just _ -> do
+            -- Target-less intent past its settle window: nothing to
+            -- re-assert; the event is genuine. Follow it.
+            modify $ \s -> s { focusIntent = Nothing }
+            applyClean
         Nothing ->
             applyClean
   where
@@ -623,8 +648,10 @@ handleFrontAppChanged pid = do
 pushBackFocus :: FocusIntent -> M ()
 pushBackFocus i = do
     conn <- asks connection
-    let t = fiTarget i
-    io $ sendCommand conn (FocusWindow (wrWindowId t) (wrPid t))
+    -- Target-less intents never reach here (the handlers follow instead
+    -- of pushing back — there is nothing to re-assert), but stay total.
+    whenJust (fiTarget i) $ \t ->
+        io $ sendCommand conn (FocusWindow (wrWindowId t) (wrPid t))
     modify $ \s -> s { focusIntent = consumeIntent i }
 
 -- ---------------------------------------------------------------------------

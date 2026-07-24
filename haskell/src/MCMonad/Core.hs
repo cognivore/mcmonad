@@ -619,7 +619,21 @@ resolveFrontApp pid ws = case W.peek ws of
 -- budget for how many divergent AX\/NSWorkspace events we will fight
 -- before giving up and letting macOS' view win.
 data FocusIntent = FocusIntent
-    { fiTarget             :: !WindowRef
+    { fiTarget             :: !(Maybe WindowRef)
+      -- ^ The window the arming 'MCMonad.Operations.windows' pass told
+      -- macOS to focus — or 'Nothing' when the pass landed on an EMPTY
+      -- workspace. 'Nothing' is a real, defensible focus state, not the
+      -- absence of one: macOS cannot focus "no window", so after an
+      -- empty-workspace view the OS keyboard focus necessarily stays on
+      -- some other screen's window, and that window's ambient
+      -- re-assertion events keep arriving. When viewing an empty
+      -- workspace used to clear the intent outright, the first such
+      -- event sailed through 'MCMonad.Core.resolveFocusedWindow' and
+      -- yanked the current screen back across monitors — the
+      -- "jumped to an empty workspace, pressed a view key, everything
+      -- happened on the wrong screen" bug. A target-less intent keeps
+      -- the settling suppression alive for those echoes while making
+      -- no claim about which window is focused.
     , fiReissuesRemaining  :: !Word8
     , fiSettling           :: !(Set WindowRef)
       -- ^ Every window the 'MCMonad.Operations.windows' pass that armed
@@ -666,18 +680,24 @@ settleGrace = 1.0
 -- | Build a fresh intent from the focus 'MCMonad.Operations.windows'
 -- just committed, plus the set of windows it wrote frames for (for
 -- 'fiSettling') and the wall-clock @now@ the pass ran (for the settle
--- deadline). 'Nothing' for an empty workspace clears any prior arming
--- and disables suppression entirely until the next focus change.
+-- deadline).
+--
+-- ALWAYS arms — including for 'Nothing' (an empty workspace). The old
+-- behavior, clearing the intent on an empty view, left zero
+-- suppression at exactly the moment macOS focus is guaranteed to be
+-- pointing at another screen's window (see 'fiTarget'). The result is
+-- still wrapped in 'Maybe' because 'MCMonad.Core.MState' stores
+-- @Maybe FocusIntent@ and a physical 'UserMouseDown' genuinely clears
+-- it.
 armingIntent :: UTCTime -> Set WindowRef -> Maybe WindowRef -> Maybe FocusIntent
-armingIntent now settling (Just w) =
-    Just (FocusIntent w defaultFocusBudget settling (addUTCTime settleGrace now))
-armingIntent _ _ Nothing = Nothing
+armingIntent now settling target =
+    Just (FocusIntent target defaultFocusBudget settling
+                      (addUTCTime settleGrace now))
 
 -- | Does an incoming @FocusedWindowChanged wid pid@ exactly match the
 -- intent's target? Used to recognise AX confirmation echoes.
 isFocusIntentTarget :: Word32 -> Int32 -> FocusIntent -> Bool
-isFocusIntentTarget wid pid i =
-    wrWindowId (fiTarget i) == wid && wrPid (fiTarget i) == pid
+isFocusIntentTarget wid pid i = fiTarget i == Just (WindowRef wid pid)
 
 -- | Does an incoming event's PID match the intent's target PID? Used
 -- two ways: to recognise NSWorkspace confirmation echoes (target's app
@@ -685,7 +705,7 @@ isFocusIntentTarget wid pid i =
 -- target's app is reporting focus on a *different* window of itself,
 -- which we treat as a user click and accept).
 isIntentTargetPid :: Int32 -> FocusIntent -> Bool
-isIntentTargetPid pid i = wrPid (fiTarget i) == pid
+isIntentTargetPid pid i = maybe False ((== pid) . wrPid) (fiTarget i)
 
 -- | Is an incoming @FocusedWindowChanged wid pid@ an echo of a window
 -- this layout pass just moved? Such an event is macOS settling around

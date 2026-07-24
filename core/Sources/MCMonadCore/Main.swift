@@ -52,6 +52,19 @@ final class EventBridge: SkyLightEventDelegate {
     /// the hidden window always crosses the threshold.
     private static let ineligibleRetireStreak = 5
 
+    /// System-UI processes whose windows must never be managed, even
+    /// though they pass the close-button test. macOS notification alerts
+    /// (UserNotificationCenter) are level-0 windows WITH close buttons —
+    /// on 2026-07-24 they were being tiled 1146x1410 onto whatever
+    /// workspace was current, focused, and then auto-dismissed seconds
+    /// later, hijacking the layout and stealing focus on every system
+    /// notification. Notification Center's banner daemon is included for
+    /// completeness (its banners are normally filtered by level anyway).
+    private static let systemUIBundleIds: Set<String> = [
+        "com.apple.UserNotificationCenter",
+        "com.apple.notificationcenterui",
+    ]
+
     init(socketServer: SocketServer, focusTracker: AXFocusTracker) {
         self.socketServer = socketServer
         self.focusTracker = focusTracker
@@ -205,6 +218,14 @@ final class EventBridge: SkyLightEventDelegate {
         // Only manage windows that have a close button — this filters
         // out context menus, tooltips, popups, and other transient UI
         guard info.hasCloseButton else {
+            noteRejected(snap.windowId)
+            return
+        }
+
+        // System notification alerts pass the close-button test but are
+        // transient UI all the same — never manage them.
+        if let bundleId = info.bundleId,
+           Self.systemUIBundleIds.contains(bundleId) {
             noteRejected(snap.windowId)
             return
         }

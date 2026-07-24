@@ -134,6 +134,18 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private var keyMonitor: Any?
 
+    /// Mirror of "the search field's editor currently holds first
+    /// responder", maintained on the main thread by the
+    /// `controlTextDidBeginEditing`/`controlTextDidEndEditing` delegate
+    /// callbacks. Read by the local key monitor's closure.
+    ///
+    /// `nonisolated(unsafe)` on purpose: the local monitor is always
+    /// delivered on the main thread and so is every writer, so there is no
+    /// real data race — but the monitor's closure must stay *non*-isolated
+    /// (see `installKeyMonitor`), which means it cannot touch `@MainActor`
+    /// state. A plain stored flag it can read is the whole point.
+    private nonisolated(unsafe) var editorHasFocus = false
+
     // MARK: - Views
 
     private var panel: KeyablePanel?
@@ -771,19 +783,35 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private func installKeyMonitor() {
         removeKeyMonitor()
+        // The closure is intentionally *non*-isolated. AppKit invokes a
+        // local monitor synchronously from -[NSApplication sendEvent:] via
+        // its non-isolated handler type, so a `@MainActor` closure here
+        // forces the compiler to insert a dynamic actor-isolation
+        // precondition (swift_task_isCurrentExecutorWithFlags) on that
+        // call path — and that check crashes the daemon in this runtime
+        // (Bus error inside swift_getObjectType). It is the same landmine
+        // that took down the VerticallyCenteredTextFieldCell override; the
+        // cure is the same — don't cross the ObjC→Swift boundary into
+        // `@MainActor` synchronously.
+        //
+        // So the closure decides *only* from non-isolated inputs (the
+        // NSEvent's own fields and the `editorHasFocus` mirror) whether to
+        // swallow the event, and defers every main-actor action through
+        // `onMain`, the async hop this codebase already uses for its
+        // Carbon-hotkey and CGEvent-tap callbacks. A one-runloop delay on
+        // Enter/Esc/arrows/Tab is imperceptible.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             // ⌘L toggles voice from anywhere in the panel.
             if event.modifierFlags.contains(.command),
                event.charactersIgnoringModifiers?.lowercased() == "l" {
-                self.toggleVoice()
+                self.onMain { $0.toggleVoice() }
                 return nil
             }
-            // While the search field's editor holds focus, its
-            // control(_:textView:doCommandBy:) drives navigation — leave it be
-            // so typing and the existing key handling are unchanged.
-            if let editor = self.searchField.currentEditor(),
-               self.panel?.firstResponder === editor {
+            // While the search field's editor holds first responder, its
+            // control(_:textView:doCommandBy:) drives navigation — leave it
+            // be so typing and the existing key handling are unchanged.
+            if self.editorHasFocus {
                 return event
             }
             // Focus is elsewhere — typically the results table grabbed first
@@ -793,19 +821,32 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             // Return/Escape. This is what made mouse-then-keyboard feel "stuck".
             switch event.keyCode {
             case 36, 76:   // Return, keypad Enter
-                self.activateSelection(); return nil
+                self.onMain { $0.activateSelection() }; return nil
             case 53:       // Escape
-                self.cancel(); return nil
+                self.onMain { $0.cancel() }; return nil
             case 125:      // Down arrow
-                self.moveSelection(by: 1); return nil
+                self.onMain { $0.moveSelection(by: 1) }; return nil
             case 126:      // Up arrow
-                self.moveSelection(by: -1); return nil
+                self.onMain { $0.moveSelection(by: -1) }; return nil
             case 48:       // Tab (Shift-Tab cycles back)
-                self.cycleMode(forward: !event.modifierFlags.contains(.shift))
-                return nil
+                let forward = !event.modifierFlags.contains(.shift)
+                self.onMain { $0.cycleMode(forward: forward) }; return nil
             default:
                 return event
             }
+        }
+    }
+
+    /// Run `body` on the main actor on the next runloop tick. Nonisolated
+    /// so the non-isolated key monitor can call it; the async hop is the
+    /// same one HotkeyManager / MouseDownMonitor use, and it never inserts
+    /// the synchronous isolation check that crashes.
+    private nonisolated func onMain(
+        _ body: @escaping @MainActor (SpotlightController) -> Void
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            body(self)
         }
     }
 
@@ -916,6 +957,18 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         // partials stop overwriting what they're typing.
         if voice.isListening { voice.stop() }
         applyFilter(searchField.stringValue)
+    }
+
+    // Keep `editorHasFocus` in step with the field editor's lifecycle so
+    // the non-isolated key monitor can tell "typing in the field" from
+    // "the results table has first responder" without touching @MainActor
+    // state (see installKeyMonitor). These fire on the main thread.
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        editorHasFocus = true
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        editorHasFocus = false
     }
 
     func control(_ control: NSControl,

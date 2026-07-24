@@ -43,6 +43,7 @@ module MCMonad.Core
     , isIntentTargetPid
     , isSettlingEcho
     , isSettlingPidEcho
+    , withinSettleWindow
     , consumeIntent
     , defaultFocusBudget
     ) where
@@ -59,7 +60,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word8, Word32)
 import GHC.Generics (Generic)
@@ -636,7 +637,16 @@ data FocusIntent = FocusIntent
       -- no-op it, and crucially do not spend the budget on it. A genuine
       -- click on any of these windows still lands, because a physical
       -- 'UserMouseDown' clears the whole intent first (see the note below).
-    } deriving (Eq, Show, Read)
+    , fiSettleUntil        :: !UTCTime
+      -- ^ The 'fiSettling' membership only suppresses events until this
+      -- deadline (arming time + 'settleGrace'). macOS emits a layout
+      -- write's focus echoes in a burst within a few hundred ms; anything
+      -- for the same window *later* is a genuine user action (a keyboard
+      -- Cmd-Tab to an app that lives only on the other monitor) and must
+      -- still be allowed to move the current screen. Without the deadline,
+      -- a stale settling set — refreshed only by the next layout pass or a
+      -- physical click — would swallow such a switch indefinitely.
+    } deriving (Eq, Show)
 
 -- | Initial budget for re-issues per intent. Empirically a single user
 -- action triggers at most 3 cross-app divergent events (AX bounce for
@@ -646,13 +656,22 @@ data FocusIntent = FocusIntent
 defaultFocusBudget :: Word8
 defaultFocusBudget = 4
 
+-- | How long a layout pass's settling echoes are believed to be ours.
+-- Comfortably covers the macOS AX-settle burst (the core's DEFIED
+-- re-verify uses 500ms) while staying short enough that a deliberate
+-- keyboard app-switch a beat later is treated as genuine intent.
+settleGrace :: NominalDiffTime
+settleGrace = 1.0
+
 -- | Build a fresh intent from the focus 'MCMonad.Operations.windows'
 -- just committed, plus the set of windows it wrote frames for (for
--- 'fiSettling'). 'Nothing' for an empty workspace clears any prior
--- arming and disables suppression entirely until the next focus change.
-armingIntent :: Set WindowRef -> Maybe WindowRef -> Maybe FocusIntent
-armingIntent settling (Just w) = Just (FocusIntent w defaultFocusBudget settling)
-armingIntent _        Nothing  = Nothing
+-- 'fiSettling') and the wall-clock @now@ the pass ran (for the settle
+-- deadline). 'Nothing' for an empty workspace clears any prior arming
+-- and disables suppression entirely until the next focus change.
+armingIntent :: UTCTime -> Set WindowRef -> Maybe WindowRef -> Maybe FocusIntent
+armingIntent now settling (Just w) =
+    Just (FocusIntent w defaultFocusBudget settling (addUTCTime settleGrace now))
+armingIntent _ _ Nothing = Nothing
 
 -- | Does an incoming @FocusedWindowChanged wid pid@ exactly match the
 -- intent's target? Used to recognise AX confirmation echoes.
@@ -682,6 +701,12 @@ isSettlingEcho wid pid i = Set.member (WindowRef wid pid) (fiSettling i)
 -- on any settling window sharing the pid.
 isSettlingPidEcho :: Int32 -> FocusIntent -> Bool
 isSettlingPidEcho pid i = any ((== pid) . wrPid) (Set.toList (fiSettling i))
+
+-- | Is @now@ still inside this intent's settle window? The settling-echo
+-- predicates only apply while this holds; past the deadline a matching
+-- event is a genuine later user action, not our write's echo.
+withinSettleWindow :: UTCTime -> FocusIntent -> Bool
+withinSettleWindow now i = now <= fiSettleUntil i
 
 -- | Decrement the re-issue budget after a divergent event has triggered
 -- a push-back. Returns 'Nothing' when the budget is exhausted so the

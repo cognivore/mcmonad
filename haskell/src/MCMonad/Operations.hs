@@ -259,8 +259,10 @@ windows f = do
     -- only 'newFocus'. This pass moved windows on *both* monitors, and the
     -- AX echoes from the secondary monitor's writes must not be mistaken
     -- for the user looking over there (see 'FocusIntent'/'fiSettling').
+    -- The timestamp bounds how long those echoes are believed to be ours.
+    nowArm <- io getCurrentTime
     modify $ \s -> s
-        { focusIntent = armingIntent (S.fromList newVisible) newFocus }
+        { focusIntent = armingIntent nowArm (S.fromList newVisible) newFocus }
 
     -- 8. Send workspace indicator update (with mode indicator)
     mode <- gets inputMode

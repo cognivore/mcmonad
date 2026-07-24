@@ -10,6 +10,7 @@ import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Int (Int32)
 import Data.Word (Word32)
+import Data.Time.Clock (getCurrentTime)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitSuccess)
 import System.IO (hPutStrLn, stderr)
@@ -540,19 +541,23 @@ handleEvent debug cfg hotkeyIdMap evt = do
 handleFocusedWindowChanged :: Word32 -> Int32 -> M ()
 handleFocusedWindowChanged wid pid = do
     fi <- gets focusIntent
+    now <- io getCurrentTime
     case fi of
         Just i | isFocusIntentTarget wid pid i ->
             -- Exact match: AX is confirming our command. StackSet is
             -- already on this window. Leave intent armed in case more
             -- divergences follow.
             return ()
-        Just i | isSettlingEcho wid pid i ->
-            -- A window this layout pass moved is reporting focus — macOS
-            -- settling around our own AX write, not the user. No-op, and
-            -- (unlike the cross-app branch) do NOT spend the budget: a
-            -- secondary monitor's worth of settling echoes must not be
-            -- able to exhaust suppression and let a later echo flip the
-            -- current screen. A real click clears the intent first.
+        Just i | withinSettleWindow now i && isSettlingEcho wid pid i ->
+            -- A window this layout pass moved is reporting focus, and it's
+            -- soon enough after the write to be macOS settling around our
+            -- own AX, not the user. No-op, and (unlike the cross-app
+            -- branch) do NOT spend the budget: a secondary monitor's worth
+            -- of settling echoes must not be able to exhaust suppression
+            -- and let a later echo flip the current screen. Past the
+            -- settle deadline this guard lapses, so a genuine later switch
+            -- to one of these windows still follows. A real click clears
+            -- the intent outright.
             return ()
         Just i | isIntentTargetPid pid i ->
             -- Same app, different window (the exact-match guard above
@@ -587,14 +592,16 @@ handleFocusedWindowChanged wid pid = do
 handleFrontAppChanged :: Int32 -> M ()
 handleFrontAppChanged pid = do
     fi <- gets focusIntent
+    now <- io getCurrentTime
     case fi of
         Just i | isIntentTargetPid pid i ->
             -- App-level confirmation. No-op; keep intent armed.
             return ()
-        Just i | isSettlingPidEcho pid i ->
+        Just i | withinSettleWindow now i && isSettlingPidEcho pid i ->
             -- Front-app echo for an app we just moved a window of — our
             -- own AX write settling, not a genuine app switch. No-op
             -- without spending the budget (see 'handleFocusedWindowChanged').
+            -- Time-bounded, so a real Cmd-Tab later still follows.
             return ()
         Just i ->
             -- Different app activated — bounce or spurious. Push back.

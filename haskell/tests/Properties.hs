@@ -6,7 +6,8 @@ import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
     , updateAffinities, resolveFocusedWindow, resolveFrontApp
     , FocusIntent(..), armingIntent, isFocusIntentTarget
-    , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho, consumeIntent
+    , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
+    , withinSettleWindow, consumeIntent
     )
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
@@ -580,19 +581,19 @@ instance Arbitrary SameAppPair where
 -- cross-app changes: intra-app bounces are possible too.
 prop_armingIntent_arms_when_target :: WindowRef -> Bool
 prop_armingIntent_arms_when_target w =
-    case armingIntent Set.empty (Just w) of
+    case armingIntent originBase Set.empty (Just w) of
         Just i  -> fiTarget i == w
         Nothing -> False
 
 -- armingIntent does not arm when the focus is cleared (empty workspace).
 prop_armingIntent_nothing_clears :: Bool
-prop_armingIntent_nothing_clears = armingIntent Set.empty Nothing == Nothing
+prop_armingIntent_nothing_clears = armingIntent originBase Set.empty Nothing == Nothing
 
 -- isFocusIntentTarget identifies the exact (wid, pid) of the intent's
 -- target — the AX confirmation signal — and only that pair.
 prop_isFocusIntentTarget_recognises_target :: WindowRef -> Bool
 prop_isFocusIntentTarget_recognises_target w =
-    case armingIntent Set.empty (Just w) of
+    case armingIntent originBase Set.empty (Just w) of
         Nothing -> False
         Just i  -> isFocusIntentTarget (wrWindowId w) (wrPid w) i
 
@@ -601,7 +602,7 @@ prop_isFocusIntentTarget_recognises_target w =
 prop_isFocusIntentTarget_distinguishes :: WindowRef -> WindowRef -> Property
 prop_isFocusIntentTarget_distinguishes w1 w2 =
     (wrWindowId w1, wrPid w1) /= (wrWindowId w2, wrPid w2)
-    ==> case armingIntent Set.empty (Just w1) of
+    ==> case armingIntent originBase Set.empty (Just w1) of
             Nothing -> property False
             Just i  -> property $ not (isFocusIntentTarget (wrWindowId w2) (wrPid w2) i)
 
@@ -611,7 +612,7 @@ prop_isFocusIntentTarget_distinguishes w1 w2 =
 -- means a different window of the target's app gained focus.
 prop_isIntentTargetPid_matches_same_pid :: SameAppPair -> Bool
 prop_isIntentTargetPid_matches_same_pid (SameAppPair from to) =
-    case armingIntent Set.empty (Just to) of
+    case armingIntent originBase Set.empty (Just to) of
         Nothing -> False
         Just i  -> isIntentTargetPid (wrPid from) i
                    && isIntentTargetPid (wrPid to) i
@@ -619,7 +620,7 @@ prop_isIntentTargetPid_matches_same_pid (SameAppPair from to) =
 -- And it does NOT match a different pid (cross-app divergence).
 prop_isIntentTargetPid_distinguishes_other_pid :: CrossAppPair -> Bool
 prop_isIntentTargetPid_distinguishes_other_pid (CrossAppPair from to) =
-    case armingIntent Set.empty (Just to) of
+    case armingIntent originBase Set.empty (Just to) of
         Nothing -> False
         Just i  -> isIntentTargetPid (wrPid to) i
                    && not (isIntentTargetPid (wrPid from) i)
@@ -630,7 +631,7 @@ prop_isIntentTargetPid_distinguishes_other_pid (CrossAppPair from to) =
 -- divergence eventually wins.
 prop_consumeIntent_drains_exactly_the_budget :: WindowRef -> Bool
 prop_consumeIntent_drains_exactly_the_budget w =
-    case armingIntent Set.empty (Just w) of
+    case armingIntent originBase Set.empty (Just w) of
         Nothing -> False
         Just i0 ->
             let budget = fromIntegral (fiReissuesRemaining i0) :: Int
@@ -653,7 +654,7 @@ prop_consumeIntent_drains_exactly_the_budget w =
 -- whatever its pid — so the handler no-ops it instead of pushing back.
 prop_isSettlingEcho_recognises_laid_out :: WindowRef -> [WindowRef] -> Property
 prop_isSettlingEcho_recognises_laid_out w rest =
-    case armingIntent (Set.fromList (w : rest)) (Just w) of
+    case armingIntent originBase (Set.fromList (w : rest)) (Just w) of
         Nothing -> property False
         Just i  -> property $ isSettlingEcho (wrWindowId w) (wrPid w) i
 
@@ -663,7 +664,7 @@ prop_isSettlingEcho_recognises_laid_out w rest =
 prop_isSettlingEcho_covers_whole_set :: WindowRef -> WindowRef -> Property
 prop_isSettlingEcho_covers_whole_set target other =
     (wrWindowId target, wrPid target) /= (wrWindowId other, wrPid other)
-    ==> case armingIntent (Set.fromList [target, other]) (Just target) of
+    ==> case armingIntent originBase (Set.fromList [target, other]) (Just target) of
             Nothing -> property False
             Just i  -> property $ isSettlingEcho (wrWindowId other) (wrPid other) i
 
@@ -673,7 +674,7 @@ prop_isSettlingEcho_rejects_outsider :: WindowRef -> WindowRef -> Property
 prop_isSettlingEcho_rejects_outsider target outsider =
     outsider `notElem` [target]
     && (wrWindowId target, wrPid target) /= (wrWindowId outsider, wrPid outsider)
-    ==> case armingIntent (Set.singleton target) (Just target) of
+    ==> case armingIntent originBase (Set.singleton target) (Just target) of
             Nothing -> property False
             Just i  -> property $
                 not (isSettlingEcho (wrWindowId outsider) (wrPid outsider) i)
@@ -683,11 +684,23 @@ prop_isSettlingEcho_rejects_outsider target outsider =
 prop_isSettlingPidEcho_matches_and_rejects :: WindowRef -> Int32 -> Property
 prop_isSettlingPidEcho_matches_and_rejects w otherPid =
     otherPid /= wrPid w
-    ==> case armingIntent (Set.singleton w) (Just w) of
+    ==> case armingIntent originBase (Set.singleton w) (Just w) of
             Nothing -> property False
             Just i  -> property $
                 isSettlingPidEcho (wrPid w) i
                 && not (isSettlingPidEcho otherPid i)
+
+-- The settle window is what makes echo-suppression safe: a set member is
+-- suppressible at arming time, but NOT once the grace has elapsed — past
+-- the deadline the same window's event is a genuine later user switch and
+-- must be free to move the current screen. (settleGrace is 1s.)
+prop_settle_window_bounds_suppression :: WindowRef -> Property
+prop_settle_window_bounds_suppression w =
+    case armingIntent originBase (Set.singleton w) (Just w) of
+        Nothing -> property False
+        Just i  -> property $
+            withinSettleWindow originBase i
+            && not (withinSettleWindow (addUTCTime 2 originBase) i)
 
 
 -- === PERSISTENCE ROUND-TRIP (MCMonad.Persistence) ===
@@ -1313,6 +1326,7 @@ allProperties =
     , ("settling echo covers whole set, not just target", property prop_isSettlingEcho_covers_whole_set)
     , ("settling echo rejects an outsider window",     property prop_isSettlingEcho_rejects_outsider)
     , ("settling pid-echo matches and rejects",        property prop_isSettlingPidEcho_matches_and_rejects)
+    , ("settle window bounds echo suppression",        property prop_settle_window_bounds_suppression)
     -- Cross-restart identity matcher
     -- Persistence round-trip (WindowRef identity)
     , ("persistence: kept saved survives, stale dropped", property prop_persistence_round_trip)

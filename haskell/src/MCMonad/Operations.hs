@@ -255,7 +255,12 @@ windows f = do
         case newFocus of
             Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
             Nothing -> return ()
-    modify $ \s -> s { focusIntent = armingIntent newFocus }
+    -- Arm suppression against every window we just wrote a frame for, not
+    -- only 'newFocus'. This pass moved windows on *both* monitors, and the
+    -- AX echoes from the secondary monitor's writes must not be mistaken
+    -- for the user looking over there (see 'FocusIntent'/'fiSettling').
+    modify $ \s -> s
+        { focusIntent = armingIntent (S.fromList newVisible) newFocus }
 
     -- 8. Send workspace indicator update (with mode indicator)
     mode <- gets inputMode

@@ -6,7 +6,7 @@ import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
     , updateAffinities, resolveFocusedWindow, resolveFrontApp
     , FocusIntent(..), armingIntent, isFocusIntentTarget
-    , isIntentTargetPid, consumeIntent
+    , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho, consumeIntent
     )
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
@@ -580,19 +580,19 @@ instance Arbitrary SameAppPair where
 -- cross-app changes: intra-app bounces are possible too.
 prop_armingIntent_arms_when_target :: WindowRef -> Bool
 prop_armingIntent_arms_when_target w =
-    case armingIntent (Just w) of
+    case armingIntent Set.empty (Just w) of
         Just i  -> fiTarget i == w
         Nothing -> False
 
 -- armingIntent does not arm when the focus is cleared (empty workspace).
 prop_armingIntent_nothing_clears :: Bool
-prop_armingIntent_nothing_clears = armingIntent Nothing == Nothing
+prop_armingIntent_nothing_clears = armingIntent Set.empty Nothing == Nothing
 
 -- isFocusIntentTarget identifies the exact (wid, pid) of the intent's
 -- target — the AX confirmation signal — and only that pair.
 prop_isFocusIntentTarget_recognises_target :: WindowRef -> Bool
 prop_isFocusIntentTarget_recognises_target w =
-    case armingIntent (Just w) of
+    case armingIntent Set.empty (Just w) of
         Nothing -> False
         Just i  -> isFocusIntentTarget (wrWindowId w) (wrPid w) i
 
@@ -601,7 +601,7 @@ prop_isFocusIntentTarget_recognises_target w =
 prop_isFocusIntentTarget_distinguishes :: WindowRef -> WindowRef -> Property
 prop_isFocusIntentTarget_distinguishes w1 w2 =
     (wrWindowId w1, wrPid w1) /= (wrWindowId w2, wrPid w2)
-    ==> case armingIntent (Just w1) of
+    ==> case armingIntent Set.empty (Just w1) of
             Nothing -> property False
             Just i  -> property $ not (isFocusIntentTarget (wrWindowId w2) (wrPid w2) i)
 
@@ -611,7 +611,7 @@ prop_isFocusIntentTarget_distinguishes w1 w2 =
 -- means a different window of the target's app gained focus.
 prop_isIntentTargetPid_matches_same_pid :: SameAppPair -> Bool
 prop_isIntentTargetPid_matches_same_pid (SameAppPair from to) =
-    case armingIntent (Just to) of
+    case armingIntent Set.empty (Just to) of
         Nothing -> False
         Just i  -> isIntentTargetPid (wrPid from) i
                    && isIntentTargetPid (wrPid to) i
@@ -619,7 +619,7 @@ prop_isIntentTargetPid_matches_same_pid (SameAppPair from to) =
 -- And it does NOT match a different pid (cross-app divergence).
 prop_isIntentTargetPid_distinguishes_other_pid :: CrossAppPair -> Bool
 prop_isIntentTargetPid_distinguishes_other_pid (CrossAppPair from to) =
-    case armingIntent (Just to) of
+    case armingIntent Set.empty (Just to) of
         Nothing -> False
         Just i  -> isIntentTargetPid (wrPid to) i
                    && not (isIntentTargetPid (wrPid from) i)
@@ -630,7 +630,7 @@ prop_isIntentTargetPid_distinguishes_other_pid (CrossAppPair from to) =
 -- divergence eventually wins.
 prop_consumeIntent_drains_exactly_the_budget :: WindowRef -> Bool
 prop_consumeIntent_drains_exactly_the_budget w =
-    case armingIntent (Just w) of
+    case armingIntent Set.empty (Just w) of
         Nothing -> False
         Just i0 ->
             let budget = fromIntegral (fiReissuesRemaining i0) :: Int
@@ -638,6 +638,56 @@ prop_consumeIntent_drains_exactly_the_budget w =
                               (iterate (>>= consumeIntent) (Just i0))
             in last steps == Nothing
                && length (filter (/= Nothing) steps) == budget
+
+-- === SETTLING-ECHO SUPPRESSION (fiSettling) ===
+--
+-- 'MCMonad.Operations.windows' writes frames to every window on every
+-- screen, then arms the intent with that whole set as 'fiSettling'. The
+-- AX/NSWorkspace echoes those writes provoke — especially for windows on
+-- the *other* monitor — must be recognised as our own settling, not as
+-- the user looking elsewhere. Getting this wrong is the "Opt-h/l/j makes
+-- focus jump to the wrong screen" bug: the echoes drain the budget and
+-- then flip the current screen.
+
+-- A window that was part of the just-laid-out set is a settling echo,
+-- whatever its pid — so the handler no-ops it instead of pushing back.
+prop_isSettlingEcho_recognises_laid_out :: WindowRef -> [WindowRef] -> Property
+prop_isSettlingEcho_recognises_laid_out w rest =
+    case armingIntent (Set.fromList (w : rest)) (Just w) of
+        Nothing -> property False
+        Just i  -> property $ isSettlingEcho (wrWindowId w) (wrPid w) i
+
+-- Any member of the settling set is recognised, not only the focus
+-- target — this is the whole point (secondary-monitor windows we moved
+-- but did not focus).
+prop_isSettlingEcho_covers_whole_set :: WindowRef -> WindowRef -> Property
+prop_isSettlingEcho_covers_whole_set target other =
+    (wrWindowId target, wrPid target) /= (wrWindowId other, wrPid other)
+    ==> case armingIntent (Set.fromList [target, other]) (Just target) of
+            Nothing -> property False
+            Just i  -> property $ isSettlingEcho (wrWindowId other) (wrPid other) i
+
+-- A window we did NOT lay out is not a settling echo — otherwise a real
+-- focus change would be swallowed forever.
+prop_isSettlingEcho_rejects_outsider :: WindowRef -> WindowRef -> Property
+prop_isSettlingEcho_rejects_outsider target outsider =
+    outsider `notElem` [target]
+    && (wrWindowId target, wrPid target) /= (wrWindowId outsider, wrPid outsider)
+    ==> case armingIntent (Set.singleton target) (Just target) of
+            Nothing -> property False
+            Just i  -> property $
+                not (isSettlingEcho (wrWindowId outsider) (wrPid outsider) i)
+
+-- The PID-only front-app variant matches when any settling window shares
+-- the pid, and rejects a pid absent from the set.
+prop_isSettlingPidEcho_matches_and_rejects :: WindowRef -> Int32 -> Property
+prop_isSettlingPidEcho_matches_and_rejects w otherPid =
+    otherPid /= wrPid w
+    ==> case armingIntent (Set.singleton w) (Just w) of
+            Nothing -> property False
+            Just i  -> property $
+                isSettlingPidEcho (wrPid w) i
+                && not (isSettlingPidEcho otherPid i)
 
 
 -- === PERSISTENCE ROUND-TRIP (MCMonad.Persistence) ===
@@ -1259,6 +1309,10 @@ allProperties =
     , ("isIntentTargetPid matches same pid",           property prop_isIntentTargetPid_matches_same_pid)
     , ("isIntentTargetPid distinguishes cross-app",    property prop_isIntentTargetPid_distinguishes_other_pid)
     , ("consumeIntent drains exactly the budget",      property prop_consumeIntent_drains_exactly_the_budget)
+    , ("settling echo recognises laid-out window",     property prop_isSettlingEcho_recognises_laid_out)
+    , ("settling echo covers whole set, not just target", property prop_isSettlingEcho_covers_whole_set)
+    , ("settling echo rejects an outsider window",     property prop_isSettlingEcho_rejects_outsider)
+    , ("settling pid-echo matches and rejects",        property prop_isSettlingPidEcho_matches_and_rejects)
     -- Cross-restart identity matcher
     -- Persistence round-trip (WindowRef identity)
     , ("persistence: kept saved survives, stale dropped", property prop_persistence_round_trip)

@@ -546,6 +546,14 @@ handleFocusedWindowChanged wid pid = do
             -- already on this window. Leave intent armed in case more
             -- divergences follow.
             return ()
+        Just i | isSettlingEcho wid pid i ->
+            -- A window this layout pass moved is reporting focus — macOS
+            -- settling around our own AX write, not the user. No-op, and
+            -- (unlike the cross-app branch) do NOT spend the budget: a
+            -- secondary monitor's worth of settling echoes must not be
+            -- able to exhaust suppression and let a later echo flip the
+            -- current screen. A real click clears the intent first.
+            return ()
         Just i | isIntentTargetPid pid i ->
             -- Same app, different window (the exact-match guard above
             -- excluded the target's wid). A different window of the
@@ -582,6 +590,11 @@ handleFrontAppChanged pid = do
     case fi of
         Just i | isIntentTargetPid pid i ->
             -- App-level confirmation. No-op; keep intent armed.
+            return ()
+        Just i | isSettlingPidEcho pid i ->
+            -- Front-app echo for an app we just moved a window of — our
+            -- own AX write settling, not a genuine app switch. No-op
+            -- without spending the budget (see 'handleFocusedWindowChanged').
             return ()
         Just i ->
             -- Different app activated — bounce or spurious. Push back.

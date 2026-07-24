@@ -41,6 +41,8 @@ module MCMonad.Core
     , armingIntent
     , isFocusIntentTarget
     , isIntentTargetPid
+    , isSettlingEcho
+    , isSettlingPidEcho
     , consumeIntent
     , defaultFocusBudget
     ) where
@@ -55,6 +57,7 @@ import Data.Int (Int32)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 import Data.Typeable (Typeable, cast)
@@ -617,7 +620,23 @@ resolveFrontApp pid ws = case W.peek ws of
 data FocusIntent = FocusIntent
     { fiTarget             :: !WindowRef
     , fiReissuesRemaining  :: !Word8
-    } deriving (Eq, Show, Read, Generic)
+    , fiSettling           :: !(Set WindowRef)
+      -- ^ Every window the 'MCMonad.Operations.windows' pass that armed
+      -- this intent wrote a frame for — the whole visible set across
+      -- *all* screens, not just 'fiTarget'.
+      --
+      -- Those AX writes make macOS emit 'FocusedWindowChanged' \/
+      -- 'FrontAppChanged' echoes for windows on the *other* monitor. With
+      -- only 'fiTarget' to check against, each echo read as a cross-app
+      -- divergence: it burned a re-issue from the budget, and once the
+      -- budget drained the next echo flowed through to 'resolveFocusedWindow'
+      -- and dragged the current screen onto the other monitor — the
+      -- Opt-h\/l\/j "focus jumps to the wrong screen while I resize" bug.
+      -- An event whose window is in this set is our own settling echo:
+      -- no-op it, and crucially do not spend the budget on it. A genuine
+      -- click on any of these windows still lands, because a physical
+      -- 'UserMouseDown' clears the whole intent first (see the note below).
+    } deriving (Eq, Show, Read)
 
 -- | Initial budget for re-issues per intent. Empirically a single user
 -- action triggers at most 3 cross-app divergent events (AX bounce for
@@ -628,11 +647,12 @@ defaultFocusBudget :: Word8
 defaultFocusBudget = 4
 
 -- | Build a fresh intent from the focus 'MCMonad.Operations.windows'
--- just committed. 'Nothing' for an empty workspace clears any prior
+-- just committed, plus the set of windows it wrote frames for (for
+-- 'fiSettling'). 'Nothing' for an empty workspace clears any prior
 -- arming and disables suppression entirely until the next focus change.
-armingIntent :: Maybe WindowRef -> Maybe FocusIntent
-armingIntent (Just w) = Just (FocusIntent w defaultFocusBudget)
-armingIntent Nothing  = Nothing
+armingIntent :: Set WindowRef -> Maybe WindowRef -> Maybe FocusIntent
+armingIntent settling (Just w) = Just (FocusIntent w defaultFocusBudget settling)
+armingIntent _        Nothing  = Nothing
 
 -- | Does an incoming @FocusedWindowChanged wid pid@ exactly match the
 -- intent's target? Used to recognise AX confirmation echoes.
@@ -647,6 +667,21 @@ isFocusIntentTarget wid pid i =
 -- which we treat as a user click and accept).
 isIntentTargetPid :: Int32 -> FocusIntent -> Bool
 isIntentTargetPid pid i = wrPid (fiTarget i) == pid
+
+-- | Is an incoming @FocusedWindowChanged wid pid@ an echo of a window
+-- this layout pass just moved? Such an event is macOS settling around
+-- our own AX write — never user intent — so the handler no-ops it
+-- without spending the re-issue budget. This is what stops a
+-- secondary-monitor window's settling echo from dragging the current
+-- screen across displays.
+isSettlingEcho :: Word32 -> Int32 -> FocusIntent -> Bool
+isSettlingEcho wid pid i = Set.member (WindowRef wid pid) (fiSettling i)
+
+-- | Is an incoming @FrontAppChanged pid@ an echo of an app we just
+-- moved a window of? The PID-only signal can't name a window, so match
+-- on any settling window sharing the pid.
+isSettlingPidEcho :: Int32 -> FocusIntent -> Bool
+isSettlingPidEcho pid i = any ((== pid) . wrPid) (Set.toList (fiSettling i))
 
 -- | Decrement the re-issue budget after a divergent event has triggered
 -- a push-back. Returns 'Nothing' when the budget is exhausted so the

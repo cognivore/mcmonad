@@ -42,6 +42,7 @@ module MCMonad.Persistence
     ) where
 
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified XMonad.StackSet as W
 
 import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..), Timer(..))
@@ -181,13 +182,17 @@ serialToWindowSet layout allTags screens saved = pruneFloating built
         _             -> Nothing
 
     -- Pre-built affinity lookup: ScreenId index → tag at save time.
-    -- Drop entries whose tag is no longer in the config.
+    -- Drop entries whose tag is no longer in the config or whose screen is
+    -- no longer present. Otherwise the tag is removed from the fallback pool
+    -- without ever receiving a screen, deleting that workspace on restore.
     affByScreen :: Map.Map Int String
     affByScreen = Map.fromList
         [ (sid, tag)
         | (tag, sid) <- ssAffinity saved
         , tag `elem` allTags
+        , sid `Set.member` liveScreenIds
         ]
+    liveScreenIds = Set.fromList [i | (S i, _) <- screens]
     affTags = Map.elems affByScreen
 
     -- Tags not claimed by affinity, with 'ssCurrentTag' moved to the

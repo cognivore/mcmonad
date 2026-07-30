@@ -1020,6 +1020,26 @@ prop_serialToWindowSet_no_affinity_falls_back =
         ws = serialToWindowSet (0 :: Int) allTags screens saved
     in W.currentTag ws === "b"
 
+-- An affinity for an unplugged display must not claim a workspace. It still
+-- belongs in the hidden pool and must survive the next state save.
+prop_serialToWindowSet_keeps_workspace_from_absent_screen :: Property
+prop_serialToWindowSet_keeps_workspace_from_absent_screen =
+    let allTags = ["1", "5", "z"]
+        screens = [(S 0, SD (Rectangle 0 0 1000 1000))]
+        saved = SerialState
+            { ssVersion    = persistenceVersion
+            , ssStacks     = [("1", Nothing), ("5", Nothing), ("z", Nothing)]
+            , ssCurrentTag = "z"
+            , ssFloating   = []
+            , ssAffinity   = [("1", 0), ("5", 1), ("z", 0)]
+            , ssTimers     = []
+            , ssNextTimerId = 1
+            }
+        ws :: W.StackSet String Int WindowRef ScreenId ScreenDetail
+        ws = serialToWindowSet (0 :: Int) allTags screens saved
+        restoredTags = L.sort (map W.tag (W.workspaces ws))
+    in counterexample (show ws) $ restoredTags === L.sort allTags
+
 -- === PARK-CORNER DETECTION (multi-monitor) ===
 --
 -- 'frameAtParkCorner' answers "is this should-be-hidden window still
@@ -1363,6 +1383,7 @@ allProperties =
     , ("serialToWindowSet respects ssAffinity",       property prop_serialToWindowSet_respects_affinity_two_screens)
     , ("serialToWindowSet preserves current tag",     property prop_serialToWindowSet_preserves_current_tag)
     , ("serialToWindowSet no affinity falls back",    property prop_serialToWindowSet_no_affinity_falls_back)
+    , ("serialToWindowSet keeps absent-screen workspace", property prop_serialToWindowSet_keeps_workspace_from_absent_screen)
     -- Park-corner detection on side-by-side displays
     , ("park: second-screen tile is not parked",      property prop_parkCorner_tiled_on_second_screen)
     , ("park: second-screen half tile is not parked", property prop_parkCorner_half_tile_on_second_screen)

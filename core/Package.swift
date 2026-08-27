@@ -5,8 +5,16 @@ let package = Package(
     name: "mcmonad-core",
     platforms: [.macOS(.v14)],
     targets: [
+        // Obj-C @try/@catch shim. AVFoundation/AppKit still signal some
+        // failures by raising NSException, which Swift cannot catch and which
+        // corrupts the concurrency runtime if it unwinds through Swift frames.
+        .target(
+            name: "MCObjCGuard",
+            path: "Sources/MCObjCGuard"
+        ),
         .executableTarget(
             name: "mcmonad-core",
+            dependencies: ["MCObjCGuard"],
             path: "Sources/MCMonadCore",
             swiftSettings: [.swiftLanguageMode(.v6)],
             linkerSettings: [

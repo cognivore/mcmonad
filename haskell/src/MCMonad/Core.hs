@@ -19,6 +19,10 @@ module MCMonad.Core
     , WindowMetadata(..)
       -- * Timers
     , Timer(..)
+      -- * Lazy restore
+    , PendingWindow(..)
+      -- * Persisted-state snapshot
+    , StateSnapshot(..)
       -- * Layout system
     , Layout(..)
     , LayoutClass(..)
@@ -54,6 +58,7 @@ import Control.Monad.Reader
 import Control.Monad.State.Strict
 import Data.Aeson (FromJSON(..), ToJSON(..), (.=), (.:))
 import qualified Data.Aeson as Aeson
+import Data.IORef (IORef)
 import Data.Int (Int32)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
@@ -132,6 +137,60 @@ data Timer = Timer
       -- ^ Tag of the workspace that was current when the timer was
       -- started. Drives the reminder HUD's \"Jump to workspace\" button.
     } deriving (Eq, Show, Read, Generic)
+
+-- ---------------------------------------------------------------------------
+-- Lazy restore
+--
+-- A window recorded in the saved snapshot that mcmonad-core has not
+-- confirmed alive. Absence from one enumeration is not death: on
+-- 2026-08-28 a daemon restart while the display was asleep produced an
+-- empty first enumeration, every saved window was declared stale and
+-- deleted, the emptied snapshot was written straight back to disk, and
+-- the very same windows were re-adopted as brand-new ones onto the
+-- current workspace two seconds later. Every workspace assignment was
+-- lost in one write.
+--
+-- Pending windows live outside the live 'WindowSet' — they are never
+-- laid out, focused or parked as ghosts — but carry enough context to
+-- go back exactly where they were the moment the daemon reports them.
+-- See 'MCMonad.Persistence.partitionPending' / 'placePending'.
+
+-- | Where a saved-but-unconfirmed window belongs.
+data PendingWindow a = PendingWindow
+    { pwTag     :: !String
+      -- ^ Workspace it was saved on.
+    , pwBefore  :: ![a]
+      -- ^ The windows that preceded it on that workspace in display
+      -- order at save time, nearest first. When it returns it is
+      -- re-inserted right after the nearest of these that is present,
+      -- or at the top if none is — so any subset of a workspace's
+      -- windows, returning in any order, reassembles in the saved
+      -- order.
+    , pwFocused :: !Bool
+      -- ^ It held that workspace's focus at save time; it takes the
+      -- focus back when it returns.
+    , pwFloat   :: !(Maybe (Rational, Rational, Rational, Rational))
+      -- ^ Its floating rectangle (x, y, w, h), if it was floating.
+    } deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Persisted-state snapshot
+
+-- | Everything 'MCMonad.Operations.saveStateIO' writes, gathered from
+-- 'MState' in one place so that every save site — the throttled save
+-- in 'MCMonad.Operations.windows', timer edits, Mod-q, and the
+-- exit-time flush — serialises exactly the same thing. The latest one
+-- is mirrored into 'latestSnapshot' so it can be written from outside
+-- the 'M' monad when the process is told to stop.
+data StateSnapshot = StateSnapshot
+    { snWindowSet   :: !WindowSet
+    , snAffinity    :: !(Map.Map String ScreenId)
+    , snTimers      :: ![Timer]
+    , snNextTimerId :: !Int
+    , snPending     :: !(Map.Map WindowRef (PendingWindow WindowRef))
+      -- ^ Folded back into their workspaces on save, so the file always
+      -- records where every window belongs, confirmed or not.
+    }
 
 instance FromJSON WindowRef where
     parseJSON = Aeson.withObject "WindowRef" $ \v ->
@@ -370,12 +429,30 @@ data MState = MState
       -- window bounds any chance of a recycled CGWindowID matching a
       -- stale entry. Consumed on first use. Not persisted, for the same
       -- reason as 'unmanagedOrigin'.
+    , pendingRestore   :: !(Map.Map WindowRef (PendingWindow WindowRef))
+      -- ^ Saved windows the daemon has not confirmed yet, keyed by the
+      -- exact identity they will come back under. Consulted by
+      -- 'MCMonad.Operations.restorePending' before the manage hook on
+      -- every 'WindowCreated', so a late-enumerated window returns to
+      -- its own workspace instead of landing on the current one.
+      -- Persisted (merged into the saved stacks), so a restart in the
+      -- middle of a restore loses nothing. Entries leave only on
+      -- positive evidence: the window is reported, its process is
+      -- gone (checked at restore), or the daemon reports it destroyed.
     }
 
 -- | Read-only environment for the M monad. Parameterised over the config's
 -- layout type, but the connection and resolved config are always present.
 data MConf = MConf
-    { connection :: !Connection
+    { connection     :: !Connection
+    , latestSnapshot :: !(IORef (Maybe StateSnapshot))
+      -- ^ Mirror of the most recent complete state, refreshed on every
+      -- save attempt (throttled or not). Read by the deferred save and
+      -- by the exit path in "MCMonad.Main", neither of which runs
+      -- inside 'M'.
+    , saveArmed      :: !(IORef Bool)
+      -- ^ A deferred save is already scheduled; see
+      -- 'MCMonad.Operations.maybeSaveState'.
     }
 
 -- | The M monad: ReaderT for config/connection, StateT for window manager state,

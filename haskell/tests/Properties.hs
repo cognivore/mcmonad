@@ -8,11 +8,13 @@ import MCMonad.Core
     , FocusIntent(..), armingIntent, isFocusIntentTarget
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
     , withinSettleWindow, consumeIntent
+    , PendingWindow(..)
     )
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     , windowSetToSerial
+    , partitionPending, placePending, mergePending
     )
 import MCMonad.Operations
     ( frameAtParkCorner, reassignScreens
@@ -22,7 +24,7 @@ import MCMonad.Sway (viewOnScreen)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Maybe (isNothing)
+import Data.Maybe (isNothing, fromMaybe)
 import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Int (Int32)
@@ -1291,6 +1293,90 @@ prop_pruneReclaims_keeps_fresh ws =
     m = mkReclaims [ (w, 0) | w <- ws ]
 
 -- Collect all properties
+
+-- === LAZY RESTORE: pending windows ===
+--
+-- On 2026-08-28 a daemon restart while the display was asleep answered
+-- the startup enumeration with zero windows. The restore concluded all
+-- 21 saved windows were dead, deleted them, persisted the emptied
+-- snapshot, and then managed the same windows as brand-new ones onto
+-- the current workspace as the daemon's sweep re-reported them. Every
+-- workspace assignment was lost. The properties below pin the
+-- replacement: an unconfirmed saved window is held aside with its
+-- placement and put back exactly where it was when it is reported —
+-- whatever subset returns, in whatever order.
+
+-- | A StackSet plus a random subset of its windows playing "what the
+-- daemon enumerated"; everything else is pending.
+genPendingCase :: Gen (TestStackSet, Set.Set WindowRef)
+genPendingCase = do
+    ws <- arbitrary
+    live <- sublistOf (W.allWindows ws)
+    return (ws, Set.fromList live)
+
+-- The split is exact: confirmed windows stay, every other saved window
+-- is pending, nothing is in both places and nothing is lost.
+prop_pending_partition_is_exact :: Property
+prop_pending_partition_is_exact = forAll genPendingCase $ \(ws, live) ->
+    let (ws', pend) = partitionPending live ws
+        kept = Set.fromList (W.allWindows ws')
+        pendingKeys = Map.keysSet pend
+    in counterexample ("kept=" ++ show kept ++ " pending=" ++ show pendingKeys) $
+       (kept `Set.union` pendingKeys === Set.fromList (W.allWindows ws))
+       .&&. Set.null (kept `Set.intersection` pendingKeys)
+       .&&. kept `Set.isSubsetOf` live
+
+-- Putting every pending window back reproduces the saved StackSet
+-- exactly: same workspaces, same order, same focus, same floating map.
+-- This is also the guarantee behind persisting pending windows on their
+-- workspaces — the file written mid-restore equals the one loaded.
+prop_pending_merge_is_identity :: Property
+prop_pending_merge_is_identity = forAll genPendingCase $ \(ws, live) ->
+    let (ws', pend) = partitionPending live ws
+    in mergePending pend ws' === ws
+
+-- Windows come back one at a time, in whatever order the daemon's sweep
+-- reports them; the result must not depend on that order.
+prop_pending_place_order_independent :: Property
+prop_pending_place_order_independent = forAll genPendingCase $ \(ws, live) ->
+    let (ws', pend) = partitionPending live ws
+    in forAll (shuffle (Map.toList pend)) $ \order ->
+        foldl (\acc (w, pw) -> fromMaybe acc (placePending w pw acc)) ws' order
+        === ws
+
+-- Placing a window that is already a member changes nothing — a
+-- pending entry that outlived its own return is harmless.
+prop_pending_place_member_is_identity :: Property
+prop_pending_place_member_is_identity = forAll genPendingCase $ \(ws, live) ->
+    let (_, pend) = partitionPending live ws
+    in conjoin [ placePending w pw ws === Just ws | (w, pw) <- Map.toList pend ]
+
+-- A pending window whose workspace no longer exists is refused, so the
+-- caller can fall through to the manage hook instead of inventing a
+-- placement.
+prop_pending_place_unknown_tag_refused :: Property
+prop_pending_place_unknown_tag_refused = forAll genPendingCase $ \(ws, live) ->
+    let (ws', pend) = partitionPending live ws
+    in conjoin
+        [ placePending w pw { pwTag = "no-such-workspace" } ws' === Nothing
+        | (w, pw) <- Map.toList pend
+        ]
+
+-- Pending placements survive a save/load cycle: the snapshot written
+-- with pending windows merged in re-derives the identical pending set
+-- when it is loaded against the same enumeration.
+prop_pending_survives_save_load :: Property
+prop_pending_survives_save_load = forAll genPendingCase $ \(ws, live) ->
+    let (ws', pend) = partitionPending live ws
+        aff = Map.fromList [ (W.tag (W.workspace s), W.screen s) | s <- W.screens ws ]
+        ser = windowSetToSerial (mergePending pend ws') aff [] 1
+        tags = map W.tag (W.workspaces ws)
+        screens = [ (W.screen s, W.screenDetail s) | s <- W.screens ws ]
+        ws2 :: TestStackSet
+        ws2 = serialToWindowSet (0 :: Int) tags screens ser
+        (_, pend2) = partitionPending live ws2
+    in pend2 === pend
+
 allProperties :: [(String, Property)]
 allProperties =
     [ ("invariant",               property prop_invariant)
@@ -1379,6 +1465,13 @@ allProperties =
     , ("floating: restore prunes float-only entries",  property prop_floating_pruned_on_restore)
     , ("floating: save filters float-only entries",    property prop_floating_pruned_on_save)
     , ("floating: stale delete clears floating",       property prop_stale_delete_clears_floating)
+    -- Lazy restore (the 2026-08-28 empty-enumeration wipe)
+    , ("pending: partition is exact",                  property prop_pending_partition_is_exact)
+    , ("pending: merge back is identity",              property prop_pending_merge_is_identity)
+    , ("pending: return order is irrelevant",          property prop_pending_place_order_independent)
+    , ("pending: placing a member is identity",        property prop_pending_place_member_is_identity)
+    , ("pending: unknown workspace is refused",        property prop_pending_place_unknown_tag_refused)
+    , ("pending: survives save/load",                  property prop_pending_survives_save_load)
     -- serialToWindowSet restoring per-screen workspace assignment
     , ("serialToWindowSet respects ssAffinity",       property prop_serialToWindowSet_respects_affinity_two_screens)
     , ("serialToWindowSet preserves current tag",     property prop_serialToWindowSet_preserves_current_tag)

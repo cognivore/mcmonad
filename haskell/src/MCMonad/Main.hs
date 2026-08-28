@@ -3,7 +3,10 @@ module MCMonad.Main
     , launch
     ) where
 
-import Control.Monad (forever, unless, when)
+import Control.Concurrent (myThreadId)
+import Control.Exception (finally, throwTo)
+import Control.Monad (forever, unless, void, when)
+import Data.IORef (IORef, newIORef, readIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -12,8 +15,9 @@ import Data.Int (Int32)
 import Data.Word (Word32)
 import Data.Time.Clock (getCurrentTime)
 import System.Environment (getArgs, lookupEnv)
-import System.Exit (exitSuccess)
+import System.Exit (ExitCode(..), exitSuccess)
 import System.IO (hPutStrLn, stderr)
+import System.Posix.Signals (Handler(..), installHandler, sigINT, sigTERM)
 import qualified XMonad.StackSet as W
 
 import MCMonad.Config
@@ -21,7 +25,8 @@ import MCMonad.Core
 import MCMonad.Debug (toggleDebugOverlays, setDebugOverlays)
 import MCMonad.IPC
 import MCMonad.Operations
-import MCMonad.Persistence (SerialState(..), serialToWindowSet)
+import MCMonad.Persistence
+    ( SerialState(..), serialToWindowSet, partitionPending )
 
 -- | Main entry point. Connect to the Swift daemon, initialise state, and
 -- run the event loop. This is what users call from their @mcmonad.hs@:
@@ -49,12 +54,18 @@ launch cfg = do
     -- 1. Connect to mcmonad-core
     conn <- connectToCore
 
-    -- 2. Wait for Ready event
-    waitForReady conn
+    -- 2. Wait for Ready event. Whatever else arrives during the startup
+    --    handshake is kept and replayed once state exists — see
+    --    'waitForEvent'.
+    ((), deferred1) <- waitForEvent conn $ \ev -> case ev of
+        Ready -> Just ()
+        _     -> Nothing
 
     -- 3. Query screen geometry
     sendCommand conn QueryScreens
-    screens <- waitForScreens conn
+    (screens, deferred2) <- waitForEvent conn $ \ev -> case ev of
+        ScreensChanged scs -> Just scs
+        _                  -> Nothing
 
     -- 4. Build the hotkey map and register hotkeys
     let keyMap    = mcKeys cfg cfg
@@ -68,7 +79,9 @@ launch cfg = do
 
     -- 5. Query existing windows
     sendCommand conn QueryWindows
-    existingWindows <- waitForWindows conn
+    (existingWindows, deferred3) <- waitForEvent conn $ \ev -> case ev of
+        QueryWindowsResponse ws -> Just ws
+        _                       -> Nothing
 
     -- 6. Check debug mode
     debug <- maybe False (const True) <$> lookupEnv "MCMONAD_DEBUG"
@@ -80,17 +93,31 @@ launch cfg = do
     --    as the WindowServer is still alive (i.e. the user hasn't
     --    logged out). After logout / reboot, identities don't
     --    match anything and every window goes through the manage
-    --    hook — see 'MCMonad.Persistence' for the design.
+    --    hook — see 'MCMonad.Persistence' for the design. Saved
+    --    windows the daemon did not enumerate are held pending, not
+    --    dropped (see 'rsPending').
     mSaved <- restoreSnapshot cfg screens existingWindows
-    let (ws0, restoredAffinity, unmatchedLives, restoredTimers, restoredNextTimerId) =
-            case mSaved of
-                Just (ws, aff, leftovers, tms, nid) ->
-                    (ws, aff, leftovers, tms, nid)
-                Nothing ->
-                    let ws = buildInitialWindowSet cfg screens
-                    in  (ws, initialAffinities ws, existingWindows, [], 1)
+    let restored = case mSaved of
+            Just r  -> r
+            Nothing ->
+                let ws = buildInitialWindowSet cfg screens
+                in Restored
+                    { rsWindowSet   = ws
+                    , rsAffinity    = initialAffinities ws
+                    , rsUnmatched   = existingWindows
+                    , rsTimers      = []
+                    , rsNextTimerId = 1
+                    , rsPending     = Map.empty
+                    }
+        ws0 = rsWindowSet restored
+        unmatchedLives = rsUnmatched restored
 
-    let mconf = MConf { connection = conn }
+    snapRef  <- newIORef Nothing
+    armedRef <- newIORef False
+    let mconf = MConf { connection     = conn
+                      , latestSnapshot = snapRef
+                      , saveArmed      = armedRef
+                      }
         -- Seed the metadata cache from the daemon's enumeration of
         -- live windows. After a Haskell-only restart, this covers
         -- both restored windows (already in ws0) and new windows that
@@ -102,7 +129,7 @@ launch cfg = do
             ]
         mst0  = MState { windowset = ws0
                        , mapped = Set.empty
-                       , affinity = restoredAffinity
+                       , affinity = rsAffinity restored
                        , inputMode = "default"
                        , sticky = Set.empty
                        , scratchpads = Map.empty
@@ -113,14 +140,27 @@ launch cfg = do
                        , windowMetadata = seededMetadata
                        , debugOverlays = False
                        , lastSaveAt = Nothing
-                       , timers = restoredTimers
-                       , nextTimerId = restoredNextTimerId
+                       , timers = rsTimers restored
+                       , nextTimerId = rsNextTimerId restored
                        , focusIntent = Nothing
                        , unmanagedOrigin = Map.empty
                        , reclaimOrigin  = Map.empty
+                       , pendingRestore = rsPending restored
                        }
 
-    _ <- runM mconf mst0 $ do
+    -- Stop requests (the launcher's SIGTERM on every deploy, Ctrl-C when
+    -- run by hand) are delivered to the main thread as an 'ExitSuccess'
+    -- so the event loop unwinds through the 'finally' below and the last
+    -- snapshot is written before the process ends. Until now the brain
+    -- died on the spot, and the throttled save could be a state change
+    -- behind.
+    mainThread <- myThreadId
+    let stopOnSignal = throwTo mainThread ExitSuccess
+    _ <- installHandler sigTERM (Catch stopOnSignal) Nothing
+    _ <- installHandler sigINT  (Catch stopOnSignal) Nothing
+
+    let deferred = deferred1 ++ deferred2 ++ deferred3
+    (`finally` flushSnapshot snapRef) $ void $ runM mconf mst0 $ do
         -- Live windows that didn't match a saved entry go through the
         -- usual manage hook (default workspace placement, ManageHook
         -- rules, etc.). On a fresh start that's every window; on a
@@ -146,29 +186,64 @@ launch cfg = do
         userCodeDef () (startupHook cfg)
 
         -- Enter the event loop
-        eventLoop debug cfg hotkeyIdMap
+        eventLoop debug cfg hotkeyIdMap deferred
 
-    return ()
+-- | Write the mirrored snapshot one last time. Runs on every way out of
+-- the event loop: a stop signal (see 'launch'), the daemon's socket
+-- closing under us, an uncaught error. The launcher stops the daemon
+-- first and the brain second on every deploy, so the socket-closed
+-- path is the common one.
+flushSnapshot :: IORef (Maybe StateSnapshot) -> IO ()
+flushSnapshot ref = do
+    m <- readIORef ref
+    case m of
+        Nothing   -> return ()
+        Just snap -> do
+            saveStateIO snap
+            hPutStrLn stderr "mcmonad: final state written"
 
--- | Try to restore a previous snapshot.
+-- | What 'restoreSnapshot' rebuilds from the saved state.
+data Restored = Restored
+    { rsWindowSet   :: WindowSet
+      -- ^ The saved layout, holding exactly the saved windows the daemon
+      -- confirmed alive.
+    , rsAffinity    :: Map.Map String ScreenId
+    , rsUnmatched   :: [WindowInfo]
+      -- ^ Live windows that appear nowhere in the saved state — they go
+      -- through the manage hook.
+    , rsTimers      :: [Timer]
+    , rsNextTimerId :: Int
+    , rsPending     :: Map.Map WindowRef (PendingWindow WindowRef)
+      -- ^ Saved windows the daemon did not enumerate but whose process
+      -- is still running. Held out of the 'WindowSet' with their saved
+      -- placement, and put back the moment the daemon reports them
+      -- ('MCMonad.Operations.restorePending').
+    }
+
+-- | Try to restore a previous snapshot. Returns 'Nothing' when no save
+-- file exists (or it is unreadable — see 'loadStateIO').
 --
--- Returns the rebuilt 'WindowSet', the restored affinity map, the
--- list of live windows that did NOT appear in the saved state (those
--- go through the manage hook), the restored timer list, and the saved
--- monotonic timer-id counter. Returns 'Nothing' when no save file exists.
+-- Identity is exact 'WindowRef' equality: a saved window is live iff
+-- its @(wid, pid)@ pair appears in the window list mcmonad-core just
+-- enumerated. This is correct for every mcmonad-side restart (Mod-q,
+-- daemon kick, launchd restart) and intentionally collapses to "fresh
+-- start" after logout / reboot, where no IDs match by construction and
+-- the manage hook does all the work.
 --
--- Identity is exact 'WindowRef' equality: a saved window survives
--- restore iff its @(wid, pid)@ pair appears in the live window list
--- that mcmonad-core just enumerated. This is correct for every
--- mcmonad-side restart (Mod-q, daemon kick, launchd restart) and
--- intentionally collapses to "fresh start" after logout / reboot,
--- where no IDs match by construction and the manage hook does all
--- the work.
+-- A saved window that is /absent/ from the enumeration is not thereby
+-- dead. The enumeration is one instant's answer from SkyLight and AX,
+-- and it has been empty for a daemon restarted while the display was
+-- asleep (2026-08-28) — under the old "absent means stale" rule that
+-- one answer erased every workspace assignment. The only positive
+-- evidence available here is process liveness: a window cannot outlive
+-- its process, so saved windows whose pid is gone are dropped, and all
+-- others are held pending with their saved placement until the daemon
+-- reports them or reports them destroyed.
 restoreSnapshot
     :: MConfig Layout
     -> [ScreenInfo]
     -> [WindowInfo]
-    -> IO (Maybe (WindowSet, Map.Map String ScreenId, [WindowInfo], [Timer], Int))
+    -> IO (Maybe Restored)
 restoreSnapshot cfg screens existingWindows = do
     mSaved <- loadStateIO
     case mSaved of
@@ -189,14 +264,10 @@ restoreSnapshot cfg screens existingWindows = do
                     [ WindowRef (wiWindowId wi) (wiPid wi)
                     | wi <- existingWindows
                     ]
-                -- Saved windows whose (wid, pid) isn't in the live set
-                -- — these died while mcmonad was down. Drop them with
-                -- the full 'W.delete' (not 'W.delete''), which also
-                -- clears their floating entries — dead windows never
-                -- come back under the same id, and 'delete'' here was
-                -- one of the leaks that bloated mcmonad.state.
-                staleSaved = filter (`Set.notMember` liveSet) (W.allWindows ws0)
-                ws = foldr W.delete ws0 staleSaved
+                -- Confirmed windows stay; the rest leave the WindowSet
+                -- (the full 'W.delete', so their floating entries go
+                -- too) and are remembered with their placement.
+                (ws, absent) = partitionPending liveSet ws0
                 -- Live windows we don't have in the saved set go
                 -- through the manage hook.
                 inWs wi =
@@ -208,12 +279,32 @@ restoreSnapshot cfg screens existingWindows = do
                         | (tag, n) <- ssAffinity saved
                         , Set.member tag validTags
                         ]
+            -- One liveness check per distinct pid among the absent
+            -- windows; a dead pid retires all of its windows.
+            let pids = Set.toList (Set.fromList (map wrPid (Map.keys absent)))
+            liveness <- Map.fromList <$> mapM (\p -> (,) p <$> pidAlive p) pids
+            let alive w  = Map.findWithDefault False (wrPid w) liveness
+                pending  = Map.filterWithKey (\w _ -> alive w) absent
+                dead     = Map.size absent - Map.size pending
             hPutStrLn stderr $
                 "mcmonad: restored "
                 ++ show (length (W.allWindows ws))
-                ++ " window(s); " ++ show (length staleSaved) ++ " stale; "
+                ++ " window(s); " ++ show (Map.size pending)
+                ++ " pending (saved, not enumerated yet); "
+                ++ show dead ++ " dead (process gone); "
                 ++ show (length unmatched) ++ " new"
-            return $ Just (ws, aff, unmatched, ssTimers saved, ssNextTimerId saved)
+            when (null (W.allWindows ws) && not (Map.null pending)) $
+                hPutStrLn stderr
+                    "mcmonad: the daemon enumerated none of the saved \
+                    \windows; holding every placement until they are reported"
+            return $ Just Restored
+                { rsWindowSet   = ws
+                , rsAffinity    = aff
+                , rsUnmatched   = unmatched
+                , rsTimers      = ssTimers saved
+                , rsNextTimerId = ssNextTimerId saved
+                , rsPending     = pending
+                }
   where
     -- A saved snapshot may carry workspace tags that don't exist in
     -- the current config (the user renamed a workspace). Drop them
@@ -242,29 +333,19 @@ restoreSnapshot cfg screens existingWindows = do
 -- ---------------------------------------------------------------------------
 -- Initialisation helpers
 
--- | Block until a Ready event arrives, discarding anything else.
-waitForReady :: Connection -> IO ()
-waitForReady conn = do
-    ev <- readEvent conn
-    case ev of
-        Ready -> return ()
-        _     -> waitForReady conn
-
--- | Block until a ScreensChanged event arrives after QueryScreens.
-waitForScreens :: Connection -> IO [ScreenInfo]
-waitForScreens conn = do
-    ev <- readEvent conn
-    case ev of
-        ScreensChanged scs -> return scs
-        _ -> waitForScreens conn  -- skip unexpected events, keep waiting
-
--- | Block until a QueryWindowsResponse event arrives after QueryWindows.
-waitForWindows :: Connection -> IO [WindowInfo]
-waitForWindows conn = do
-    ev <- readEvent conn
-    case ev of
-        QueryWindowsResponse ws -> return ws
-        _ -> waitForWindows conn  -- skip unexpected events, keep waiting
+-- | Block until an event the projection accepts arrives. Every other
+-- event that arrived first is returned too, in order, so the caller can
+-- replay it once state exists. The old per-message waiters discarded
+-- those: a 'ScreensChanged' or a sweep-adopted 'WindowCreated' landing
+-- during the startup handshake was simply lost.
+waitForEvent :: Connection -> (Event -> Maybe a) -> IO (a, [Event])
+waitForEvent conn pick = go []
+  where
+    go acc = do
+        ev <- readEvent conn
+        case pick ev of
+            Just x  -> return (x, reverse acc)
+            Nothing -> go (ev : acc)
 
 -- | Build the initial 'WindowSet' from config and screen info.
 buildInitialWindowSet :: MConfig Layout -> [ScreenInfo] -> WindowSet
@@ -310,11 +391,14 @@ initialAffinities ws = Map.fromList
 -- ---------------------------------------------------------------------------
 -- Event loop
 
--- | The main event loop: read events from the Swift daemon and dispatch.
-eventLoop :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> M ()
-eventLoop debug cfg hotkeyIdMap = forever $ do
-    evt <- withConnection $ \conn -> io $ readEvent conn
-    userCodeDef () $ handleEvent debug cfg hotkeyIdMap evt
+-- | The main event loop: replay the events deferred during startup,
+-- then read events from the Swift daemon and dispatch forever.
+eventLoop :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> [Event] -> M ()
+eventLoop debug cfg hotkeyIdMap deferred = do
+    mapM_ (userCodeDef () . handleEvent debug cfg hotkeyIdMap) deferred
+    forever $ do
+        evt <- withConnection $ \conn -> io $ readEvent conn
+        userCodeDef () $ handleEvent debug cfg hotkeyIdMap evt
 
 -- | Dispatch a single event from the Swift daemon.
 handleEvent :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> Event -> M ()
@@ -322,19 +406,25 @@ handleEvent debug cfg hotkeyIdMap evt = do
     when debug $ io $ hPutStrLn stderr $ "EVENT: " ++ show evt
     case evt of
         WindowCreated winfo -> do
-            manage winfo (manageHook cfg)
-            -- Register as named scratchpad if one is pending
-            pending <- gets pendingScratchpad
-            whenJust pending $ \name -> do
-                let wr = WindowRef (wiWindowId winfo) (wiPid winfo)
-                modify $ \s -> s
-                    { scratchpads = Map.insert name wr (scratchpads s)
-                    , pendingScratchpad = Nothing
-                    }
-                -- Float the scratchpad window
-                windows (W.float wr (W.RationalRect 0.1 0.05 0.8 0.6))
+            -- A saved window the daemon is only reporting now goes back
+            -- to its own workspace; only genuinely new windows meet the
+            -- manage hook.
+            restored <- restorePending winfo
+            unless restored $ do
+                manage winfo (manageHook cfg)
+                -- Register as named scratchpad if one is pending
+                pending <- gets pendingScratchpad
+                whenJust pending $ \name -> do
+                    let wr = WindowRef (wiWindowId winfo) (wiPid winfo)
+                    modify $ \s -> s
+                        { scratchpads = Map.insert name wr (scratchpads s)
+                        , pendingScratchpad = Nothing
+                        }
+                    -- Float the scratchpad window
+                    windows (W.float wr (W.RationalRect 0.1 0.05 0.8 0.6))
 
         WindowDestroyed wid -> do
+            forgetPending wid
             ws <- gets windowset
             let mref = findByWindowId wid (W.allWindows ws)
             whenJust mref $ \wref -> unmanage wref

@@ -8,6 +8,8 @@ module MCMonad.Operations
       -- * Window lifecycle
     , manage
     , manageSilent
+    , restorePending
+    , forgetPending
     , unmanage
     , unmanagedOriginTTL
     , reclaimOriginTTL
@@ -45,9 +47,11 @@ module MCMonad.Operations
     , journalDismissed
     , journalJumped
       -- * State persistence
+    , currentSnapshot
     , saveStateIO
     , maybeSaveState
     , loadStateIO
+    , pidAlive
     , getConfigDir
     , getStateFile
       -- * Screens
@@ -60,15 +64,18 @@ module MCMonad.Operations
     ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (IOException, catch)
 import Control.Monad (forM, void, unless, when)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Pair)
 import qualified Data.ByteString.Lazy as LBS
+import Data.IORef (atomicModifyIORef', readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (find, sortBy)
+import Data.Word (Word32)
+import Data.Maybe (fromMaybe)
 import Data.Monoid (Endo(..))
 import Data.Ord (Down(..), comparing)
 import qualified Data.Map.Strict as M
@@ -80,10 +87,12 @@ import System.Directory (doesFileExist, getHomeDirectory, createDirectoryIfMissi
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
-import System.IO (hPutStrLn, stderr)
+import System.IO (hPutStrLn, readFile', stderr)
+import System.IO.Error (isPermissionError)
 import System.Info (arch, os)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (executeFile)
+import System.Posix.Signals (nullSignal, signalProcess)
 import System.Process (createProcess, shell, readProcessWithExitCode, CreateProcess(..))
 import qualified XMonad.StackSet as W
 
@@ -92,6 +101,7 @@ import MCMonad.IPC
 import MCMonad.ManageHook (ManageHook, runManageHook)
 import MCMonad.Persistence
     ( SerialState(..), persistenceVersion, windowSetToSerial
+    , mergePending, placePending
     )
 
 -- ---------------------------------------------------------------------------
@@ -316,20 +326,35 @@ windows f = do
 -- it deliberately skips the whole 'windows' cycle — but it *does*
 -- change which workspace is current, and that has to survive a
 -- restart).
+--
+-- A throttled call is deferred, not dropped: the snapshot is mirrored
+-- into 'latestSnapshot' on every call and, when the write is skipped,
+-- a one-shot flush of that mirror is scheduled for when the throttle
+-- window ends. Before this, the second of two state changes inside
+-- 250ms stayed unwritten until the next unrelated change — and a
+-- deploy-restart in that gap lost it. The same mirror is what the
+-- exit path in "MCMonad.Main" writes.
 maybeSaveState :: M ()
 maybeSaveState = do
+    snap <- currentSnapshot
+    ref <- asks latestSnapshot
+    armed <- asks saveArmed
+    io $ writeIORef ref (Just snap)
     now <- io getCurrentTime
     last' <- gets lastSaveAt
-    let shouldSave = case last' of
+    let due = case last' of
             Nothing -> True
             Just t  -> diffUTCTime now t >= saveThrottleSeconds
-    when shouldSave $ do
-        ws' <- gets windowset
-        aff' <- gets affinity
-        ts' <- gets timers
-        nid' <- gets nextTimerId
-        modify $ \s -> s { lastSaveAt = Just now }
-        io $ saveStateIO ws' aff' ts' nid'
+    if due
+        then do
+            modify $ \s -> s { lastSaveAt = Just now }
+            io $ saveStateIO snap
+        else io $ do
+            alreadyArmed <- atomicModifyIORef' armed (\a -> (True, a))
+            unless alreadyArmed $ void $ forkIO $ do
+                threadDelay (round (saveThrottleSeconds * 1000000))
+                writeIORef armed False
+                readIORef ref >>= mapM_ saveStateIO
 
 -- | Maximum frequency for 'windows'-driven persistence writes. The
 -- 'restart' path bypasses this — the final snapshot before Mod-q's
@@ -666,6 +691,62 @@ manageSilent wi hook = do
             , windowMetadata = M.insert wr (metadataFromInfo wi) (windowMetadata s)
             }
 
+-- | If this window is one the restore is still waiting for, put it back
+-- on the workspace it was saved on — at its saved position, with its
+-- saved focus and floating state — and report 'True'. 'False' means
+-- the window is not pending and the caller should manage it as new.
+--
+-- Runs before the manage hook on every 'WindowCreated'. This is how a
+-- window the daemon only enumerates late (an empty or partial startup
+-- enumeration, an app slow to answer AX, a window the app hid and
+-- re-showed) returns to its own workspace instead of landing on
+-- whatever workspace happens to be current.
+restorePending :: WindowInfo -> M Bool
+restorePending wi = do
+    let wr = WindowRef (wiWindowId wi) (wiPid wi)
+    pend <- gets pendingRestore
+    case M.lookup wr pend of
+        Nothing -> return False
+        Just pw -> do
+            ws <- gets windowset
+            case placePending wr pw ws of
+                Nothing -> do
+                    -- Its workspace no longer exists. Tags can't change
+                    -- at runtime, so this is defensive: forget the entry
+                    -- and let the caller manage the window as new.
+                    modify $ \s -> s { pendingRestore = M.delete wr (pendingRestore s) }
+                    return False
+                Just _ -> do
+                    modify $ \s -> s
+                        { pendingRestore = M.delete wr (pendingRestore s)
+                        , windowMetadata = M.insert wr (metadataFromInfo wi)
+                                                       (windowMetadata s)
+                        }
+                    io $ hPutStrLn stderr $
+                        "mcmonad: window " ++ show (wiWindowId wi)
+                        ++ " (pid " ++ show (wiPid wi)
+                        ++ ") enumerated late; restored to workspace "
+                        ++ pwTag pw
+                    windows (\cur -> fromMaybe cur (placePending wr pw cur))
+                    -- Back on a hidden workspace, the visible set didn't
+                    -- change, so 'windows' issued no hides and the window
+                    -- sits wherever its app left it. Park it explicitly
+                    -- (same reasoning as the routed case in 'manage').
+                    ws' <- gets windowset
+                    unless (wr `elem` allVisibleWindows ws') reassertHiddenWindows
+                    return True
+
+-- | The daemon reported this window id destroyed: stop waiting for it.
+-- Persists when it changed anything — this mutation bypasses 'windows',
+-- and the saved snapshot carries pending windows on their workspaces.
+forgetPending :: Word32 -> M ()
+forgetPending wid = do
+    pend <- gets pendingRestore
+    let pend' = M.filterWithKey (\w _ -> wrWindowId w /= wid) pend
+    unless (M.size pend' == M.size pend) $ do
+        modify $ \s -> s { pendingRestore = pend' }
+        maybeSaveState
+
 -- | Remove a window from management. Called when a window is destroyed.
 unmanage :: WindowRef -> M ()
 unmanage w = do
@@ -843,12 +924,7 @@ pushTimers = do
 -- (unlike the 'windows' save path): timer edits are infrequent and must
 -- survive an immediate crash or restart.
 saveTimersIO :: M ()
-saveTimersIO = do
-    ws  <- gets windowset
-    aff <- gets affinity
-    ts  <- gets timers
-    nid <- gets nextTimerId
-    io $ saveStateIO ws aff ts nid
+saveTimersIO = currentSnapshot >>= io . saveStateIO
 
 -- | Resync after a timer mutation: push the new list to the daemon and
 -- persist it. The single funnel every timer event handler calls.
@@ -935,22 +1011,41 @@ journalJumped lbl ws =
 -- ---------------------------------------------------------------------------
 -- State persistence
 
--- | Atomically write the current 'WindowSet' (plus affinity) to
+-- | Gather everything the state file records from 'MState'. The single
+-- source for every save site, so they can never disagree about what
+-- gets written.
+currentSnapshot :: M StateSnapshot
+currentSnapshot = do
+    ws   <- gets windowset
+    aff  <- gets affinity
+    ts   <- gets timers
+    nid  <- gets nextTimerId
+    pend <- gets pendingRestore
+    return StateSnapshot
+        { snWindowSet   = ws
+        , snAffinity    = aff
+        , snTimers      = ts
+        , snNextTimerId = nid
+        , snPending     = pend
+        }
+
+-- | Atomically write a 'StateSnapshot' to
 -- @~\/.config\/mcmonad\/mcmonad.state@.
 --
 -- Called automatically by 'windows' (throttled — see
--- 'saveThrottleSeconds') and explicitly by 'restart' before @exec@.
--- Write is atomic via tempfile + rename. File mode is 0600.
+-- 'saveThrottleSeconds'), explicitly by 'restart' before @exec@, and
+-- by the exit path in "MCMonad.Main". Pending windows are written on
+-- their workspaces ('mergePending'), so the file records where every
+-- window belongs whether or not the daemon has confirmed it yet, and
+-- a restart in the middle of a restore re-derives the same pending
+-- set. Write is atomic via tempfile + rename. File mode is 0600.
 -- Errors are logged but never raised; a transient disk hiccup must
 -- not crash the WM.
-saveStateIO
-    :: WindowSet
-    -> M.Map String ScreenId
-    -> [Timer]
-    -> Int
-    -> IO ()
-saveStateIO ws aff timers' nextTimerId' = do
-    let snapshot = windowSetToSerial ws aff timers' nextTimerId'
+saveStateIO :: StateSnapshot -> IO ()
+saveStateIO snap = do
+    let ws = mergePending (snPending snap) (snWindowSet snap)
+        snapshot = windowSetToSerial ws (snAffinity snap)
+                                     (snTimers snap) (snNextTimerId snap)
     sf <- getStateFile
     let tmp = sf ++ ".tmp"
     (do writeFile tmp (show snapshot)
@@ -969,6 +1064,12 @@ saveStateIO ws aff timers' nextTimerId' = do
 -- @mcmonad.state.bak@ so the next 'saveStateIO' doesn't overwrite
 -- what might be the only copy the user has — they can recover it
 -- manually if they want.
+--
+-- On success the snapshot just loaded is also copied to
+-- @mcmonad.state.prev@. The first save of the new session overwrites
+-- @mcmonad.state@ with whatever the restore produced; if that ever
+-- turns out to be wrong, the previous session's last snapshot is
+-- still on disk to recover from by hand.
 loadStateIO :: IO (Maybe (SerialState WindowRef))
 loadStateIO = do
     sf <- getStateFile
@@ -976,12 +1077,13 @@ loadStateIO = do
     if not exists
         then return Nothing
         else (do
-            contents <- readFile sf
+            contents <- readFile' sf
             case reads contents of
                 [(saved, _)]
                     | ssVersion saved == persistenceVersion -> do
                         hPutStrLn stderr $
                             "mcmonad: loaded saved state from " ++ sf
+                        keepPrevious sf contents
                         return (Just saved)
                 _ -> do
                     hPutStrLn stderr $
@@ -993,6 +1095,30 @@ loadStateIO = do
                 hPutStrLn stderr $
                     "mcmonad: state load failed: " ++ show (e :: IOException)
                 return Nothing
+  where
+    keepPrevious sf contents = do
+        let prev = sf ++ ".prev"
+            tmp  = prev ++ ".tmp"
+        (do writeFile tmp contents
+            Posix.setFileMode tmp 0o600
+            Posix.rename tmp prev)
+            `catch` \e ->
+                hPutStrLn stderr $ "mcmonad: could not keep " ++ prev
+                    ++ ": " ++ show (e :: IOException)
+
+-- | Is a process with this pid still running?
+--
+-- The one piece of positive evidence the restore can get about a
+-- saved window the daemon did not enumerate: a window cannot outlive
+-- its process, so a dead pid means a dead window, while a live pid
+-- means nothing either way and the window stays pending. POSIX
+-- @kill(2)@ with the null signal — the same portable process-table
+-- access 'spawn' and 'restart' already rely on, not a macOS API.
+-- @EPERM@ is "exists, not ours": alive.
+pidAlive :: Int32 -> IO Bool
+pidAlive pid =
+    (signalProcess nullSignal (fromIntegral pid) >> return True)
+        `catch` \e -> return (isPermissionError (e :: IOException))
 
 -- | The mcmonad config directory: @~\/.config\/mcmonad@.
 getConfigDir :: IO FilePath
@@ -1068,13 +1194,10 @@ recompile = do
 restart :: M ()
 restart = do
     -- 1. Serialise state
-    ws <- gets windowset
-    aff <- gets affinity
-    ts <- gets timers
-    nid <- gets nextTimerId
+    snap <- currentSnapshot
     io $ do
         sf <- getStateFile
-        saveStateIO ws aff ts nid
+        saveStateIO snap
         hPutStrLn stderr $ "mcmonad: state written to " ++ sf
 
     -- 2. Recompile

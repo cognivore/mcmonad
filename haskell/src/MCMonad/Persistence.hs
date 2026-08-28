@@ -31,6 +31,30 @@
 -- See @~/Journals/incidents/20260601-mcmonad-multi-window-focus/@
 -- for the post-mortem covering the synthetic-identity attempt
 -- (commits @d60a605..815bea0@) and why it was reverted.
+--
+-- == Restore is lazy
+--
+-- Matching is exact, but it is not a one-shot test. A saved identity
+-- that is missing from mcmonad-core's enumeration is __not__ concluded
+-- dead: the enumeration is a snapshot of what SkyLight and AX would
+-- answer at that instant, and on 2026-08-28 that answer was empty for
+-- a daemon restarted while the display was asleep. Under the old
+-- one-shot rule every saved window was deleted, the emptied snapshot
+-- was written straight back to disk, and the same windows were
+-- re-adopted as brand-new ones onto the current workspace two seconds
+-- later — every workspace assignment gone in one write.
+--
+-- Now a saved window the daemon did not confirm is held aside as a
+-- 'PendingWindow' ('partitionPending'): outside the live 'WindowSet',
+-- so it is never laid out, focused or parked as a ghost, but with
+-- enough context to go back exactly where it was ('placePending') the
+-- moment the daemon reports it. Pending windows are persisted on their
+-- workspaces ('mergePending' runs before every save), so the on-disk
+-- snapshot always records where every window belongs and a second
+-- restart re-derives the same pending set. A pending entry is retired
+-- only on positive evidence — its process is gone (checked at restore
+-- in "MCMonad.Main") or the daemon reports the window destroyed —
+-- never on the strength of an absence.
 module MCMonad.Persistence
     ( -- * Persistence format
       SerialState(..)
@@ -39,13 +63,22 @@ module MCMonad.Persistence
       -- * Snapshot / restore
     , windowSetToSerial
     , serialToWindowSet
+      -- * Lazy restore
+    , partitionPending
+    , placePending
+    , mergePending
     ) where
 
+import Data.List (find)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import qualified XMonad.StackSet as W
 
-import MCMonad.Core (WindowRef(..), ScreenId(..), ScreenDetail(..), Timer(..))
+import MCMonad.Core
+    ( WindowRef(..), ScreenId(..), ScreenDetail(..), Timer(..)
+    , PendingWindow(..)
+    )
 
 -- ---------------------------------------------------------------------------
 -- Persistence format
@@ -229,3 +262,99 @@ serialToWindowSet layout allTags screens saved = pruneFloating built
                     "MCMonad.Persistence.serialToWindowSet: no screens"
 
     hiddenWSs = map mkWorkspace leftover
+
+-- ---------------------------------------------------------------------------
+-- Lazy restore
+
+-- | Split a rebuilt 'WindowSet' into the part the daemon confirmed and
+-- the windows it did not. Confirmed windows stay; every other saved
+-- window is deleted from the set (the full 'W.delete', so its floating
+-- entry goes too) and recorded as a 'PendingWindow' carrying its
+-- workspace, its saved predecessors, whether it held the focus, and
+-- its floating rectangle — everything 'placePending' needs to put it
+-- back.
+partitionPending
+    :: Ord a
+    => Set.Set a
+       -- ^ the identities the daemon enumerated
+    -> W.StackSet String l a sid sd
+       -- ^ rebuilt from the snapshot, before any reconciliation
+    -> (W.StackSet String l a sid sd, Map.Map a (PendingWindow a))
+partitionPending live ws0 = (foldr W.delete ws0 absent, Map.fromList entries)
+  where
+    absent  = filter (`Set.notMember` live) (W.allWindows ws0)
+    entries = [ (w, pendingFor w) | w <- absent ]
+    pendingFor w =
+        case W.findTag w ws0 >>= \t -> find ((== t) . W.tag) (W.workspaces ws0) of
+            Just wsp ->
+                let order = W.integrate' (W.stack wsp)
+                in PendingWindow
+                    { pwTag     = W.tag wsp
+                    , pwBefore  = reverse (takeWhile (/= w) order)
+                    , pwFocused = fmap W.focus (W.stack wsp) == Just w
+                    , pwFloat   = rational <$> Map.lookup w (W.floating ws0)
+                    }
+            Nothing -> error
+                "MCMonad.Persistence.partitionPending: \
+                \window is in allWindows but on no workspace"
+    rational (W.RationalRect x y w h) = (x, y, w, h)
+
+-- | Put a pending window back on its workspace.
+--
+-- It is re-inserted directly after the nearest of its saved
+-- predecessors that is present on that workspace, or at the top when
+-- none is; if it held the workspace's focus at save time it takes the
+-- focus back, otherwise the workspace's current focus is untouched.
+-- The rule is order-independent: whichever subset of a workspace's
+-- saved windows returns, in whatever order, ends up in the saved
+-- relative order (see the @pending@ properties).
+--
+-- 'Nothing' when the workspace no longer exists — the caller treats
+-- the window as new. A window that is already a member is left alone.
+placePending
+    :: Ord a
+    => a
+    -> PendingWindow a
+    -> W.StackSet String l a sid sd
+    -> Maybe (W.StackSet String l a sid sd)
+placePending w pw ws
+    | W.member w ws = Just ws
+    | pwTag pw `notElem` map W.tag (W.workspaces ws) = Nothing
+    | otherwise = Just (withFloat (W.mapWorkspace place ws))
+  where
+    place wsp
+        | W.tag wsp == pwTag pw = wsp { W.stack = Just (insertBack (W.stack wsp)) }
+        | otherwise             = wsp
+    insertBack Nothing   = W.Stack w [] []
+    insertBack (Just st) =
+        let order  = W.integrate st
+            anchor = find (`elem` order) (pwBefore pw)
+            order' = case anchor of
+                Nothing -> w : order
+                Just a  -> let (before, rest) = break (== a) order
+                           in before ++ a : w : drop 1 rest
+            focus' = if pwFocused pw then w else W.focus st
+        in stackAt focus' order'
+    withFloat ws' = case pwFloat pw of
+        Nothing           -> ws'
+        Just (x, y, r, h) -> ws'
+            { W.floating = Map.insert w (W.RationalRect x y r h) (W.floating ws') }
+
+-- | Rebuild a zipper from a display-order list and the element to
+-- focus, which must be in the list.
+stackAt :: Eq a => a -> [a] -> W.Stack a
+stackAt f xs =
+    let (before, rest) = break (== f) xs
+    in W.Stack f (reverse before) (drop 1 rest)
+
+-- | Fold every pending window back onto its workspace. Used by the save
+-- path so the persisted snapshot carries pending windows where they
+-- belong; entries whose workspace is gone are skipped.
+mergePending
+    :: Ord a
+    => Map.Map a (PendingWindow a)
+    -> W.StackSet String l a sid sd
+    -> W.StackSet String l a sid sd
+mergePending pend ws = Map.foldrWithKey step ws pend
+  where
+    step w pw acc = fromMaybe acc (placePending w pw acc)

@@ -282,29 +282,75 @@ final class CommandExecutor {
         WindowFocus.focusWindow(pid: pid, windowId: windowId)
     }
 
-    private func executeQueryWindows() {
-        let snapshots = SkyLightQuery.queryAllVisibleWindows()
-        var windowInfos: [WindowInfo] = []
+    /// Re-enumerations granted to a `query-windows` whose answer would
+    /// be "no readable window at all", and the pause between them.
+    ///
+    /// The brain restores its saved layout against this one answer. On
+    /// 2026-08-28 a daemon restarted while the display was asleep
+    /// answered it with zero windows — the reconcile sweep found all 21
+    /// two seconds later — and the brain (then) took the empty answer
+    /// as proof that every saved window had died. The brain no longer
+    /// draws that conclusion (it holds unconfirmed windows pending), but
+    /// an answer that is empty while the desktop is not costs it a
+    /// window-by-window rebuild over the following seconds, so a
+    /// degenerate enumeration is retried a few times before it is sent.
+    /// A genuinely empty desktop pays at most the full retry budget,
+    /// once, at startup. Every attempt is logged as an `ENUM:` line so
+    /// the next empty answer can be read off the log.
+    private static let emptyEnumerationRetries = 3
+    private static let emptyEnumerationRetryInterval: UInt64 = 250_000_000
 
+    /// Everything SkyLight lists as a visible top-level window that AX
+    /// can read, minus our own panels (the same exclusion the reconcile
+    /// sweep applies). The SkyLight count comes back alongside so the
+    /// caller can tell "the desktop is empty" from "AX answered for
+    /// nothing".
+    private func enumerateManageableWindows() -> (seen: Int, infos: [WindowInfo]) {
+        let ownPid = getpid()
+        let snapshots = SkyLightQuery.queryAllVisibleWindows()
+            .filter { $0.pid != ownPid }
+        var windowInfos: [WindowInfo] = []
         for snap in snapshots {
             if let info = AXWindowService.info(windowId: snap.windowId, pid: snap.pid) {
                 windowInfos.append(info)
             }
             // If AX can't read the window, skip it — don't fabricate data
         }
+        return (snapshots.count, windowInfos)
+    }
 
-        // Notify the owner BEFORE sending the response so the
-        // EventBridge can register these windows (and start AX
-        // focus tracking for their pids) by the time Haskell starts
-        // emitting commands that depend on focus events.
-        onExistingWindowsEnumerated?(windowInfos)
+    private func executeQueryWindows() {
+        Task { @MainActor in
+            var attempt = 0
+            while true {
+                attempt += 1
+                let (seen, windowInfos) = enumerateManageableWindows()
+                let retry = windowInfos.isEmpty
+                    && attempt <= Self.emptyEnumerationRetries
+                let verdict = retry ? "retry" : (windowInfos.isEmpty ? "empty" : "ok")
+                fputs("ENUM: attempt=\(attempt) skylight=\(seen) "
+                      + "ax-ok=\(windowInfos.count) ax-fail=\(seen - windowInfos.count) "
+                      + "result=\(verdict)\n", stderr)
+                if retry {
+                    try? await Task.sleep(nanoseconds: Self.emptyEnumerationRetryInterval)
+                    continue
+                }
 
-        let response = QueryWindowsResponse(windows: windowInfos)
-        do {
-            let data = try encoder.encode(response)
-            socketServer.sendRaw(data)
-        } catch {
-            logger.error("Failed to encode query-windows response: \(error)")
+                // Notify the owner BEFORE sending the response so the
+                // EventBridge can register these windows (and start AX
+                // focus tracking for their pids) by the time Haskell starts
+                // emitting commands that depend on focus events.
+                onExistingWindowsEnumerated?(windowInfos)
+
+                let response = QueryWindowsResponse(windows: windowInfos)
+                do {
+                    let data = try encoder.encode(response)
+                    socketServer.sendRaw(data)
+                } catch {
+                    logger.error("Failed to encode query-windows response: \(error)")
+                }
+                return
+            }
         }
     }
 

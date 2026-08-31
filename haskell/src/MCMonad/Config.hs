@@ -133,9 +133,9 @@ defaultConfig = MConfig
 --
 --                 View            Move
 --   L1 (r/g/o)    ⌘⌥⌃⇧ (Hyper)    ⌘⌥⌃
---   L2 (b/y/w)    ⌘⌥⇧             ⌘⌥
---   L3 (f/a/c)    ⌘⌃⇧             ⌘⌃
---   L4 (p/t/m)    ⌥⌃⇧             ⌥⌃
+--   L2 (b/f/w)    ⌘⌥⇧             ⌘⌥
+--   L3 (y/a/c)    ⌘⌃⇧             ⌘⌃
+--   L4 (t/p/m)    ⌥⌃⇧             ⌥⌃
 --
 -- This mirrors palinchron's Palinchron.Palette / Palinchron.Encoding so the two
 -- agree on names + modifier encoding (mcmonad can't import palinchron — it
@@ -154,13 +154,13 @@ palinchronColour layer col = case (layer, col) of
     (0, 1) -> 'g'
     (0, _) -> 'o'
     (1, 0) -> 'b'
-    (1, 1) -> 'y'
+    (1, 1) -> 'f'
     (1, _) -> 'w'
-    (2, 0) -> 'f'
+    (2, 0) -> 'y'
     (2, 1) -> 'a'
     (2, _) -> 'c'
-    (_, 0) -> 'p'
-    (_, 1) -> 't'
+    (_, 0) -> 't'
+    (_, 1) -> 'p'
     (_, _) -> 'm'
 
 -- | Numpad column of a digit: {0,1,4,7}->0, {2,5,8}->1, {3,6,9}->2.

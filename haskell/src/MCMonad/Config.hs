@@ -132,10 +132,10 @@ defaultConfig = MConfig
 -- numpad by holding the layer's modifier combo and pressing the digit:
 --
 --                 View            Move
---   L1 (r/g/o)    ⌘⌥⌃⇧ (Hyper)    ⌘⌥⌃
---   L2 (b/f/w)    ⌘⌥⇧             ⌘⌥
---   L3 (y/a/c)    ⌘⌃⇧             ⌘⌃
---   L4 (t/p/m)    ⌥⌃⇧             ⌥⌃
+--   L1 (r/g/m)    ⌘⌥⌃⇧ (Hyper)    ⌘⌥⌃
+--   L2 (b/f/a)    ⌘⌥⇧             ⌘⌥
+--   L3 (y/c/w)    ⌘⌃⇧             ⌘⌃
+--   L4 (p/o/t)    ⌥⌃⇧             ⌥⌃
 --
 -- This mirrors palinchron's Palinchron.Palette / Palinchron.Encoding so the two
 -- agree on names + modifier encoding (mcmonad can't import palinchron — it
@@ -152,16 +152,16 @@ palinchronColour :: Int -> Int -> Char
 palinchronColour layer col = case (layer, col) of
     (0, 0) -> 'r'
     (0, 1) -> 'g'
-    (0, _) -> 'o'
+    (0, _) -> 'm'
     (1, 0) -> 'b'
     (1, 1) -> 'f'
-    (1, _) -> 'w'
+    (1, _) -> 'a'
     (2, 0) -> 'y'
-    (2, 1) -> 'a'
-    (2, _) -> 'c'
-    (_, 0) -> 't'
-    (_, 1) -> 'p'
-    (_, _) -> 'm'
+    (2, 1) -> 'c'
+    (2, _) -> 'w'
+    (_, 0) -> 'p'
+    (_, 1) -> 'o'
+    (_, _) -> 't'
 
 -- | Numpad column of a digit: {0,1,4,7}->0, {2,5,8}->1, {3,6,9}->2.
 palinchronColumn :: Int -> Int
@@ -170,7 +170,7 @@ palinchronColumn d
     | d `elem` [3, 6, 9] = 2
     | otherwise          = 0
 
--- | Colour-workspace name for a (layer, digit), e.g. (0,3) -> "o3".
+-- | Colour-workspace name for a (layer, digit), e.g. (0,3) -> "m3".
 palinchronWorkspace :: Int -> Int -> String
 palinchronWorkspace layer d = palinchronColour layer (palinchronColumn d) : show d
 

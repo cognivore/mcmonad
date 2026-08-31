@@ -126,7 +126,21 @@ in
         # mic/speech request attribute correctly without a race).
         lsreg=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
         [ -x "$lsreg" ] && "$lsreg" -f ${lib.escapeShellArg coreBundlePath} 2>/dev/null || true
+      '';
 
+    # Recompiling the user's config has to happen AFTER linkGeneration, not
+    # merely after writeBoundary. `services.mcmonad.configFile` is written
+    # through home.file, so ~/.config/mcmonad/mcmonad.hs only becomes a
+    # symlink to the *new* generation once linkGeneration runs. Both entries
+    # sit after writeBoundary, and home-manager is free to order them either
+    # way — when installMcmonadApp won the toss it compiled the PREVIOUS
+    # generation's config and then kickstarted the daemon, so a changed
+    # mcmonad.hs (new workspace names, new bindings) silently didn't reach
+    # the running window manager until the *next* switch. Depending on
+    # linkGeneration pins the order: link the new source, then compile it,
+    # then restart.
+    home.activation.recompileMcmonadConfig =
+      lib.hm.dag.entryAfter [ "installMcmonadApp" "linkGeneration" ] ''
         # Recompile the user's mcmonad.hs against the freshly installed
         # mcmonad library, so the Mod-q-compiled custom binary stays in
         # lock-step with the bundled IPC protocol. Without this step, an

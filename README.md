@@ -168,15 +168,16 @@ structured output only. Rows come in workspace order, on-screen ones first,
 each with its reason underneath. Return views that workspace.
 
 The answers are cached per workspace and kept current by what the window
-manager itself reports, so opening "what's up" is instant and never re-asks
-about a workspace that did not change. Every layout snapshot and every OCR
-re-read updates a per-workspace fingerprint. A change to a workspace's window
-set (windows added, removed, moved) refreshes just the changed workspaces in
-the background, batched into one call after a three-second quiet period and
-never more than one call per twenty seconds. A change only to titles or
-recognised text marks the workspace stale; it is refreshed when you next open
-"what's up", which shows the cached rows at once, marks the stale ones
-"(refreshing…)", and swaps in the fresh ones when the call lands.
+manager itself reports, so opening "what's up" only reads the cache — instant,
+no call — and a workspace that did not change is never asked about again.
+Every layout snapshot and every OCR re-read updates a per-workspace
+fingerprint. A change to a workspace's window set (windows added, removed,
+moved) refreshes just the changed workspaces in the background after a
+three-second quiet period. A change only to titles or recognised text also
+refreshes in the background, but only once that workspace's summary is ten
+minutes old, so a terminal repainting all day costs a call every ten minutes
+at most. Calls are batched and at least twenty seconds apart. Rows being
+refreshed while the panel is open say "(refreshing…)" and update in place.
 
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first

@@ -7,14 +7,14 @@ import Foundation
 /// to the model, batched into one call:
 ///
 ///   * a change to a workspace's *window set* (windows added, removed,
-///     moved) refreshes in the background after a short quiet period, never
-///     more than one call per `minGap`;
-///   * a change to titles or recognised text only marks the workspace stale;
-///     it is refreshed when the user opens "what's up", which shows the
-///     cached rows at once and swaps in the fresh ones when the call lands.
+///     moved) refreshes in the background after a short quiet period;
+///   * a change to titles or recognised text refreshes in the background
+///     too, but only once the workspace's summary is `textRefreshAge` old —
+///     a terminal repainting all day costs a call every ten minutes at most;
+///   * never more than one call per `minGap`, always batched.
 ///
-/// So opening "what's up" is instant, and a workspace that did not change
-/// costs nothing — no call, no tokens.
+/// Opening "what's up" only reads the cache: it is instant and costs nothing.
+/// A workspace that did not change is never asked about again.
 @MainActor
 final class WhatsUpCache {
     struct Fingerprint: Equatable {
@@ -32,6 +32,7 @@ final class WhatsUpCache {
 
     struct Entry: Equatable {
         var summary: WhatsUp.Summary?
+        var summarisedAt: Date?
         var fingerprint: Fingerprint
         var staleness: Staleness
     }
@@ -45,6 +46,7 @@ final class WhatsUpCache {
 
     static let quietPeriod: TimeInterval = 3
     static let minGap: TimeInterval = 20
+    static let textRefreshAge: TimeInterval = 600
 
     private(set) var entries: [String: Entry] = [:]
     /// Workspaces with windows, on-screen first — the manifold's order.
@@ -80,9 +82,10 @@ final class WhatsUpCache {
         scheduleBackgroundRefresh()
     }
 
-    /// The user opened "what's up": everything stale is worth a call now.
+    /// The user opened "what's up": skip the quiet period, nothing else —
+    /// the same age gate and call gap apply, and the rows come from the cache.
     func refreshNow() {
-        refreshDue(userAsked: true)
+        refreshDue()
     }
 
     var rows: [Row] {
@@ -109,7 +112,7 @@ final class WhatsUpCache {
                 e.fingerprint = fp
                 next[tag] = e
             } else {
-                next[tag] = Entry(summary: nil, fingerprint: fp, staleness: .structureChanged)
+                next[tag] = Entry(summary: nil, summarisedAt: nil, fingerprint: fp, staleness: .structureChanged)
             }
         }
         entries = next
@@ -128,14 +131,16 @@ final class WhatsUpCache {
     }
 
     /// Workspaces worth a call: window-set changes always, text changes
-    /// only when the user asked.
-    func due(userAsked: Bool) -> Set<String> {
+    /// once the summary is `textRefreshAge` old (or there is none).
+    func due(at now: Date = Date()) -> Set<String> {
         Set(entries.compactMap { tag, e in
             guard inFlight[tag] == nil else { return nil }
             switch e.staleness {
             case .fresh: return nil
             case .structureChanged: return tag
-            case .textChanged: return userAsked ? tag : nil
+            case .textChanged:
+                guard let at = e.summarisedAt else { return tag }
+                return now.timeIntervalSince(at) >= Self.textRefreshAge ? tag : nil
             }
         })
     }
@@ -149,26 +154,24 @@ final class WhatsUpCache {
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(Self.quietPeriod))
             guard let self, self.pendingGeneration == generation else { return }
-            self.refreshDue(userAsked: false)
+            self.refreshDue()
         }
     }
 
-    private func refreshDue(userAsked: Bool) {
+    private func refreshDue() {
         guard !isRefreshing, let snap = snapshot else { return }
-        let tags = due(userAsked: userAsked)
+        let tags = due()
         guard !tags.isEmpty else { return }
-        if !userAsked {
-            let wait = Self.minGap - Date().timeIntervalSince(lastCallEnded)
-            if wait > 0 {
-                pendingGeneration += 1
-                let generation = pendingGeneration
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(for: .seconds(wait))
-                    guard let self, self.pendingGeneration == generation else { return }
-                    self.refreshDue(userAsked: false)
-                }
-                return
+        let wait = Self.minGap - Date().timeIntervalSince(lastCallEnded)
+        if wait > 0 {
+            pendingGeneration += 1
+            let generation = pendingGeneration
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(wait))
+                guard let self, self.pendingGeneration == generation else { return }
+                self.refreshDue()
             }
+            return
         }
         let manifold = Ask.manifold(question: WhatsUp.question, snapshot: snap, text: text, only: tags)
         for tag in tags { inFlight[tag] = entries[tag]?.fingerprint }
@@ -188,15 +191,16 @@ final class WhatsUpCache {
         }
         // On any failure the entries stay stale; the next report retries.
         onUpdated?()
-        if !due(userAsked: false).isEmpty { scheduleBackgroundRefresh() }
+        if !due().isEmpty { scheduleBackgroundRefresh() }
     }
 
     /// Fold an answer in. A workspace whose fingerprint moved during the
     /// call keeps its new summary but stays stale, so it is asked again.
-    func apply(_ summaries: [WhatsUp.Summary], asked: [String: Fingerprint]) {
+    func apply(_ summaries: [WhatsUp.Summary], asked: [String: Fingerprint], at now: Date = Date()) {
         for s in summaries {
             guard var e = entries[s.tag] else { continue }
             e.summary = s
+            e.summarisedAt = now
             if asked[s.tag] == e.fingerprint { e.staleness = .fresh }
             entries[s.tag] = e
         }

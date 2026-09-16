@@ -183,31 +183,34 @@ enum LauncherLogicChecks {
         let cache = WhatsUpCache(text: { _ in nil }, textHash: { hashes[$0] })
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy")])], [("o5", [w(9, "Chrome", "cats")]), ("z", [])]))
         precondition(cache.order == ["3", "o5"])
-        precondition(cache.due(userAsked: false) == ["3", "o5"], "new workspaces are due")
+        precondition(cache.due() == ["3", "o5"], "new workspaces are due")
         precondition(cache.rows == [.init(tag: "3", summary: nil, refreshing: false), .init(tag: "o5", summary: nil, refreshing: false)])
         // An answer lands for both, matching the fingerprints they were asked with.
         let asked = ["3": cache.entries["3"]!.fingerprint, "o5": cache.entries["o5"]!.fingerprint]
-        cache.apply([.init(tag: "3", summary: "Deploy.", reason: "title"), .init(tag: "o5", summary: "Cats.", reason: "title")], asked: asked)
-        precondition(cache.due(userAsked: true).isEmpty, "fresh after apply")
+        let t0 = Date()
+        cache.apply([.init(tag: "3", summary: "Deploy.", reason: "title"), .init(tag: "o5", summary: "Cats.", reason: "title")], asked: asked, at: t0)
+        precondition(cache.due(at: t0).isEmpty, "fresh after apply")
         precondition(cache.rows[0].summary?.summary == "Deploy.")
-        // Same windows, new OCR text: stale only for a user ask, not in the background.
+        // Same windows, new OCR text: not due until the summary is old enough.
         hashes[7] = 2
         cache.noteTextChanged()
-        precondition(cache.due(userAsked: false).isEmpty && cache.due(userAsked: true) == ["3"])
+        precondition(cache.due(at: t0.addingTimeInterval(60)).isEmpty)
+        precondition(cache.due(at: t0.addingTimeInterval(WhatsUpCache.textRefreshAge)) == ["3"])
         // A title change is text too.
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [w(9, "Chrome", "cats")])]))
-        precondition(cache.due(userAsked: false).isEmpty && cache.due(userAsked: true) == ["3"])
-        // A new window on o5 changes its window set: due in the background; 3 keeps its summary.
+        precondition(cache.due(at: t0.addingTimeInterval(60)).isEmpty)
+        // A new window on o5 changes its window set: due at once; 3 keeps its summary.
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [w(9, "Chrome", "cats"), w(10, "Slack", "geo")])]))
-        precondition(cache.due(userAsked: false) == ["o5"], "\(cache.due(userAsked: false))")
+        precondition(cache.due(at: t0.addingTimeInterval(60)) == ["o5"], "\(cache.due(at: t0.addingTimeInterval(60)))")
         precondition(cache.rows[1].summary?.summary == "Cats.", "old summary shown while stale")
         // A workspace that lost every window is gone from the rows.
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [])]))
         precondition(cache.order == ["3"] && cache.entries["o5"] == nil)
         // An answer for a fingerprint that moved meanwhile keeps the workspace stale.
         let stale = ["3": WhatsUpCache.Fingerprint(structure: 0, text: 0)]
-        cache.apply([.init(tag: "3", summary: "Later.", reason: "r")], asked: stale)
-        precondition(cache.rows[0].summary?.summary == "Later." && cache.due(userAsked: true) == ["3"])
+        cache.apply([.init(tag: "3", summary: "Later.", reason: "r")], asked: stale, at: t0)
+        precondition(cache.rows[0].summary?.summary == "Later." && cache.due(at: t0.addingTimeInterval(WhatsUpCache.textRefreshAge)) == ["3"])
+        precondition(cache.due(at: t0).isEmpty, "a moved-but-young text summary waits for the age gate")
     }
 
     // MARK: RecentUse

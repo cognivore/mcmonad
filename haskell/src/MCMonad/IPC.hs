@@ -280,6 +280,7 @@ timerJSON t = Aeson.object
     , "label"     .= tmLabel t
     , "fireAt"    .= tmFireAt t
     , "workspace" .= tmWorkspace t
+    , "durationSec" .= tmDurationSec t
     ]
 
 -- ---------------------------------------------------------------------------

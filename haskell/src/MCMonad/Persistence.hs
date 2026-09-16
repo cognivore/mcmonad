@@ -90,10 +90,11 @@ import MCMonad.Core
 
 -- | Persistence format version. Bumped whenever the on-disk schema
 -- changes in a way older parsers can't tolerate. mcmonad reads
--- 'ssVersion' on load; any mismatch or parse failure renames the
--- stale file aside and starts fresh.
+-- 'ssVersion' on load; unsupported versions or parse failures rename the
+-- stale file aside and start fresh. Version 3 remains readable: timers
+-- from that version simply have no duration for Peek.
 persistenceVersion :: Int
-persistenceVersion = 3
+persistenceVersion = 4
 
 -- | A workspace stack zipper, generalised over the window type.
 -- 'ssUp' is reverse-ordered relative to display order, matching

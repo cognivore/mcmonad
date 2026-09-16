@@ -23,7 +23,7 @@ import os
 /// mcmonad was down).
 ///
 /// On fire: a system sound plays and a transient, non-activating HUD panel
-/// announces "time's up" with Snooze / Jump-to-workspace / Dismiss. We
+/// announces "time's up" with Snooze / Jump-to-workspace / Peek / Dismiss. We
 /// deliberately avoid `UNUserNotificationCenter` (which needs a
 /// fully-registered bundle + entitlements that a bare, directly-exec'd
 /// daemon binary doesn't reliably have) — the sound + HUD path works
@@ -44,6 +44,7 @@ final class TimerController: NSObject, NSMenuDelegate {
         let panel: NSPanel
         let label: String
         let workspace: String
+        let durationSec: TimeInterval?
     }
 
     // MARK: - Callbacks (wired in Main to socket events)
@@ -155,7 +156,7 @@ final class TimerController: NSObject, NSMenuDelegate {
     private func fire(_ t: TimerSpec) {
         Self.logger.info("timer #\(t.id) fired: \(t.label, privacy: .public)")
         playSound()
-        showReminder(label: t.label, workspace: t.workspace)
+        showReminder(label: t.label, workspace: t.workspace, durationSec: t.durationSec)
     }
 
     private func teardown() {
@@ -271,7 +272,7 @@ final class TimerController: NSObject, NSMenuDelegate {
     /// windows, takes clicks on its buttons without stealing focus, and is
     /// ignored by the tiling engine (its window level is outside the managed
     /// {0,3,8} set).
-    private func showReminder(label rawLabel: String, workspace: String) {
+    private func showReminder(label rawLabel: String, workspace: String, durationSec: TimeInterval?) {
         let id = nextReminderId
         nextReminderId += 1
         let trimmed = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -314,15 +315,14 @@ final class TimerController: NSObject, NSMenuDelegate {
                                width: Self.reminderWidth - 32, height: 28)
         container.addSubview(message)
 
-        // Three buttons, centred as a row: Snooze · Jump to workspace · Dismiss.
-        // The Jump button is omitted only when the timer has no recorded origin
-        // (which shouldn't happen — the brain always stamps the current tag).
+        // Snooze · Jump · Peek · Dismiss. Jump and Peek need a recorded origin;
+        // the brain always stamps the current tag on new timers.
         let hasWorkspace = !workspace.isEmpty
         let buttonH: CGFloat = 30
         let buttonY: CGFloat = 14
-        let gap: CGFloat = 10
-        let buttonW: CGFloat = 150
-        let count = hasWorkspace ? 3 : 2
+        let gap: CGFloat = 8
+        let count = hasWorkspace ? 4 : 2
+        let buttonW = (Self.reminderWidth - 32 - CGFloat(count - 1) * gap) / CGFloat(count)
         let totalW = CGFloat(count) * buttonW + CGFloat(count - 1) * gap
         var x = (Self.reminderWidth - totalW) / 2
 
@@ -345,6 +345,21 @@ final class TimerController: NSObject, NSMenuDelegate {
             jump.action = #selector(jumpReminderClicked(_:))
             container.addSubview(jump)
             x += buttonW + gap
+
+            let peek = NSButton(frame: NSRect(x: x, y: buttonY, width: buttonW, height: buttonH))
+            peek.bezelStyle = .rounded
+            peek.title = "Peek"
+            peek.tag = id
+            peek.target = self
+            peek.action = #selector(peekReminderClicked(_:))
+            if let durationSec, durationSec.isFinite, durationSec > 0 {
+                peek.toolTip = "Jump to \(workspace) and restart this timer for \(Self.format(durationSec))"
+            } else {
+                peek.isEnabled = false
+                peek.toolTip = "This older timer has no saved duration; use Snooze or start a new timer"
+            }
+            container.addSubview(peek)
+            x += buttonW + gap
         }
 
         let dismiss = NSButton(frame: NSRect(x: x, y: buttonY, width: buttonW, height: buttonH))
@@ -355,7 +370,8 @@ final class TimerController: NSObject, NSMenuDelegate {
         dismiss.action = #selector(dismissReminderClicked(_:))
         container.addSubview(dismiss)
 
-        reminders.append(Reminder(id: id, panel: panel, label: rawLabel, workspace: workspace))
+        reminders.append(Reminder(id: id, panel: panel, label: rawLabel,
+                                  workspace: workspace, durationSec: durationSec))
         relayoutReminders()
         panel.orderFrontRegardless()
     }
@@ -389,6 +405,14 @@ final class TimerController: NSObject, NSMenuDelegate {
         let workspace = r.workspace
         dismissReminder(id: sender.tag)
         onJump?(label, workspace)
+    }
+
+    @objc private func peekReminderClicked(_ sender: NSButton) {
+        guard let r = reminders.first(where: { $0.id == sender.tag }),
+              let seconds = r.durationSec, seconds.isFinite, seconds > 0 else { return }
+        dismissReminder(id: sender.tag)
+        onJump?(r.label, r.workspace)
+        onSnooze?(seconds, r.label, r.workspace)
     }
 
     @objc private func dismissReminderClicked(_ sender: NSButton) {

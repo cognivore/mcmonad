@@ -54,6 +54,7 @@ module MCMonad.Core
 
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, catch)
+import Control.Monad (guard)
 import Control.Monad.Reader
 import Control.Monad.State.Strict
 import Data.Aeson (FromJSON(..), ToJSON(..), (.=), (.:))
@@ -70,6 +71,7 @@ import Data.Typeable (Typeable, cast)
 import Data.Word (Word8, Word32)
 import GHC.Generics (Generic)
 import System.IO (Handle)
+import Text.Read (Lexeme(..), Read(..), ReadPrec, lexP, parens, (+++))
 import qualified XMonad.Core as XMonad
 import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayout(..))
 import qualified XMonad.StackSet as W
@@ -136,7 +138,35 @@ data Timer = Timer
     , tmWorkspace :: !String
       -- ^ Tag of the workspace that was current when the timer was
       -- started. Drives the reminder HUD's \"Jump to workspace\" button.
-    } deriving (Eq, Show, Read, Generic)
+    , tmDurationSec :: !(Maybe Double)
+      -- ^ The interval that produced this reminder, reused by Peek.
+      -- Older saved timers have no recorded duration.
+    } deriving (Eq, Show, Generic)
+
+-- Accept the old four-field record too: adding Peek must not discard a
+-- saved WindowSet just because it contains a timer from before this field.
+instance Read Timer where
+    readPrec = parens $ do
+        Ident "Timer" <- lexP
+        Punc "{" <- lexP
+        tid <- field "tmId"
+        Punc "," <- lexP
+        label <- field "tmLabel"
+        Punc "," <- lexP
+        fireAt <- field "tmFireAt"
+        Punc "," <- lexP
+        workspace <- field "tmWorkspace"
+        duration <- (do Punc "," <- lexP
+                        field "tmDurationSec") +++ pure Nothing
+        Punc "}" <- lexP
+        pure (Timer tid label fireAt workspace duration)
+      where
+        field :: Read a => String -> ReadPrec a
+        field name = do
+            Ident actual <- lexP
+            guard (actual == name)
+            Punc "=" <- lexP
+            readPrec
 
 -- ---------------------------------------------------------------------------
 -- Lazy restore

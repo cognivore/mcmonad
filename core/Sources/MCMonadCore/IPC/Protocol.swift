@@ -146,6 +146,8 @@ struct TimerSpec: Codable, Sendable {
     let label: String
     let fireAt: Double
     let workspace: String
+    /// The interval that fired, for Peek. Absent on timers saved before Peek.
+    let durationSec: Double?
 }
 
 // MARK: - Overlay/Menu snapshot (Haskell -> Swift)

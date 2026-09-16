@@ -8,7 +8,7 @@ import MCMonad.Core
     , FocusIntent(..), armingIntent, isFocusIntentTarget
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
     , withinSettleWindow, consumeIntent
-    , PendingWindow(..)
+    , PendingWindow(..), Timer(..)
     )
 import MCMonad.IPC (WindowInfo(..))
 import MCMonad.Persistence
@@ -30,6 +30,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Int (Int32)
 import Data.Word (Word32)
 import Control.Monad (foldM)
+import Text.Read (readMaybe)
 
 -- Simplified layout for testing (no need for real LayoutClass)
 type TestLayout = Int  -- just a placeholder
@@ -1377,9 +1378,24 @@ prop_pending_survives_save_load = forAll genPendingCase $ \(ws, live) ->
         (_, pend2) = partitionPending live ws2
     in pend2 === pend
 
+-- A timer keeps its full interval across restarts, even if little time remains.
+-- Reading the previous timer record must also preserve the surrounding snapshot.
+prop_timer_persistence :: String -> Positive Int -> Property
+prop_timer_persistence label (Positive seconds) =
+    let timer = Timer 42 label 1001 "work" (Just (fromIntegral seconds))
+        legacy = "SerialState {ssVersion = 3, ssStacks = [(\"work\",Just (SerStack {ssFocus = 7, ssUp = [], ssDown = [8]}))], ssCurrentTag = \"work\", ssFloating = [], ssAffinity = [(\"work\",0)], ssTimers = [Timer {tmId = 42, tmLabel = \"check\", tmFireAt = 1001.0, tmWorkspace = \"work\"}], ssNextTimerId = 43}"
+        expected = SerialState 3 [("work", Just (SerStack 7 [] [8]))]
+                     "work" [] [("work", 0)] [Timer 42 "check" 1001 "work" Nothing] 43
+    in conjoin
+        [ readMaybe (show timer) === Just timer
+        , (readMaybe legacy :: Maybe (SerialState Int)) === Just expected
+        , readMaybe (show expected) === Just expected
+        ]
+
 allProperties :: [(String, Property)]
 allProperties =
-    [ ("invariant",               property prop_invariant)
+    [ ("timer persistence + legacy snapshot", property prop_timer_persistence)
+    , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)
     , ("focusDown/focusUp",       property prop_focusDown_focusUp)
     , ("focusMaster idem",        property prop_focusMaster_idem)

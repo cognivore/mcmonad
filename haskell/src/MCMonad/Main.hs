@@ -760,7 +760,8 @@ addTimer seconds label ws = do
     now <- io nowEpoch
     nid <- gets nextTimerId
     let t = Timer { tmId = nid, tmLabel = label
-                  , tmFireAt = now + seconds, tmWorkspace = ws }
+                  , tmFireAt = now + seconds, tmWorkspace = ws
+                  , tmDurationSec = Just seconds }
     modify $ \s -> s { timers = timers s ++ [t], nextTimerId = nid + 1 }
     syncTimers
     return t

@@ -1058,7 +1058,7 @@ saveStateIO snap = do
 --
 --   * the file doesn't exist (first-ever run on this user);
 --   * the file fails to parse (older format, hand-edited, corrupt);
---   * the @ssVersion@ field doesn't match 'persistenceVersion'.
+--   * the @ssVersion@ field is unsupported (version 3 is migrated on save).
 --
 -- In the failure cases, the stale file is moved aside to
 -- @mcmonad.state.bak@ so the next 'saveStateIO' doesn't overwrite
@@ -1080,7 +1080,7 @@ loadStateIO = do
             contents <- readFile' sf
             case reads contents of
                 [(saved, _)]
-                    | ssVersion saved == persistenceVersion -> do
+                    | ssVersion saved `elem` [3, persistenceVersion] -> do
                         hPutStrLn stderr $
                             "mcmonad: loaded saved state from " ++ sf
                         keepPrevious sf contents

@@ -20,7 +20,7 @@ import os
 /// desktop costs nothing between cycles.
 @MainActor
 final class ScreenIndex {
-    private static let logger = Logger(subsystem: "com.mcmonad.core", category: "ScreenIndex")
+    nonisolated private static let logger = Logger(subsystem: "com.mcmonad.core", category: "ScreenIndex")
 
     /// Why the index may have nothing to say. `denied` is the only state
     /// that needs the user (the launcher's hint says what to do).
@@ -113,17 +113,40 @@ final class ScreenIndex {
         inFlight = true
         defer { inFlight = false }
 
+        let known = entries.mapValues(\.imageHash)
+        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        let readings = await Self.read(ids: visible, knownHashes: known, scale: scale)
+        guard isEnabled else { return }   // disabled mid-cycle: drop what was read
+        for (id, r) in readings {
+            entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, imageHash: r.hash)
+        }
+        if !readings.isEmpty {
+            Self.logger.info("screen index: re-read \(readings.count, privacy: .public) of \(self.visible.count, privacy: .public) displayed windows")
+            onUpdated?()
+        }
+    }
+
+    /// One window's pixels, reduced to what may leave the reading thread.
+    private struct Reading: Sendable {
+        let hash: Int
+        let text: String
+    }
+
+    /// Off the main actor end to end. ScreenCaptureKit's content and
+    /// windows, the captured image and Vision's observations are not
+    /// Sendable, so none of them come back; only readings for windows
+    /// whose pixels differ from `knownHashes` do.
+    private nonisolated static func read(ids: [UInt32], knownHashes: [UInt32: Int], scale: CGFloat) async -> [UInt32: Reading] {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         } catch {
-            Self.logger.error("shareable content: \(error.localizedDescription, privacy: .public)")
-            return
+            logger.error("shareable content: \(error.localizedDescription, privacy: .public)")
+            return [:]
         }
         let byId = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { a, _ in a })
-        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        var changed = 0
-        for id in visible {
+        var out: [UInt32: Reading] = [:]
+        for id in ids {
             guard let window = byId[id], window.frame.width >= 8, window.frame.height >= 8 else { continue }
             let cfg = SCStreamConfiguration()
             cfg.width = Int(window.frame.width * scale)
@@ -136,20 +159,14 @@ final class ScreenIndex {
                     configuration: cfg
                 )
             } catch {
-                Self.logger.debug("capture wid=\(id) failed: \(error.localizedDescription, privacy: .public)")
+                logger.debug("capture wid=\(id) failed: \(error.localizedDescription, privacy: .public)")
                 continue
             }
-            let hash = Self.hash(image)
-            if let old = entries[id], old.imageHash == hash { continue }
-            let text = await Self.recognise(Sendable(image: image)).joined(separator: "\n")
-            entries[id] = Entry(text: text, lower: text.lowercased(), textHash: text.hashValue, imageHash: hash)
-            changed += 1
-            guard isEnabled else { return }   // disabled mid-cycle: stop reading
+            let hash = hash(image)
+            if knownHashes[id] == hash { continue }
+            out[id] = Reading(hash: hash, text: recognise(image).joined(separator: "\n"))
         }
-        if changed > 0 {
-            Self.logger.info("screen index: re-read \(changed, privacy: .public) of \(self.visible.count, privacy: .public) displayed windows")
-            onUpdated?()
-        }
+        return out
     }
 
     private func markDenied() {
@@ -164,36 +181,35 @@ final class ScreenIndex {
         openedSettings = true
         CGRequestScreenCaptureAccess()
         Task { @MainActor in
-            _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            await Self.registerInScreenRecordingPane()
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                 NSWorkspace.shared.open(url)
             }
         }
     }
 
+    /// The query is what lists the app in the pane; its result is not needed.
+    private nonisolated static func registerInScreenRecordingPane() async {
+        _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    }
+
     // MARK: - Pixels → text (off the main actor)
 
-    /// CGImage is not Sendable in the SDK's eyes; it is immutable, and we hand
-    /// it to exactly one reader.
-    private struct Sendable: @unchecked Swift.Sendable { let image: CGImage }
-
-    private nonisolated static func recognise(_ boxed: Sendable) async -> [String] {
-        await Task.detached(priority: .utility) {
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            request.recognitionLanguages = ["en-US"]
-            request.minimumTextHeight = 0
-            do {
-                try VNImageRequestHandler(cgImage: boxed.image, options: [:]).perform([request])
-            } catch {
-                return []
-            }
-            let observations = (request.results ?? []).compactMap { o -> (CGRect, String)? in
-                o.topCandidates(1).first.map { (o.boundingBox, $0.string) }
-            }
-            return TextSearch.readingOrder(observations)
-        }.value
+    private nonisolated static func recognise(_ image: CGImage) -> [String] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = ["en-US"]
+        request.minimumTextHeight = 0
+        do {
+            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        } catch {
+            return []
+        }
+        let observations = (request.results ?? []).compactMap { o -> (CGRect, String)? in
+            o.topCandidates(1).first.map { (o.boundingBox, $0.string) }
+        }
+        return TextSearch.readingOrder(observations)
     }
 
     /// A cheap fingerprint of the pixels: every 61st byte plus the length.

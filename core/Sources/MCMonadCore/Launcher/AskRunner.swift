@@ -18,6 +18,12 @@ final class AskRunner {
     private var process: Process?
     private var finished = false
 
+    /// A byte buffer one reader thread appends to; boxed so the sendable
+    /// handlers may hold it.
+    private final class Bytes: @unchecked Sendable {
+        var data = Data()
+    }
+
     /// Locate the CLI; nil when no candidate is an executable file.
     static func locateCLI() -> String? {
         let env = ProcessInfo.processInfo.environment
@@ -53,50 +59,53 @@ final class AskRunner {
         p.standardError = stderr
 
         // Line-buffer stdout on the reader's thread; hand whole lines to the
-        // main actor. The buffers are owned by these closures.
-        nonisolated(unsafe) var buffer = Data()
+        // main actor, in order, over the main queue.
+        let buffer = Bytes()
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
             // Empty read = EOF; unhook, or this handler spins until exit.
             guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
-            buffer.append(chunk)
-            while let nl = buffer.firstIndex(of: 0x0A) {
-                let lineData = buffer.subdata(in: buffer.startIndex..<nl)
-                buffer.removeSubrange(buffer.startIndex...nl)
+            buffer.data.append(chunk)
+            while let nl = buffer.data.firstIndex(of: 0x0A) {
+                let lineData = buffer.data.subdata(in: buffer.data.startIndex..<nl)
+                buffer.data.removeSubrange(buffer.data.startIndex...nl)
                 guard let line = String(data: lineData, encoding: .utf8) else { continue }
                 let item = parse(line)
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    switch item {
-                    case .delta(let text): self.onTranscript?(text)
-                    case .final(let outcome): self.finish(outcome)
-                    case .ignore: break
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        switch item {
+                        case .delta(let text): self.onTranscript?(text)
+                        case .final(let outcome): self.finish(outcome)
+                        case .ignore: break
+                        }
                     }
                 }
             }
         }
-        nonisolated(unsafe) var errData = Data()
+        let errData = Bytes()
         stderr.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
-            errData.append(chunk)
+            errData.data.append(chunk)
         }
         p.terminationHandler = { [weak self] proc in
-            stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
             let status = proc.terminationStatus
-            let errText = String(data: errData, encoding: .utf8)?
+            let pid = proc.processIdentifier
+            let errText = String(data: errData.data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.process === proc else { return }
-                self.process = nil
-                // A result line normally arrives before exit; if it did not,
-                // the exit status is the only evidence we have.
-                if !self.finished {
-                    let why = status == 0
-                        ? "claude exited without a result line" + (errText.isEmpty ? "" : "\n" + errText)
-                        : "claude exited with status \(status)" + (errText.isEmpty ? "" : "\n" + errText)
-                    self.finish(.failed(why))
+                MainActor.assumeIsolated {
+                    guard let self, self.process?.processIdentifier == pid else { return }
+                    self.process = nil
+                    // A result line normally arrives before exit; if it did
+                    // not, the exit status is the only evidence we have.
+                    if !self.finished {
+                        let why = status == 0
+                            ? "claude exited without a result line" + (errText.isEmpty ? "" : "\n" + errText)
+                            : "claude exited with status \(status)" + (errText.isEmpty ? "" : "\n" + errText)
+                        self.finish(.failed(why))
+                    }
                 }
             }
         }
@@ -112,9 +121,10 @@ final class AskRunner {
 
         // Feed the prompt and close stdin so the CLI knows it has everything.
         let data = Data(prompt.utf8)
+        let writer = stdin.fileHandleForWriting
         DispatchQueue.global(qos: .userInitiated).async {
-            stdin.fileHandleForWriting.write(data)
-            try? stdin.fileHandleForWriting.close()
+            writer.write(data)
+            try? writer.close()
         }
     }
 

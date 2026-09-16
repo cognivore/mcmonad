@@ -53,6 +53,16 @@
 
               runHook postBuild
             '';
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              /usr/bin/swiftc -swift-version 6 \
+                Sources/MCMonadCore/Launcher/ScreenshotCommand.swift \
+                Tests/ScreenshotCommandChecks.swift \
+                -o .build/screenshot-command-checks
+              .build/screenshot-command-checks
+              runHook postCheck
+            '';
             installPhase = ''
               runHook preInstall
               mkdir -p $out/bin $out/Resources

@@ -4,7 +4,7 @@ import os
 /// A borderless panel that becomes key so its embedded search field can
 /// receive keystrokes. mcmonad-core runs as an `.accessory` app, so we
 /// also `NSApp.activate` before showing it.
-private final class KeyablePanel: NSPanel {
+final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 }
@@ -89,6 +89,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case launchApp(AppIndex.AppEntry)
         case openTimerPrompt
         case startTimer(seconds: TimeInterval, label: String)
+        case screenshot(ScreenshotCommand)
         case focusWindow(windowId: UInt32, pid: Int32)
         case hint
     }
@@ -105,6 +106,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             if case .openTimerPrompt = kind { return true }
             return false
         }
+        var isScreenshot: Bool {
+            if case .screenshot = kind { return true }
+            return false
+        }
     }
 
     // MARK: - State
@@ -113,6 +118,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private var state: State = .browsing
 
     private let appIndex = AppIndex()
+    private let screenshotPicker = ScreenshotRegionPicker()
     private let voice = VoiceInput()
     private var voiceAuthorized: Bool?      // nil = not yet requested
     /// While true, a resign-key (e.g. the system mic/speech permission prompt
@@ -499,9 +505,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     // MARK: - Building item bases
 
     private func rebuildBases() {
-        // Command mode: builtin Timer command + every launchable app.
-        var cmd: [Item] = [timerCommandItem()]
-        for app in appIndex.apps {
+        // The builtin Screenshot replaces the system app's duplicate row.
+        var cmd: [Item] = [timerCommandItem(), screenshotItem(.interactive)]
+        for app in appIndex.apps where app.bundleId != "com.apple.screenshot.launcher" {
             cmd.append(Item(
                 title: app.name,
                 kind: .launchApp(app),
@@ -555,6 +561,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         Item(title: text, kind: .hint, haystack: "")
     }
 
+    private func screenshotItem(_ command: ScreenshotCommand) -> Item {
+        Item(title: command.title, kind: .screenshot(command), haystack: "screenshot")
+    }
+
     // MARK: - Filtering
 
     private func applyFilter(_ query: String) {
@@ -570,9 +580,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             }
 
         case .browsing:
-            // "timer …" is recognised in EVERY mode, so a countdown can be set
-            // — typed or dictated — whether you're in command or window mode.
+            // Builtin commands work in both command and window-search mode.
             var items: [Item] = []
+            let screenshotCmd = ScreenshotCommand(q)
+            if let screenshotCmd {
+                items.append(screenshotItem(screenshotCmd))
+            }
             let timerCmd = Self.parseTimerCommand(q)
             if let parsed = timerCmd {
                 if let m = parsed.minutes {
@@ -583,10 +596,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             }
             switch mode {
             case .command:
-                // Don't show the builtin Timer twice when a timer row is present.
-                let base = timerCmd != nil
-                    ? commandBase.filter { !$0.isOpenTimerPrompt }
-                    : commandBase
+                // Don't show builtin commands twice when a parsed row is present.
+                let base = commandBase.filter {
+                    !(timerCmd != nil && $0.isOpenTimerPrompt)
+                        && !(screenshotCmd != nil && $0.isScreenshot)
+                }
                 items += rank(q, in: base)
             case .window:
                 items += rank(q, in: windowBase)
@@ -640,6 +654,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .startTimer(let secs, let label):
             finish()
             onStartTimer?(secs, label)
+        case .screenshot(let command):
+            // Restore the previous window before capturing, as on Escape.
+            let target = restoreTarget
+            cancel()
+            if case .delayed = command {
+                screenshotPicker.select(restoring: target) { command.run(region: $0) }
+            } else {
+                command.run()
+            }
         case .focusWindow(let wid, let pid):
             finish()
             onFocusWindow?(wid, pid)
@@ -906,6 +929,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .launchApp(let app):       return appIcon(for: app)
         case .focusWindow(_, let pid):  return windowIcon(pid: pid)
         case .openTimerPrompt, .startTimer: return symbolIcon("timer")
+        case .screenshot:               return symbolIcon("camera")
         case .hint:                     return symbolIcon("info.circle")
         }
     }

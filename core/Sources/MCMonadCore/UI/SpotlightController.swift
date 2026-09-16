@@ -1047,7 +1047,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         transcriptView.scrollToEndOfDocument(nil)
     }
 
-    private static func shellQuoted(_ arg: String) -> String {
+    private nonisolated static func shellQuoted(_ arg: String) -> String {
         if arg.isEmpty { return "''" }
         if arg.rangeOfCharacter(from: .whitespacesAndNewlines) == nil, !arg.contains("'") { return arg }
         return "'" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"

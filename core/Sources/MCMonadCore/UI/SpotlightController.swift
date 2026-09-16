@@ -208,7 +208,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private static let footHeight: CGFloat = 24
     private static let pad: CGFloat = 10
     private static let rowHeight: CGFloat = 34
-    private static let rowHeightTall: CGFloat = 52
+    /// Width the row text wraps in: panel minus insets, icon, gap, scroller.
+    private static let rowTextWidth: CGFloat = panelWidth - 2 * rowInset - 22 - 10 - 14
+    private static let rowPadding: CGFloat = 14
     private static let rowInset: CGFloat = 16
     private static let cellId = NSUserInterfaceItemIdentifier("spotlightRow")
     private static let topFraction: CGFloat = 0.20
@@ -1036,6 +1038,13 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         return s
     }
 
+    private static let rowParagraph: NSParagraphStyle = {
+        let p = NSMutableParagraphStyle()
+        p.lineBreakMode = .byWordWrapping
+        p.lineSpacing = 1
+        return p
+    }()
+
     private static func rowText(_ item: Item) -> NSAttributedString {
         let s = NSMutableAttributedString(string: item.title, attributes: [
             .font: NSFont.systemFont(ofSize: 14),
@@ -1045,6 +1054,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             s.append(NSAttributedString(string: "\n"))
             s.append(sub)
         }
+        s.addAttribute(.paragraphStyle, value: rowParagraph, range: NSRange(location: 0, length: s.length))
         return s
     }
 
@@ -1292,9 +1302,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         return cell
     }
 
+    /// Rows take the space their text needs: a long summary and its reason
+    /// wrap rather than get cut, a plain window row stays one line tall.
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         guard row >= 0, row < filtered.count else { return Self.rowHeight }
-        return filtered[row].subtitle == nil ? Self.rowHeight : Self.rowHeightTall
+        let needed = Self.rowText(filtered[row]).boundingRect(
+            with: NSSize(width: Self.rowTextWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height
+        return max(Self.rowHeight, ceil(needed) + Self.rowPadding)
     }
 
     /// Icon for a row, resolved lazily so opening the launcher does not eagerly
@@ -1328,9 +1344,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
         let tf = NSTextField(labelWithString: "")
         tf.font = .systemFont(ofSize: 14)
-        tf.lineBreakMode = .byTruncatingTail
-        tf.maximumNumberOfLines = 2
-        tf.cell?.truncatesLastVisibleLine = true
+        tf.lineBreakMode = .byWordWrapping
+        tf.maximumNumberOfLines = 0
+        tf.preferredMaxLayoutWidth = rowTextWidth
         tf.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(tf)
         cell.textField = tf

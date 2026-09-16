@@ -68,6 +68,8 @@
                 Sources/MCMonadCore/Launcher/AskProtocol.swift \
                 Sources/MCMonadCore/Launcher/WhereIsProtocol.swift \
                 Sources/MCMonadCore/Launcher/WhatsUp.swift \
+                Sources/MCMonadCore/Launcher/AskRunner.swift \
+                Sources/MCMonadCore/Launcher/WhatsUpCache.swift \
                 Tests/LauncherLogicChecks.swift \
                 -o .build/launcher-logic-checks
               .build/launcher-logic-checks

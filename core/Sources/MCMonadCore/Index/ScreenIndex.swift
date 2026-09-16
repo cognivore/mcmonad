@@ -35,6 +35,8 @@ final class ScreenIndex {
         let text: String
         /// `text.lowercased()`, kept because it is the hot path of search.
         let lower: String
+        /// Changes when the words change; the "what's up" cache keys on it.
+        let textHash: Int
         fileprivate let imageHash: Int
     }
 
@@ -140,7 +142,7 @@ final class ScreenIndex {
             let hash = Self.hash(image)
             if let old = entries[id], old.imageHash == hash { continue }
             let text = await Self.recognise(Sendable(image: image)).joined(separator: "\n")
-            entries[id] = Entry(text: text, lower: text.lowercased(), imageHash: hash)
+            entries[id] = Entry(text: text, lower: text.lowercased(), textHash: text.hashValue, imageHash: hash)
             changed += 1
             guard isEnabled else { return }   // disabled mid-cycle: stop reading
         }

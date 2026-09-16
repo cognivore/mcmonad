@@ -401,11 +401,24 @@ struct MCMonadCoreApp {
         executor.onSetOcrIndex = { [weak screenIndex] on in
             screenIndex?.setEnabled(on)
         }
-        overlayManager.onSnapshotApplied = { [weak screenIndex] snapshot in
+        // "What's up" summaries, kept current by the same reports: every
+        // snapshot and every re-read re-fingerprints the workspaces, and
+        // only the changed ones ever go back to the model.
+        let whatsUpCache = WhatsUpCache(
+            text: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.text },
+            textHash: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.textHash }
+        )
+        spotlight.whatsUpCache = whatsUpCache
+        overlayManager.onSnapshotApplied = { [weak screenIndex, weak whatsUpCache] snapshot in
             screenIndex?.noteSnapshot(snapshot)
+            whatsUpCache?.noteSnapshot(snapshot)
         }
-        screenIndex.onUpdated = { [weak spotlight] in
+        screenIndex.onUpdated = { [weak spotlight, weak whatsUpCache] in
             spotlight?.screenIndexUpdated()
+            whatsUpCache?.noteTextChanged()
+        }
+        whatsUpCache.onUpdated = { [weak spotlight] in
+            spotlight?.whatsUpUpdated()
         }
 
         // Menu reads the cached snapshot from OverlayManager
@@ -627,7 +640,8 @@ struct MCMonadCoreApp {
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, executor, eventBridge, dragHandler,
-                      mouseDownMonitor, spotlight, timerController, screenIndex)
+                      mouseDownMonitor, spotlight, timerController, screenIndex,
+                      whatsUpCache)
     }
 
     // Static storage to prevent ARC from deallocating services

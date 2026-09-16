@@ -56,6 +56,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// windows (Main); picks here touch whatever was picked.
     let recentUse = RecentUse()
 
+    /// Cached per-workspace summaries, refreshed by the window manager's own
+    /// reports (wired by Main). "What's up" reads it; it never waits on a call.
+    var whatsUpCache: WhatsUpCache?
+
     // MARK: - Modes
 
     enum Mode: Int, CaseIterable {
@@ -154,7 +158,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// highlighting) and the manifold it was asked about (for row order).
     private var askTerms: [String] = []
     private var askQuestion = ""
-    private var askManifold: Ask.Manifold?
+    /// The answered rows are the "what's up" cache; re-render on its updates.
+    private var showingWhatsUp = false
     private let voice = VoiceInput()
     private var voiceAuthorized: Bool?      // nil = not yet requested
     /// While true, a resign-key (e.g. the system mic/speech permission prompt
@@ -889,11 +894,51 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         }
     }
 
+    /// Cached rows at once; stale workspaces refresh behind them and the
+    /// rows update in place when the call lands.
     private func beginWhatsUp() {
-        beginAsk(question: WhatsUp.question, terms: [], arguments: WhatsUp.arguments) { manifold in
-            let tags = manifold.tags
-            return { WhatsUp.parseLine($0, knownTags: tags) }
+        guard let cache = whatsUpCache else { return }
+        leaveWhereIs()
+        askTerms = []
+        askQuestion = WhatsUp.question
+        showingWhatsUp = true
+        state = .answered
+        applyModeChrome()
+        cache.refreshNow()
+        renderWhatsUp()
+    }
+
+    private func renderWhatsUp() {
+        guard let cache = whatsUpCache else { return }
+        filtered = cache.rows.map { r in
+            let head: String
+            if let s = r.summary {
+                head = s.summary + (r.refreshing ? "   (refreshing…)" : "")
+            } else {
+                head = r.refreshing ? "summarising…" : "not summarised yet"
+            }
+            return Item(
+                title: "\(r.tag)   ·  \(head)",
+                kind: .viewWorkspace(tag: r.tag),
+                haystack: "",
+                subtitle: Self.highlighted("why: " + (r.summary?.reason ?? "…"), ranges: [])
+            )
         }
+        if filtered.isEmpty {
+            filtered = [hintItem("No workspace has any window.")]
+        }
+        if cache.isRefreshing { spinner.start() } else { spinner.stop() }
+        let keep = tableView.selectedRow
+        showResults()
+        if keep >= 0, keep < filtered.count, filtered[keep].activatable {
+            tableView.selectRowIndexes(IndexSet(integer: keep), byExtendingSelection: false)
+        }
+    }
+
+    /// The cache changed (a call started or landed) while its rows may be up.
+    func whatsUpUpdated() {
+        guard let panel, panel.isVisible, state == .answered, showingWhatsUp else { return }
+        renderWhatsUp()
     }
 
     /// Send the question and the manifold of every window to the model, and
@@ -906,6 +951,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         leaveWhereIs()
         askTerms = terms
         askQuestion = question
+        showingWhatsUp = false
         state = .asking
         filtered = []
         tableView.reloadData()
@@ -923,7 +969,6 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             snapshot: snap,
             text: { [weak self] wid in self?.screenIndex?.entry(for: wid)?.text }
         )
-        askManifold = manifold
         let prompt = Ask.prompt(for: manifold)
         let cli = AskRunner.locateCLI() ?? "claude"
         appendTranscript("→ \(cli) " + arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
@@ -961,25 +1006,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 filtered = [hintItem("Nothing on any workspace looks like “\(askQuestion)”.")]
             }
             showResults()
-        case .answered(.workspaces(let summaries, let dropped)):
-            appendTranscript("\n\n✓ \(summaries.count) workspace(s) summarised"
-                + (dropped > 0 ? ", \(dropped) not in the manifold ignored" : "") + "\n")
-            // One row per workspace we asked about, in the manifold's order
-            // (on screen first); a workspace the model skipped says so.
-            let byTag = Dictionary(summaries.map { ($0.tag, $0) }, uniquingKeysWith: { a, _ in a })
-            filtered = (askManifold?.workspaces ?? []).map { ws in
-                let s = byTag[ws.tag]
-                return Item(
-                    title: "\(ws.tag)   ·  \(s?.summary ?? "(no summary given)")",
-                    kind: .viewWorkspace(tag: ws.tag),
-                    haystack: "",
-                    subtitle: Self.highlighted("why: " + (s?.reason ?? "the model skipped this workspace"), ranges: [])
-                )
-            }
-            if filtered.isEmpty {
-                filtered = [hintItem("No workspace has any window.")]
-            }
-            showResults()
+        case .answered(.workspaces):
+            // Workspace summaries come through WhatsUpCache, never this runner.
+            break
         case .unavailable(let why):
             appendTranscript("\n\n✗ unavailable: \(why)\n")
         case .failed(let why):
@@ -1001,6 +1030,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         askRunner.cancel()
         spinner.stop()
         showTranscript(false)
+        showingWhatsUp = false
     }
 
     private func showTranscript(_ on: Bool) {

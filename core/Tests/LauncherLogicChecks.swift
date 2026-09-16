@@ -15,6 +15,7 @@ enum LauncherLogicChecks {
         checkManifold()
         checkStream()
         checkWhatsUp()
+        checkWhatsUpCache()
         checkRecency()
         print("Launcher logic checks passed")
     }
@@ -110,6 +111,8 @@ enum LauncherLogicChecks {
         // Budget 30 over 3 windows → 10 chars per window.
         precondition(m.workspaces[1].windows[0].text == "a b c")
         precondition(m.workspaces[1].windows[1].text == nil)
+        let some = Ask.manifold(question: "q", snapshot: snap, text: { _ in nil }, only: ["o5"])
+        precondition(some.workspaces.map(\.tag) == ["o5"] && some.currentWorkspace == "3")
         let big = Ask.manifold(question: "q", snapshot: snap,
                                text: { _ in String(repeating: "t", count: 50) }, budget: 30, perWindow: 100)
         precondition(big.workspaces[0].windows[0].text == String(repeating: "t", count: 10) + "…")
@@ -164,6 +167,47 @@ enum LauncherLogicChecks {
             droppedUnknownTags: 3))))
         let wrong = #"{"type":"result","is_error":false,"result":"x","structured_output":{"matches":[]}}"#
         precondition(WhatsUp.parseLine(wrong, knownTags: tags) == .final(.malformed("x")))
+    }
+
+    @MainActor static func checkWhatsUpCache() {
+        func w(_ id: UInt32, _ app: String, _ title: String) -> OverlayWindowEntry {
+            OverlayWindowEntry(windowId: id, pid: 1, appName: app, title: title, bundleId: nil,
+                               workspaceTag: nil, frame: .zero, isFocused: false, isFloating: false)
+        }
+        func snap(_ screens: [(String, [OverlayWindowEntry])], _ hidden: [(String, [OverlayWindowEntry])]) -> OverlaySnapshot {
+            OverlaySnapshot(debugOverlays: false,
+                            screens: screens.enumerated().map { OverlayScreenEntry(screenId: $0.offset, frame: .zero, workspaceTag: $0.element.0, windows: $0.element.1) },
+                            hiddenWorkspaces: hidden.map { OverlayHiddenWorkspace(tag: $0.0, windows: $0.1) })
+        }
+        var hashes: [UInt32: Int] = [7: 1]
+        let cache = WhatsUpCache(text: { _ in nil }, textHash: { hashes[$0] })
+        cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy")])], [("o5", [w(9, "Chrome", "cats")]), ("z", [])]))
+        precondition(cache.order == ["3", "o5"])
+        precondition(cache.due(userAsked: false) == ["3", "o5"], "new workspaces are due")
+        precondition(cache.rows == [.init(tag: "3", summary: nil, refreshing: false), .init(tag: "o5", summary: nil, refreshing: false)])
+        // An answer lands for both, matching the fingerprints they were asked with.
+        let asked = ["3": cache.entries["3"]!.fingerprint, "o5": cache.entries["o5"]!.fingerprint]
+        cache.apply([.init(tag: "3", summary: "Deploy.", reason: "title"), .init(tag: "o5", summary: "Cats.", reason: "title")], asked: asked)
+        precondition(cache.due(userAsked: true).isEmpty, "fresh after apply")
+        precondition(cache.rows[0].summary?.summary == "Deploy.")
+        // Same windows, new OCR text: stale only for a user ask, not in the background.
+        hashes[7] = 2
+        cache.noteTextChanged()
+        precondition(cache.due(userAsked: false).isEmpty && cache.due(userAsked: true) == ["3"])
+        // A title change is text too.
+        cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [w(9, "Chrome", "cats")])]))
+        precondition(cache.due(userAsked: false).isEmpty && cache.due(userAsked: true) == ["3"])
+        // A new window on o5 changes its window set: due in the background; 3 keeps its summary.
+        cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [w(9, "Chrome", "cats"), w(10, "Slack", "geo")])]))
+        precondition(cache.due(userAsked: false) == ["o5"], "\(cache.due(userAsked: false))")
+        precondition(cache.rows[1].summary?.summary == "Cats.", "old summary shown while stale")
+        // A workspace that lost every window is gone from the rows.
+        cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [])]))
+        precondition(cache.order == ["3"] && cache.entries["o5"] == nil)
+        // An answer for a fingerprint that moved meanwhile keeps the workspace stale.
+        let stale = ["3": WhatsUpCache.Fingerprint(structure: 0, text: 0)]
+        cache.apply([.init(tag: "3", summary: "Later.", reason: "r")], asked: stale)
+        precondition(cache.rows[0].summary?.summary == "Later." && cache.due(userAsked: true) == ["3"])
     }
 
     // MARK: RecentUse

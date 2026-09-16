@@ -72,22 +72,24 @@ enum Ask {
         var tags: Set<String> { Set(workspaces.map(\.tag)) }
     }
 
-    /// Every non-empty workspace, on-screen ones first, each window with an
-    /// excerpt of its recognised text. `budget` caps the total excerpt
-    /// characters across all windows so the prompt stays one call's worth;
-    /// the per-window cap is the budget spread evenly, at most `perWindow`.
+    /// Every non-empty workspace (or just those in `only`), on-screen ones
+    /// first, each window with an excerpt of its recognised text. `budget`
+    /// caps the total excerpt characters across all windows so the prompt
+    /// stays one call's worth; the per-window cap is the budget spread
+    /// evenly, at most `perWindow`.
     static func manifold(
         question: String,
         snapshot: OverlaySnapshot,
         text: (UInt32) -> String?,
+        only: Set<String>? = nil,
         budget: Int = 80_000,
         perWindow: Int = 1_500
     ) -> Manifold {
         var pending: [(String, Bool, [OverlayWindowEntry])] = []
-        for screen in snapshot.screens where !screen.windows.isEmpty {
+        for screen in snapshot.screens where !screen.windows.isEmpty && only?.contains(screen.workspaceTag) ?? true {
             pending.append((screen.workspaceTag, true, screen.windows))
         }
-        for ws in snapshot.hiddenWorkspaces where !ws.windows.isEmpty {
+        for ws in snapshot.hiddenWorkspaces where !ws.windows.isEmpty && only?.contains(ws.tag) ?? true {
             pending.append((ws.tag, false, ws.windows))
         }
         let count = pending.reduce(0) { $0 + $1.2.count }

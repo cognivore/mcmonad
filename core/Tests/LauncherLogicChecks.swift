@@ -1,5 +1,6 @@
 // Compiled with the launcher's pure files (TextSearch, RecentUse,
-// WhereIsProtocol, Protocol) and run by the Nix package checkPhase.
+// AskProtocol, WhereIsProtocol, WhatsUp, Protocol) and run by the Nix
+// package checkPhase.
 import Foundation
 import CoreGraphics
 
@@ -13,6 +14,7 @@ enum LauncherLogicChecks {
         checkWhereIsQuery()
         checkManifold()
         checkStream()
+        checkWhatsUp()
         checkRecency()
         print("Launcher logic checks passed")
     }
@@ -98,24 +100,26 @@ enum LauncherLogicChecks {
                 OverlayHiddenWorkspace(tag: "z", windows: []),
             ]
         )
-        let m = WhereIs.manifold(question: "the deploy", snapshot: snap,
-                                 text: { $0 == 9 ? "a  b\nc" : nil }, budget: 30, perWindow: 100)
+        let m = Ask.manifold(question: "Where is: the deploy", snapshot: snap,
+                             text: { $0 == 9 ? "a  b\nc" : nil }, budget: 30, perWindow: 100)
+        precondition(m.windowIds == [7, 9, 11] && m.tags == ["3", "o5"])
         precondition(m.currentWorkspace == "3")
         precondition(m.workspaces.map(\.tag) == ["3", "o5"], "\(m.workspaces.map(\.tag))")
         precondition(m.workspaces[0].onScreen && !m.workspaces[1].onScreen)
-        precondition(m.workspaces[0].windows == [WhereIs.ManifoldWindow(id: 7, app: "Ghostty", title: "deploy notes", focused: true, text: nil)])
+        precondition(m.workspaces[0].windows == [Ask.ManifoldWindow(id: 7, app: "Ghostty", title: "deploy notes", focused: true, text: nil)])
         // Budget 30 over 3 windows → 10 chars per window.
         precondition(m.workspaces[1].windows[0].text == "a b c")
         precondition(m.workspaces[1].windows[1].text == nil)
-        let big = WhereIs.manifold(question: "q", snapshot: snap,
-                                   text: { _ in String(repeating: "t", count: 50) }, budget: 30, perWindow: 100)
+        let big = Ask.manifold(question: "q", snapshot: snap,
+                               text: { _ in String(repeating: "t", count: 50) }, budget: 30, perWindow: 100)
         precondition(big.workspaces[0].windows[0].text == String(repeating: "t", count: 10) + "…")
-        let prompt = WhereIs.prompt(for: m)
+        let prompt = Ask.prompt(for: m)
         precondition(prompt.hasPrefix("Where is: the deploy\n\nManifold:\n{\"current_workspace\":\"3\""), prompt)
         precondition(prompt.contains("\"on_screen\":true"))
         precondition(WhereIs.arguments.contains("--no-session-persistence"))
         precondition(WhereIs.arguments.contains("--json-schema"))
-        precondition(WhereIs.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
+        precondition(WhereIs.arguments.contains(WhereIs.systemPrompt))
+        precondition(Ask.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
                      == ["/h/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
     }
 
@@ -130,15 +134,36 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine("", known: known) == .ignore)
 
         let ok = #"{"type":"result","subtype":"success","is_error":false,"result":"…","structured_output":{"matches":[{"id":7,"reason":"title says deploy"},{"id":9,"reason":"cats"},{"id":7,"reason":"dup"},{"id":4242,"reason":"made up"},{"id":-1,"reason":"neg"},{"reason":"no id"}]}}"#
-        precondition(WhereIs.parseLine(ok, known: known) == .final(.answered(
+        precondition(WhereIs.parseLine(ok, known: known) == .final(.answered(.windows(
             matches: [.init(windowId: 7, reason: "title says deploy"), .init(windowId: 9, reason: "cats")],
-            droppedUnknownIds: 4)))
+            droppedUnknownIds: 4))))
         let empty = #"{"type":"result","is_error":false,"structured_output":{"matches":[]}}"#
-        precondition(WhereIs.parseLine(empty, known: known) == .final(.answered(matches: [], droppedUnknownIds: 0)))
+        precondition(WhereIs.parseLine(empty, known: known) == .final(.answered(.windows(matches: [], droppedUnknownIds: 0))))
         let failed = #"{"type":"result","is_error":true,"result":"Not logged in"}"#
         precondition(WhereIs.parseLine(failed, known: known) == .final(.failed("Not logged in")))
         let malformed = #"{"type":"result","is_error":false,"result":"plain prose"}"#
         precondition(WhereIs.parseLine(malformed, known: known) == .final(.malformed("plain prose")))
+    }
+
+    // MARK: WhatsUp
+
+    static func checkWhatsUp() {
+        for text in ["what's up", "Whats up?", "WHAT IS UP!", "what’s up on my desks", "sup", "  sup?  "] {
+            precondition(WhatsUp.matches(text), text)
+        }
+        for text in ["", "what", "whatsupdog", "supper", "where is up", "what's up?tell me", "timer 5 what's up"] {
+            precondition(!WhatsUp.matches(text), text)
+        }
+        precondition(WhatsUp.systemPrompt.contains("caveman"))
+        precondition(WhatsUp.arguments.contains(WhatsUp.schemaJSON))
+        let tags: Set<String> = ["3", "o5"]
+        let ok = #"{"type":"result","is_error":false,"structured_output":{"workspaces":[{"tag":"3","summary":"Deploy work.","reason":"title 'deploy notes'"},{"tag":"3","summary":"dup","reason":"dup"},{"tag":"zz","summary":"invented","reason":"none"},{"tag":"o5","summary":"Cats.","reason":"title 'cat videos'"},{"tag":"o5"}]}}"#
+        precondition(WhatsUp.parseLine(ok, knownTags: tags) == .final(.answered(.workspaces(
+            summaries: [.init(tag: "3", summary: "Deploy work.", reason: "title 'deploy notes'"),
+                        .init(tag: "o5", summary: "Cats.", reason: "title 'cat videos'")],
+            droppedUnknownTags: 3))))
+        let wrong = #"{"type":"result","is_error":false,"result":"x","structured_output":{"matches":[]}}"#
+        precondition(WhatsUp.parseLine(wrong, knownTags: tags) == .final(.malformed("x")))
     }
 
     // MARK: RecentUse

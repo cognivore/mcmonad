@@ -159,6 +159,15 @@ question's words highlighted in it; Return focuses one, Esc goes back to the
 query. The CLI must be logged in; it is looked for in `~/.local/bin`,
 `/opt/homebrew/bin`, `/usr/local/bin` and `PATH`.
 
+**"what's up" summarises every workspace.** Type or say `what's up` (or pick
+the builtin row in command mode) and the same call goes out with a different
+contract: for every workspace that has windows, one terse sentence on what is
+going on there and one on the evidence — the titles or recognised text — that
+makes it right. The instruction asks for caveman brevity: substance only,
+structured output only. Rows come back in workspace order, on-screen ones
+first, each with its reason underneath; a workspace the model skipped says so.
+Return views that workspace.
+
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first
 keystroke hands off to the keyboard (so dictation never fights your typing);

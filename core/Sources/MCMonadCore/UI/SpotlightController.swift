@@ -44,6 +44,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// Fires when the user starts a timer (seconds, label).
     var onStartTimer: ((TimeInterval, String) -> Void)?
 
+    /// Fires with a workspace tag when the user picks a "what's up" row.
+    var onViewWorkspace: ((String) -> Void)?
+
     /// The in-memory OCR index of displayed windows (wired by Main). Read
     /// on every filter pass so a window can be found by what is written in
     /// it; its text is never copied anywhere else.
@@ -103,6 +106,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case screenshot(ScreenshotCommand)
         case focusWindow(windowId: UInt32, pid: Int32)
         case whereIs(WhereIsQuery)
+        case whatsUp
+        case viewWorkspace(tag: String)
         case hint
     }
 
@@ -131,6 +136,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             if case .screenshot = kind { return true }
             return false
         }
+        var isWhatsUp: Bool {
+            if case .whatsUp = kind { return true }
+            return false
+        }
     }
 
     // MARK: - State
@@ -140,10 +149,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private let appIndex = AppIndex()
     private let screenshotPicker = ScreenshotRegionPicker()
-    private let whereIsRunner = WhereIsRunner()
-    /// The question being asked / just answered, for highlighting.
-    private var whereIsTerms: [String] = []
-    private var whereIsQuestion = ""
+    private let askRunner = AskRunner()
+    /// The question being asked / just answered: its words (for
+    /// highlighting) and the manifold it was asked about (for row order).
+    private var askTerms: [String] = []
+    private var askQuestion = ""
+    private var askManifold: Ask.Manifold?
     private let voice = VoiceInput()
     private var voiceAuthorized: Bool?      // nil = not yet requested
     /// While true, a resign-key (e.g. the system mic/speech permission prompt
@@ -361,9 +372,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .timerPrompt:
             hintLabel.stringValue = "↩ start · ⇥ back\(voiceHint) · esc cancel"
         case .asking:
-            hintLabel.stringValue = "asking \(WhereIs.model) at \(WhereIs.effort) effort · esc cancel"
+            hintLabel.stringValue = "asking \(Ask.model) at \(Ask.effort) effort · esc cancel"
         case .answered:
-            hintLabel.stringValue = "↩ focus · esc back"
+            hintLabel.stringValue = "↩ select · esc back"
         case .browsing:
             var ocr = ""
             if mode == .window, screenIndex?.availability == .denied {
@@ -591,8 +602,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         self.transcriptScroll = tScroll
         self.transcriptView = tv
 
-        whereIsRunner.onTranscript = { [weak self] text in self?.appendTranscript(text) }
-        whereIsRunner.onFinished = { [weak self] outcome in self?.finishWhereIs(outcome) }
+        askRunner.onTranscript = { [weak self] text in self?.appendTranscript(text) }
+        askRunner.onFinished = { [weak self] outcome in self?.finishAsk(outcome) }
 
         wireVoice()
 
@@ -614,7 +625,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private func rebuildBases() {
         // The builtin Screenshot replaces the system app's duplicate row.
-        var cmd: [Item] = [timerCommandItem(), screenshotItem(.interactive)]
+        var cmd: [Item] = [timerCommandItem(), screenshotItem(.interactive), whatsUpItem()]
         for app in appIndex.apps where app.bundleId != "com.apple.screenshot.launcher" {
             cmd.append(Item(
                 title: app.name,
@@ -678,8 +689,14 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func whereIsItem(_ query: WhereIsQuery) -> Item {
-        Item(title: "Ask \(WhereIs.model) where “\(query.question)” is",
+        Item(title: "Ask \(Ask.model) where “\(query.question)” is",
              kind: .whereIs(query), haystack: "")
+    }
+
+    private func whatsUpItem() -> Item {
+        Item(title: "What's up — one line per workspace, from \(Ask.model)",
+             kind: .whatsUp, haystack: "what's up whats up sup summary workspaces overview",
+             recentKey: RecentUse.whatsUp)
     }
 
     // MARK: - Filtering
@@ -710,6 +727,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             if let ask = WhereIsQuery(q) {
                 items.append(whereIsItem(ask))
             }
+            let whatsUp = WhatsUp.matches(q)
+            if whatsUp {
+                items.append(whatsUpItem())
+            }
             let screenshotCmd = ScreenshotCommand(q)
             if let screenshotCmd {
                 items.append(screenshotItem(screenshotCmd))
@@ -728,6 +749,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 let base = commandBase.filter {
                     !(timerCmd != nil && $0.isOpenTimerPrompt)
                         && !(screenshotCmd != nil && $0.isScreenshot)
+                        && !(whatsUp && $0.isWhatsUp)
                 }
                 items += rank(q, in: base)
             case .window:
@@ -809,6 +831,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         switch item.kind {
         case .whereIs(let query):
             beginWhereIs(query)
+        case .whatsUp:
+            beginWhatsUp()
+        case .viewWorkspace(let tag):
+            finish()
+            onViewWorkspace?(tag)
         case .launchApp(let app):
             finish()
             appIndex.launch(app)
@@ -851,14 +878,32 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         onStartTimer?(TimeInterval(m) * 60, label)
     }
 
-    // MARK: - "Where is …"
+    // MARK: - Questions to the model ("where is …", "what's up")
+
+    private func beginWhereIs(_ query: WhereIsQuery) {
+        beginAsk(question: query.question, terms: query.terms, arguments: WhereIs.arguments) { manifold in
+            let known = manifold.windowIds
+            return { WhereIs.parseLine($0, known: known) }
+        }
+    }
+
+    private func beginWhatsUp() {
+        beginAsk(question: WhatsUp.question, terms: [], arguments: WhatsUp.arguments) { manifold in
+            let tags = manifold.tags
+            return { WhatsUp.parseLine($0, knownTags: tags) }
+        }
+    }
 
     /// Send the question and the manifold of every window to the model, and
-    /// show the exchange while it thinks.
-    private func beginWhereIs(_ query: WhereIsQuery) {
+    /// show the exchange while it thinks. `parse` is built once the manifold
+    /// exists, so the answer can be checked against what was asked about.
+    private func beginAsk(
+        question: String, terms: [String], arguments: [String],
+        parse: (Ask.Manifold) -> @Sendable (String) -> Ask.StreamItem
+    ) {
         leaveWhereIs()
-        whereIsTerms = query.terms
-        whereIsQuestion = query.question
+        askTerms = terms
+        askQuestion = question
         state = .asking
         filtered = []
         tableView.reloadData()
@@ -868,28 +913,28 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         spinner.start()
 
         guard let snap = snapshotProvider?() else {
-            finishWhereIs(.unavailable("The brain has not sent a window snapshot yet."))
+            finishAsk(.unavailable("The brain has not sent a window snapshot yet."))
             return
         }
-        let manifold = WhereIs.manifold(
-            question: query.question,
+        let manifold = Ask.manifold(
+            question: question,
             snapshot: snap,
             text: { [weak self] wid in self?.screenIndex?.entry(for: wid)?.text }
         )
-        let known = Set(manifold.workspaces.flatMap { $0.windows.map(\.id) })
-        let prompt = WhereIs.prompt(for: manifold)
-        let cli = WhereIsRunner.locateCLI() ?? "claude"
-        appendTranscript("→ \(cli) " + WhereIs.arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
+        askManifold = manifold
+        let prompt = Ask.prompt(for: manifold)
+        let cli = AskRunner.locateCLI() ?? "claude"
+        appendTranscript("→ \(cli) " + arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
         appendTranscript("→ stdin:\n\(prompt)\n\n← ")
-        whereIsRunner.start(prompt: prompt, known: known)
+        askRunner.start(prompt: prompt, arguments: arguments, parse: parse(manifold))
     }
 
-    private func finishWhereIs(_ outcome: WhereIs.Outcome) {
+    private func finishAsk(_ outcome: Ask.Outcome) {
         spinner.stop()
         guard state == .asking else { return }
         state = .answered
         switch outcome {
-        case .answered(let matches, let dropped):
+        case .answered(.windows(let matches, let dropped)):
             appendTranscript("\n\n✓ \(matches.count) match(es)"
                 + (dropped > 0 ? ", \(dropped) id(s) not in the manifold ignored" : "") + "\n")
             var byId: [UInt32: (OverlayWindowEntry, String)] = [:]
@@ -907,15 +952,32 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                     kind: .focusWindow(windowId: w.windowId, pid: w.pid),
                     haystack: "",
                     recentKey: RecentUse.window(w.windowId),
-                    subtitle: Self.highlighted(m.reason, ranges: TextSearch.ranges(of: whereIsTerms, in: m.reason))
+                    subtitle: Self.highlighted(m.reason, ranges: TextSearch.ranges(of: askTerms, in: m.reason))
                 )
             }
             if filtered.isEmpty {
-                filtered = [hintItem("Nothing on any workspace looks like “\(whereIsQuestion)”.")]
+                filtered = [hintItem("Nothing on any workspace looks like “\(askQuestion)”.")]
             }
-            showTranscript(false)
-            tableView.reloadData()
-            selectFirstActivatable()
+            showResults()
+        case .answered(.workspaces(let summaries, let dropped)):
+            appendTranscript("\n\n✓ \(summaries.count) workspace(s) summarised"
+                + (dropped > 0 ? ", \(dropped) not in the manifold ignored" : "") + "\n")
+            // One row per workspace we asked about, in the manifold's order
+            // (on screen first); a workspace the model skipped says so.
+            let byTag = Dictionary(summaries.map { ($0.tag, $0) }, uniquingKeysWith: { a, _ in a })
+            filtered = (askManifold?.workspaces ?? []).map { ws in
+                let s = byTag[ws.tag]
+                return Item(
+                    title: "\(ws.tag)   ·  \(s?.summary ?? "(no summary given)")",
+                    kind: .viewWorkspace(tag: ws.tag),
+                    haystack: "",
+                    subtitle: Self.highlighted("why: " + (s?.reason ?? "the model skipped this workspace"), ranges: [])
+                )
+            }
+            if filtered.isEmpty {
+                filtered = [hintItem("No workspace has any window.")]
+            }
+            showResults()
         case .unavailable(let why):
             appendTranscript("\n\n✗ unavailable: \(why)\n")
         case .failed(let why):
@@ -926,9 +988,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         applyModeChrome()
     }
 
+    private func showResults() {
+        showTranscript(false)
+        tableView.reloadData()
+        selectFirstActivatable()
+    }
+
     /// Stop any question in flight and put the results table back.
     private func leaveWhereIs() {
-        whereIsRunner.cancel()
+        askRunner.cancel()
         spinner.stop()
         showTranscript(false)
     }
@@ -1079,9 +1147,13 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             return
         }
         if state == .asking || state == .answered { return }
-        // A spoken "where is …" asks the model, in any mode.
+        // A spoken "where is …" or "what's up" asks the model, in any mode.
         if let ask = WhereIsQuery(text) {
             beginWhereIs(ask)
+            return
+        }
+        if WhatsUp.matches(text) {
+            beginWhatsUp()
             return
         }
         // A spoken "timer …" sets a countdown in ANY mode — dictation isn't
@@ -1233,7 +1305,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .focusWindow(_, let pid):  return windowIcon(pid: pid)
         case .openTimerPrompt, .startTimer: return symbolIcon("timer")
         case .screenshot:               return symbolIcon("camera")
-        case .whereIs:                  return symbolIcon("sparkles")
+        case .whereIs, .whatsUp:        return symbolIcon("sparkles")
+        case .viewWorkspace:            return symbolIcon("rectangle.3.group")
         case .hint:                     return symbolIcon("info.circle")
         }
     }

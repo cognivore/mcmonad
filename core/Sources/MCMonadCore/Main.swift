@@ -441,6 +441,10 @@ struct MCMonadCoreApp {
         spotlight.onFocusWindow = { [weak socketServer] wid, pid in
             socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
         }
+        // A "what's up" row: view that workspace, same path as the menubar tree.
+        spotlight.onViewWorkspace = { [weak socketServer] tag in
+            socketServer?.send(.menuViewWorkspace(tag: tag))
+        }
         // Starting a timer is a state change: report it to the brain (which
         // stamps the current workspace, assigns an id, persists it, and pushes
         // the list back via set-timers). No origin workspace here — the brain

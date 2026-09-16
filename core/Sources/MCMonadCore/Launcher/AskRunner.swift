@@ -1,19 +1,19 @@
 import Foundation
 import os
 
-/// Runs one "where is" question through the Claude Code CLI already on this
+/// Runs one launcher question through the Claude Code CLI already on this
 /// Mac (`claude -p`), streaming its transcript back and ending in exactly one
-/// `WhereIs.Outcome`. The prompt goes in on stdin and the CLI is told not to
+/// `Ask.Outcome`. The prompt goes in on stdin and the CLI is told not to
 /// persist the session, so the recognised screen text it carries exists only
 /// in the two processes' memory for the length of the call.
 @MainActor
-final class WhereIsRunner {
-    private static let logger = Logger(subsystem: "com.mcmonad.core", category: "WhereIs")
+final class AskRunner {
+    private static let logger = Logger(subsystem: "com.mcmonad.core", category: "Ask")
 
     /// Text to append to the on-screen transcript, in order.
     var onTranscript: ((String) -> Void)?
     /// Fires once per `start`, after which the runner is idle again.
-    var onFinished: ((WhereIs.Outcome) -> Void)?
+    var onFinished: ((Ask.Outcome) -> Void)?
 
     private var process: Process?
     private var finished = false
@@ -21,23 +21,26 @@ final class WhereIsRunner {
     /// Locate the CLI; nil when no candidate is an executable file.
     static func locateCLI() -> String? {
         let env = ProcessInfo.processInfo.environment
-        return WhereIs.candidates(home: NSHomeDirectory(), path: env["PATH"])
+        return Ask.candidates(home: NSHomeDirectory(), path: env["PATH"])
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    func start(prompt: String, known: Set<UInt32>) {
+    /// `arguments` are the question's CLI arguments (schema + system prompt
+    /// included); `parse` turns one stream-json line into what to show.
+    func start(prompt: String, arguments: [String],
+               parse: @escaping @Sendable (String) -> Ask.StreamItem) {
         cancel()
         finished = false
         guard let cli = Self.locateCLI() else {
-            let looked = WhereIs.candidates(home: NSHomeDirectory(),
-                                            path: ProcessInfo.processInfo.environment["PATH"])
+            let looked = Ask.candidates(home: NSHomeDirectory(),
+                                        path: ProcessInfo.processInfo.environment["PATH"])
             finish(.unavailable("No claude CLI found. Looked in:\n" + looked.joined(separator: "\n")))
             return
         }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cli)
-        p.arguments = WhereIs.arguments
+        p.arguments = arguments
         p.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = [NSHomeDirectory() + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
@@ -50,8 +53,7 @@ final class WhereIsRunner {
         p.standardError = stderr
 
         // Line-buffer stdout on the reader's thread; hand whole lines to the
-        // main actor. `known` and the buffers are owned by this closure.
-        let known = known
+        // main actor. The buffers are owned by these closures.
         nonisolated(unsafe) var buffer = Data()
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
@@ -62,7 +64,7 @@ final class WhereIsRunner {
                 let lineData = buffer.subdata(in: buffer.startIndex..<nl)
                 buffer.removeSubrange(buffer.startIndex...nl)
                 guard let line = String(data: lineData, encoding: .utf8) else { continue }
-                let item = WhereIs.parseLine(line, known: known)
+                let item = parse(line)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     switch item {
@@ -106,7 +108,7 @@ final class WhereIsRunner {
             return
         }
         process = p
-        Self.logger.info("where-is: asked \(WhereIs.model, privacy: .public) via \(cli, privacy: .public)")
+        Self.logger.info("ask: \(Ask.model, privacy: .public) via \(cli, privacy: .public)")
 
         // Feed the prompt and close stdin so the CLI knows it has everything.
         let data = Data(prompt.utf8)
@@ -127,17 +129,19 @@ final class WhereIsRunner {
         p.terminate()
     }
 
-    private func finish(_ outcome: WhereIs.Outcome) {
+    private func finish(_ outcome: Ask.Outcome) {
         guard !finished else { return }
         finished = true
         // Only the kind is logged: the payloads can carry the model's words
         // about screen contents, which stay on screen.
         switch outcome {
-        case .answered(let m, let dropped):
-            Self.logger.info("where-is: \(m.count, privacy: .public) match(es), \(dropped, privacy: .public) dropped")
-        case .unavailable: Self.logger.error("where-is: claude CLI unavailable")
-        case .failed: Self.logger.error("where-is: claude CLI failed")
-        case .malformed: Self.logger.error("where-is: answer was not in the schema")
+        case .answered(.windows(let m, let dropped)):
+            Self.logger.info("ask: \(m.count, privacy: .public) window(s), \(dropped, privacy: .public) dropped")
+        case .answered(.workspaces(let s, let dropped)):
+            Self.logger.info("ask: \(s.count, privacy: .public) workspace summaries, \(dropped, privacy: .public) dropped")
+        case .unavailable: Self.logger.error("ask: claude CLI unavailable")
+        case .failed: Self.logger.error("ask: claude CLI failed")
+        case .malformed: Self.logger.error("ask: answer was not in the schema")
         }
         onFinished?(outcome)
     }

@@ -14,6 +14,7 @@ final class RecentUse {
     nonisolated static func app(bundleId: String?, path: String) -> String { "a:" + (bundleId ?? path) }
     static let timer = "c:timer"
     static let screenshot = "c:screenshot"
+    static let whatsUp = "c:whats-up"
 
     func touch(_ key: String) {
         tick &+= 1

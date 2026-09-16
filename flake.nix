@@ -65,7 +65,9 @@
                 Sources/MCMonadCore/IPC/Protocol.swift \
                 Sources/MCMonadCore/Index/TextSearch.swift \
                 Sources/MCMonadCore/Launcher/RecentUse.swift \
+                Sources/MCMonadCore/Launcher/AskProtocol.swift \
                 Sources/MCMonadCore/Launcher/WhereIsProtocol.swift \
+                Sources/MCMonadCore/Launcher/WhatsUp.swift \
                 Tests/LauncherLogicChecks.swift \
                 -o .build/launcher-logic-checks
               .build/launcher-logic-checks

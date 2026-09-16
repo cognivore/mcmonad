@@ -10,7 +10,9 @@ import MCMonad.Core
     , withinSettleWindow, consumeIntent
     , PendingWindow(..), Timer(..)
     )
-import MCMonad.IPC (WindowInfo(..))
+import MCMonad.IPC (WindowInfo(..), Command(..))
+import qualified Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy.Char8 as BL
 import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     , windowSetToSerial
@@ -1392,9 +1394,20 @@ prop_timer_persistence label (Positive seconds) =
         , readMaybe (show expected) === Just expected
         ]
 
+-- The OCR-index switch is the one config bit the daemon acts on without
+-- ever answering; the wire name is the whole contract.
+prop_ocr_index_wire :: Bool -> Property
+prop_ocr_index_wire on =
+    let json = BL.unpack (Aeson.encode (SetOcrIndex on))
+    in conjoin
+        [ counterexample json (property ("\"cmd\":\"set-ocr-index\"" `L.isInfixOf` json))
+        , counterexample json (property (("\"on\":" ++ (if on then "true" else "false")) `L.isInfixOf` json))
+        ]
+
 allProperties :: [(String, Property)]
 allProperties =
-    [ ("timer persistence + legacy snapshot", property prop_timer_persistence)
+    [ ("ocr-index wire format", property prop_ocr_index_wire)
+    , ("timer persistence + legacy snapshot", property prop_timer_persistence)
     , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)
     , ("focusDown/focusUp",       property prop_focusDown_focusUp)

@@ -394,6 +394,20 @@ struct MCMonadCoreApp {
             overlayManager: overlayManager
         )
 
+        // In-memory OCR index of displayed windows. Idle until the brain's
+        // config says on (the default); its text never leaves this process.
+        let screenIndex = ScreenIndex()
+        spotlight.screenIndex = screenIndex
+        executor.onSetOcrIndex = { [weak screenIndex] on in
+            screenIndex?.setEnabled(on)
+        }
+        overlayManager.onSnapshotApplied = { [weak screenIndex] snapshot in
+            screenIndex?.noteSnapshot(snapshot)
+        }
+        screenIndex.onUpdated = { [weak spotlight] in
+            spotlight?.screenIndexUpdated()
+        }
+
         // Menu reads the cached snapshot from OverlayManager
         statusBar.snapshotProvider = { [weak overlayManager] in
             overlayManager?.cachedSnapshot
@@ -499,11 +513,15 @@ struct MCMonadCoreApp {
         // first window of this PID" when the user clicks any of them.
         let focusTracker = AXFocusTracker()
         AXFocusTracker.shared = focusTracker
-        focusTracker.onFocusedWindowChanged = { [weak socketServer] windowId, pid in
+        focusTracker.onFocusedWindowChanged = { [weak socketServer, weak spotlight, weak screenIndex] windowId, pid in
             FocusLog.emit(source: .emitFocusedWindowChanged,
                           windowId: windowId, pid: pid,
                           extra: "via=axFocusedWindowChanged")
             socketServer?.send(.focusedWindowChanged(windowId: windowId, pid: pid))
+            // Recency for the launcher's lists, and a nudge to re-read the
+            // screen: a focus change usually means something new to read.
+            spotlight?.recentUse.touch(RecentUse.window(windowId))
+            screenIndex?.requestSoon()
         }
 
         // Wire SkyLightEventObserver (singleton, delegate-based) to socket
@@ -605,7 +623,7 @@ struct MCMonadCoreApp {
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, executor, eventBridge, dragHandler,
-                      mouseDownMonitor, spotlight, timerController)
+                      mouseDownMonitor, spotlight, timerController, screenIndex)
     }
 
     // Static storage to prevent ARC from deallocating services

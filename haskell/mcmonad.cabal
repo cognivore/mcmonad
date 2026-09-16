@@ -63,6 +63,8 @@ test-suite properties
     mcmonad,
     xmonad,
     QuickCheck >= 2.14,
+    aeson,
+    bytestring,
     containers,
     text,
     time

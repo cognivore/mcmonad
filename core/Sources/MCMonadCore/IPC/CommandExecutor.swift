@@ -35,6 +35,10 @@ final class CommandExecutor {
     /// `set-timers` command). Wired in Main to TimerController.setTimers.
     var onSetTimers: (([TimerSpec]) -> Void)?
 
+    /// Invoked when Haskell turns the OCR screen index on or off (the
+    /// `set-ocr-index` command). Wired in Main to ScreenIndex.setEnabled.
+    var onSetOcrIndex: ((Bool) -> Void)?
+
     private let encoder = JSONEncoder()
 
     init(
@@ -85,6 +89,8 @@ final class CommandExecutor {
             onShowSpotlight?(mode)
         case .setTimers(let timers):
             onSetTimers?(timers)
+        case .setOcrIndex(let on):
+            onSetOcrIndex?(on)
         }
     }
 

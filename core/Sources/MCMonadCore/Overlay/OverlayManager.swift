@@ -37,6 +37,10 @@ final class OverlayManager {
     /// on subsequent applies, only on the entry edge.
     var onEnabledTurnedOn: (() -> Void)?
 
+    /// Called with every snapshot the brain pushes, enabled or not. The
+    /// screen index reads the displayed-window list from it.
+    var onSnapshotApplied: ((OverlaySnapshot) -> Void)?
+
     func setEnabled(_ on: Bool) {
         guard enabled != on else { return }
         enabled = on
@@ -64,6 +68,7 @@ final class OverlayManager {
             + snapshot.hiddenWorkspaces.reduce(0) { $0 + $1.windows.count }
         fputs("OVERLAY: apply screens=\(snapshot.screens.count) "
             + "hidden=\(snapshot.hiddenWorkspaces.count) windows=\(wc)\n", stderr)
+        onSnapshotApplied?(snapshot)
         guard enabled else { return }
         redraw(snapshot)
     }

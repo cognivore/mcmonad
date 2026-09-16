@@ -393,6 +393,9 @@ enum IPCCommand: Decodable, Sendable {
     case showWindowPicker
     case showSpotlight(mode: String)
     case setTimers(timers: [TimerSpec])
+    /// Turn the in-memory OCR index of displayed windows on or off
+    /// (`MCMonad.Config.ocrIndex`). What it reads never goes back out.
+    case setOcrIndex(on: Bool)
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -411,6 +414,7 @@ enum IPCCommand: Decodable, Sendable {
         case showWindowPicker = "show-window-picker"
         case showSpotlight = "show-spotlight"
         case setTimers = "set-timers"
+        case setOcrIndex = "set-ocr-index"
     }
 
     init(from decoder: Decoder) throws {
@@ -464,6 +468,9 @@ enum IPCCommand: Decodable, Sendable {
         case .setTimers:
             let timers = try container.decode([TimerSpec].self, forKey: .timers)
             self = .setTimers(timers: timers)
+        case .setOcrIndex:
+            let on = try container.decode(Bool.self, forKey: .on)
+            self = .setOcrIndex(on: on)
         }
     }
 }

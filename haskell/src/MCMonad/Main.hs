@@ -76,6 +76,9 @@ launch cfg = do
         hotkeyIdMap = Map.fromList
                       $ zipWith (\i (_, action) -> (i, action)) [0 ..] keyList
     sendCommand conn (RegisterHotkeys hotkeySpecs)
+    -- The OCR index is the daemon's to run; the config only says whether
+    -- (on unless the user opted out).
+    sendCommand conn (SetOcrIndex (ocrIndex cfg))
 
     -- 5. Query existing windows
     sendCommand conn QueryWindows

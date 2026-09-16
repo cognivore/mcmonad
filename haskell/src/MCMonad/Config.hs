@@ -84,6 +84,14 @@ data MConfig l = MConfig
     , mouseWarping       :: !Bool
       -- ^ Whether to warp the mouse cursor to the focused window on
       -- workspace\/screen changes. Sway disables this.
+    , ocrIndex           :: !Bool
+      -- ^ Keep an in-memory OCR index of the windows on the displayed
+      -- workspaces, so the launcher's window search and its \"where is\"
+      -- question can look inside windows, not only at their titles. On by
+      -- default; set it to 'False' to opt out. It needs the Screen Recording
+      -- permission for MCMonadCore.app, and what it reads off the
+      -- framebuffer lives only in the daemon's memory — never on disk, in a
+      -- log, or on the IPC socket.
     , logHook            :: !(M ())
       -- ^ Action run after every state change (e.g. update a status bar).
     , startupHook        :: !(M ())
@@ -113,6 +121,7 @@ defaultConfig = MConfig
     , focusedBorderColor = "#ffffff"
     , focusFollowsMouse  = True
     , mouseWarping       = True
+    , ocrIndex           = True
     , logHook            = return ()
     , startupHook        = return ()
     }

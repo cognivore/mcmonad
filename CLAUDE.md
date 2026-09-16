@@ -222,4 +222,10 @@ xmonad xmonad.
 ## Permissions
 
 - Accessibility: required by mcmonad-core. Prompt via `AXIsProcessTrustedWithOptions`.
+- Screen Recording: needed by the launcher's OCR screen index (on by default,
+  `ocrIndex = False` opts out). On macOS 26 nothing prompts; a
+  ScreenCaptureKit query lists MCMonadCore.app in the pane, unticked, and the
+  daemon opens the pane once. Whatever the index reads off the framebuffer
+  stays in mcmonad-core's memory: never on disk, never logged, never on the
+  socket. The same rule binds anything else that touches window pixels.
 - No other explicit permissions needed.

@@ -44,6 +44,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// Fires when the user starts a timer (seconds, label).
     var onStartTimer: ((TimeInterval, String) -> Void)?
 
+    /// The in-memory OCR index of displayed windows (wired by Main). Read
+    /// on every filter pass so a window can be found by what is written in
+    /// it; its text is never copied anywhere else.
+    var screenIndex: ScreenIndex?
+
+    /// Recency for every list the launcher shows. Focus events touch
+    /// windows (Main); picks here touch whatever was picked.
+    let recentUse = RecentUse()
+
     // MARK: - Modes
 
     enum Mode: Int, CaseIterable {
@@ -81,6 +90,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private enum State {
         case browsing
         case timerPrompt   // command mode, after choosing "Timer": awaiting minutes
+        case asking        // "where is …" sent to the model; transcript on screen
+        case answered      // the model's list (or its failure) on screen
     }
 
     // MARK: - Items
@@ -91,6 +102,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case startTimer(seconds: TimeInterval, label: String)
         case screenshot(ScreenshotCommand)
         case focusWindow(windowId: UInt32, pid: Int32)
+        case whereIs(WhereIsQuery)
         case hint
     }
 
@@ -98,6 +110,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         let title: String
         let kind: Kind
         let haystack: String
+        /// Key into `recentUse`; nil for rows that have no recency (hints).
+        var recentKey: String? = nil
+        /// Second line: a highlighted text excerpt or the model's reason.
+        var subtitle: NSAttributedString? = nil
+        /// For window rows: the id to look up in the screen index.
+        var windowId: UInt32? {
+            if case .focusWindow(let id, _) = kind { return id }
+            return nil
+        }
         var activatable: Bool {
             if case .hint = kind { return false }
             return true
@@ -119,6 +140,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private let appIndex = AppIndex()
     private let screenshotPicker = ScreenshotRegionPicker()
+    private let whereIsRunner = WhereIsRunner()
+    /// The question being asked / just answered, for highlighting.
+    private var whereIsTerms: [String] = []
+    private var whereIsQuestion = ""
     private let voice = VoiceInput()
     private var voiceAuthorized: Bool?      // nil = not yet requested
     /// While true, a resign-key (e.g. the system mic/speech permission prompt
@@ -161,6 +186,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private var modeLabel: NSTextField!
     private var hintLabel: NSTextField!
     private var micButton: NSButton!
+    private var resultsScroll: NSScrollView!
+    private var transcriptScroll: NSScrollView!
+    private var transcriptView: NSTextView!
+    private var spinner: SpinnerView!
 
     private static let panelWidth: CGFloat = 660
     private static let panelHeight: CGFloat = 460
@@ -168,6 +197,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private static let footHeight: CGFloat = 24
     private static let pad: CGFloat = 10
     private static let rowHeight: CGFloat = 34
+    private static let rowHeightTall: CGFloat = 52
     private static let rowInset: CGFloat = 16
     private static let cellId = NSUserInterfaceItemIdentifier("spotlightRow")
     private static let topFraction: CGFloat = 0.20
@@ -195,6 +225,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
         appIndex.refreshIfStale()
         rebuildBases()
+        // "At a given moment": re-read the displayed windows as the launcher opens.
+        screenIndex?.requestSoon(after: 0)
 
         restoreTarget = WindowFocus.frontmostFocusedWindow()
 
@@ -217,8 +249,19 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     func hide() {
         voice.stop()
+        leaveWhereIs()
         removeKeyMonitor()
         panel?.orderOut(nil)
+    }
+
+    /// The screen index changed while the launcher may be open: re-rank a
+    /// live window search, unless the user has moved the selection.
+    func screenIndexUpdated() {
+        guard let panel, panel.isVisible, state == .browsing, mode == .window,
+              !searchField.stringValue.isEmpty,
+              tableView.selectedRow <= (filtered.firstIndex { $0.activatable } ?? 0)
+        else { return }
+        applyFilter(searchField.stringValue)
     }
 
     /// Dismiss having chosen something: don't restore prior focus.
@@ -235,6 +278,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             searchField.stringValue = ""
             applyModeChrome()
             applyFilter("")
+            return
+        }
+        if state == .asking || state == .answered {
+            // First Esc leaves the question, keeping its text to edit.
+            leaveWhereIs()
+            state = .browsing
+            applyModeChrome()
+            applyFilter(searchField.stringValue)
+            panel?.makeFirstResponder(searchField)
             return
         }
         let target = restoreTarget
@@ -254,6 +306,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     /// Switch to a top-level mode, resetting any sub-prompt and the query.
     private func switchTo(_ newMode: Mode) {
+        leaveWhereIs()
         state = .browsing
         mode = newMode
         searchField.stringValue = ""
@@ -275,6 +328,14 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             glyphName = "timer"
             placeholder = "Minutes — e.g. 15 check on agents"
             modeText = "Timer"
+        case .asking:
+            glyphName = "sparkles"
+            placeholder = "where is …"
+            modeText = "Asking"
+        case .answered:
+            glyphName = "sparkles"
+            placeholder = "where is …"
+            modeText = "Where is"
         case .browsing:
             glyphName = mode.glyph
             placeholder = mode.placeholder
@@ -299,8 +360,16 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         switch state {
         case .timerPrompt:
             hintLabel.stringValue = "↩ start · ⇥ back\(voiceHint) · esc cancel"
+        case .asking:
+            hintLabel.stringValue = "asking \(WhereIs.model) at \(WhereIs.effort) effort · esc cancel"
+        case .answered:
+            hintLabel.stringValue = "↩ focus · esc back"
         case .browsing:
-            hintLabel.stringValue = "⇥ \(mode.next().label) · ↩ select\(voiceHint) · esc cancel"
+            var ocr = ""
+            if mode == .window, screenIndex?.availability == .denied {
+                ocr = " · ⚠ screen index: grant Screen Recording to MCMonadCore.app"
+            }
+            hintLabel.stringValue = "⇥ \(mode.next().label) · ↩ select\(voiceHint) · esc cancel\(ocr)"
         }
     }
 
@@ -485,6 +554,45 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         scroll.documentView = table
         container.addSubview(scroll)
         self.tableView = table
+        self.resultsScroll = scroll
+
+        // "Where is": a muted spinner behind the live transcript of what we
+        // send the model and what it streams back. Both hidden until asked.
+        let spinnerSide: CGFloat = 220
+        let spin = SpinnerView(frame: NSRect(
+            x: scrollFrame.midX - spinnerSide / 2,
+            y: scrollFrame.midY - spinnerSide / 2,
+            width: spinnerSide, height: spinnerSide
+        ))
+        spin.isHidden = true
+        container.addSubview(spin)
+        self.spinner = spin
+
+        let tScroll = NSScrollView(frame: scrollFrame)
+        tScroll.hasVerticalScroller = true
+        tScroll.drawsBackground = false
+        tScroll.borderType = .noBorder
+        tScroll.automaticallyAdjustsContentInsets = false
+        let tv = NSTextView(frame: NSRect(origin: .zero, size: scrollFrame.size))
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.textColor = .secondaryLabelColor
+        tv.textContainerInset = NSSize(width: Self.rowInset - 4, height: 8)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: scrollFrame.width, height: .greatestFiniteMagnitude)
+        tScroll.documentView = tv
+        tScroll.isHidden = true
+        container.addSubview(tScroll)
+        self.transcriptScroll = tScroll
+        self.transcriptView = tv
+
+        whereIsRunner.onTranscript = { [weak self] text in self?.appendTranscript(text) }
+        whereIsRunner.onFinished = { [weak self] outcome in self?.finishWhereIs(outcome) }
 
         wireVoice()
 
@@ -511,7 +619,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             cmd.append(Item(
                 title: app.name,
                 kind: .launchApp(app),
-                haystack: app.haystack
+                haystack: app.haystack,
+                recentKey: RecentUse.app(bundleId: app.bundleId, path: app.url.path)
             ))
         }
         commandBase = cmd
@@ -526,7 +635,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 wins.append(Item(
                     title: "\(body)   ·  \(tag)",
                     kind: .focusWindow(windowId: w.windowId, pid: w.pid),
-                    haystack: "\(app) \(title) \(tag)".lowercased()
+                    haystack: "\(app) \(title) \(tag)".lowercased(),
+                    recentKey: RecentUse.window(w.windowId)
                 ))
             }
             for screen in snap.screens {
@@ -543,7 +653,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         Item(
             title: "Timer — set a countdown",
             kind: .openTimerPrompt,
-            haystack: "timer countdown stopwatch alarm"
+            haystack: "timer countdown stopwatch alarm",
+            recentKey: RecentUse.timer
         )
     }
 
@@ -562,7 +673,13 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func screenshotItem(_ command: ScreenshotCommand) -> Item {
-        Item(title: command.title, kind: .screenshot(command), haystack: "screenshot")
+        Item(title: command.title, kind: .screenshot(command), haystack: "screenshot",
+             recentKey: RecentUse.screenshot)
+    }
+
+    private func whereIsItem(_ query: WhereIsQuery) -> Item {
+        Item(title: "Ask \(WhereIs.model) where “\(query.question)” is",
+             kind: .whereIs(query), haystack: "")
     }
 
     // MARK: - Filtering
@@ -579,9 +696,20 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 filtered = [hintItem("Type minutes, e.g. “15 check on agents”")]
             }
 
+        case .asking:
+            filtered = []
+
+        case .answered:
+            // `filtered` is the model's answer; typing leaves this state
+            // (see controlTextDidChange) rather than re-ranking it.
+            break
+
         case .browsing:
             // Builtin commands work in both command and window-search mode.
             var items: [Item] = []
+            if let ask = WhereIsQuery(q) {
+                items.append(whereIsItem(ask))
+            }
             let screenshotCmd = ScreenshotCommand(q)
             if let screenshotCmd {
                 items.append(screenshotItem(screenshotCmd))
@@ -603,7 +731,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 }
                 items += rank(q, in: base)
             case .window:
-                items += rank(q, in: windowBase)
+                items += rankWindows(q)
             }
             filtered = items
         }
@@ -612,17 +740,49 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         selectFirstActivatable()
     }
 
-    /// Empty query → original order; otherwise fuzzy-rank.
+    /// Empty query → most recently used first; otherwise fuzzy-rank, with
+    /// recency breaking ties.
     private func rank(_ query: String, in base: [Item]) -> [Item] {
         let q = query.lowercased()
-        if q.isEmpty { return base }
+        if q.isEmpty { return RecentUse.order(base) { recentUse.stamp($0.recentKey) } }
         let scored = base.compactMap { item -> (Item, Int)? in
             FuzzyMatch.score(query: q, in: item.haystack).map { (item, $0) }
         }
-        return scored
-            .enumerated()
+        return sortScored(scored)
+    }
+
+    /// Window search: a title/app/tag fuzzy match ranks as before; failing
+    /// that, a window whose recognised text contains every query word is
+    /// listed below the title matches with the matching line as its second
+    /// row, the words highlighted.
+    private func rankWindows(_ query: String) -> [Item] {
+        let q = query.lowercased()
+        if q.isEmpty { return RecentUse.order(windowBase) { recentUse.stamp($0.recentKey) } }
+        let terms = TextSearch.terms(query)
+        var scored: [(Item, Int)] = []
+        for item in windowBase {
+            if let score = FuzzyMatch.score(query: q, in: item.haystack) {
+                scored.append((item, score))
+                continue
+            }
+            guard let wid = item.windowId, let entry = screenIndex?.entry(for: wid),
+                  let hit = TextSearch.hit(terms: terms, in: entry.text, lower: entry.lower)
+            else { continue }
+            var row = item
+            row.subtitle = Self.highlighted(hit.snippet, ranges: hit.ranges)
+            scored.append((row, 1))   // any title match outranks a text match
+        }
+        return sortScored(scored)
+    }
+
+    private func sortScored(_ scored: [(Item, Int)]) -> [Item] {
+        scored.enumerated()
             .sorted { a, b in
-                a.element.1 != b.element.1 ? a.element.1 > b.element.1 : a.offset < b.offset
+                if a.element.1 != b.element.1 { return a.element.1 > b.element.1 }
+                let ra = recentUse.stamp(a.element.0.recentKey)
+                let rb = recentUse.stamp(b.element.0.recentKey)
+                if ra != rb { return ra > rb }
+                return a.offset < b.offset
             }
             .map { $0.element.0 }
     }
@@ -645,7 +805,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func activate(_ item: Item) {
+        if let key = item.recentKey { recentUse.touch(key) }
         switch item.kind {
+        case .whereIs(let query):
+            beginWhereIs(query)
         case .launchApp(let app):
             finish()
             appIndex.launch(app)
@@ -686,6 +849,135 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         guard let m else { return }
         finish()
         onStartTimer?(TimeInterval(m) * 60, label)
+    }
+
+    // MARK: - "Where is …"
+
+    /// Send the question and the manifold of every window to the model, and
+    /// show the exchange while it thinks.
+    private func beginWhereIs(_ query: WhereIsQuery) {
+        leaveWhereIs()
+        whereIsTerms = query.terms
+        whereIsQuestion = query.question
+        state = .asking
+        filtered = []
+        tableView.reloadData()
+        applyModeChrome()
+        transcriptView.string = ""
+        showTranscript(true)
+        spinner.start()
+
+        guard let snap = snapshotProvider?() else {
+            finishWhereIs(.unavailable("The brain has not sent a window snapshot yet."))
+            return
+        }
+        let manifold = WhereIs.manifold(
+            question: query.question,
+            snapshot: snap,
+            text: { [weak self] wid in self?.screenIndex?.entry(for: wid)?.text }
+        )
+        let known = Set(manifold.workspaces.flatMap { $0.windows.map(\.id) })
+        let prompt = WhereIs.prompt(for: manifold)
+        let cli = WhereIsRunner.locateCLI() ?? "claude"
+        appendTranscript("→ \(cli) " + WhereIs.arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
+        appendTranscript("→ stdin:\n\(prompt)\n\n← ")
+        whereIsRunner.start(prompt: prompt, known: known)
+    }
+
+    private func finishWhereIs(_ outcome: WhereIs.Outcome) {
+        spinner.stop()
+        guard state == .asking else { return }
+        state = .answered
+        switch outcome {
+        case .answered(let matches, let dropped):
+            appendTranscript("\n\n✓ \(matches.count) match(es)"
+                + (dropped > 0 ? ", \(dropped) id(s) not in the manifold ignored" : "") + "\n")
+            var byId: [UInt32: (OverlayWindowEntry, String)] = [:]
+            if let snap = snapshotProvider?() {
+                for s in snap.screens { for w in s.windows { byId[w.windowId] = (w, s.workspaceTag) } }
+                for ws in snap.hiddenWorkspaces { for w in ws.windows { byId[w.windowId] = (w, ws.tag) } }
+            }
+            filtered = matches.compactMap { m -> Item? in
+                guard let (w, tag) = byId[m.windowId] else { return nil }
+                let app = w.appName ?? "?"
+                let title = w.title ?? ""
+                let body = title.isEmpty ? app : "\(app) — \(title)"
+                return Item(
+                    title: "\(body)   ·  \(tag)",
+                    kind: .focusWindow(windowId: w.windowId, pid: w.pid),
+                    haystack: "",
+                    recentKey: RecentUse.window(w.windowId),
+                    subtitle: Self.highlighted(m.reason, ranges: TextSearch.ranges(of: whereIsTerms, in: m.reason))
+                )
+            }
+            if filtered.isEmpty {
+                filtered = [hintItem("Nothing on any workspace looks like “\(whereIsQuestion)”.")]
+            }
+            showTranscript(false)
+            tableView.reloadData()
+            selectFirstActivatable()
+        case .unavailable(let why):
+            appendTranscript("\n\n✗ unavailable: \(why)\n")
+        case .failed(let why):
+            appendTranscript("\n\n✗ failed: \(why)\n")
+        case .malformed(let why):
+            appendTranscript("\n\n✗ not the expected answer: \(why)\n")
+        }
+        applyModeChrome()
+    }
+
+    /// Stop any question in flight and put the results table back.
+    private func leaveWhereIs() {
+        whereIsRunner.cancel()
+        spinner.stop()
+        showTranscript(false)
+    }
+
+    private func showTranscript(_ on: Bool) {
+        transcriptScroll?.isHidden = !on
+        resultsScroll?.isHidden = on
+    }
+
+    private func appendTranscript(_ text: String) {
+        guard let storage = transcriptView.textStorage else { return }
+        storage.append(NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]))
+        transcriptView.scrollToEndOfDocument(nil)
+    }
+
+    private static func shellQuoted(_ arg: String) -> String {
+        if arg.isEmpty { return "''" }
+        if arg.rangeOfCharacter(from: .whitespacesAndNewlines) == nil, !arg.contains("'") { return arg }
+        return "'" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Kagi-style: the matched words bold and orange inside a dimmer line.
+    private static func highlighted(_ text: String, ranges: [NSRange]) -> NSAttributedString {
+        let s = NSMutableAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 11.5),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        for r in ranges where r.location >= 0 && NSMaxRange(r) <= s.length {
+            s.addAttributes([
+                .font: NSFont.systemFont(ofSize: 11.5, weight: .bold),
+                .foregroundColor: NSColor.systemOrange,
+            ], range: r)
+        }
+        return s
+    }
+
+    private static func rowText(_ item: Item) -> NSAttributedString {
+        let s = NSMutableAttributedString(string: item.title, attributes: [
+            .font: NSFont.systemFont(ofSize: 14),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        if let sub = item.subtitle {
+            s.append(NSAttributedString(string: "\n"))
+            s.append(sub)
+        }
+        return s
     }
 
     // MARK: - Voice
@@ -784,6 +1076,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private func interpretVoice(_ text: String) {
         if state == .timerPrompt {
             submitTimerField()
+            return
+        }
+        if state == .asking || state == .answered { return }
+        // A spoken "where is …" asks the model, in any mode.
+        if let ask = WhereIsQuery(text) {
+            beginWhereIs(ask)
             return
         }
         // A spoken "timer …" sets a countdown in ANY mode — dictation isn't
@@ -917,9 +1215,14 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         let item = filtered[row]
         let cell = (tableView.makeView(withIdentifier: Self.cellId, owner: self)
                     as? NSTableCellView) ?? Self.makeCellView()
-        cell.textField?.stringValue = item.title
+        cell.textField?.attributedStringValue = Self.rowText(item)
         cell.imageView?.image = icon(for: item)
         return cell
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard row >= 0, row < filtered.count else { return Self.rowHeight }
+        return filtered[row].subtitle == nil ? Self.rowHeight : Self.rowHeightTall
     }
 
     /// Icon for a row, resolved lazily so opening the launcher does not eagerly
@@ -930,6 +1233,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .focusWindow(_, let pid):  return windowIcon(pid: pid)
         case .openTimerPrompt, .startTimer: return symbolIcon("timer")
         case .screenshot:               return symbolIcon("camera")
+        case .whereIs:                  return symbolIcon("sparkles")
         case .hint:                     return symbolIcon("info.circle")
         }
     }
@@ -952,6 +1256,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         let tf = NSTextField(labelWithString: "")
         tf.font = .systemFont(ofSize: 14)
         tf.lineBreakMode = .byTruncatingTail
+        tf.maximumNumberOfLines = 2
         tf.cell?.truncatesLastVisibleLine = true
         tf.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(tf)
@@ -980,6 +1285,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         // means the user chose to type — hand off from voice to keyboard so
         // partials stop overwriting what they're typing.
         if voice.isListening { voice.stop() }
+        if state == .asking || state == .answered {
+            leaveWhereIs()
+            state = .browsing
+            applyModeChrome()
+        }
         applyFilter(searchField.stringValue)
     }
 

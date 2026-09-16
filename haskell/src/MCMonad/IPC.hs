@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 10
+protocolVersion = 11
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -100,6 +100,10 @@ data Command
       -- behaves like 'ShowWindowPicker'. @Tab@ cycles modes once open.
       -- Window selection returns as a 'MenuFocusWindow' event; app launch
       -- and timers are handled daemon-side and need no reply.
+    | SetOcrIndex !Bool
+      -- ^ Turn the daemon's in-memory OCR index of displayed windows on or
+      -- off ('MCMonad.Config.ocrIndex'). Sent once at startup; the text
+      -- it gathers never comes back over this socket.
     | SetTimers [Timer]
       -- ^ Authoritative list of running countdown timers. The brain owns
       -- timer state and resends the whole list whenever it changes (and
@@ -270,6 +274,10 @@ instance Aeson.ToJSON Command where
     toJSON (SetTimers ts) = Aeson.object
         [ "cmd"    .= ("set-timers" :: Text)
         , "timers" .= map timerJSON ts
+        ]
+    toJSON (SetOcrIndex on) = Aeson.object
+        [ "cmd" .= ("set-ocr-index" :: Text)
+        , "on"  .= on
         ]
 
 -- | Wire encoding of one 'Timer'. 'tmFireAt' is absolute POSIX epoch

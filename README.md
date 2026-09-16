@@ -128,6 +128,37 @@ starts another 10-minute countdown; Peek after a 5-minute Snooze restarts those
 5 minutes. Existing state files remain readable; timers saved before duration
 tracking can still fire, Snooze, and Jump, but Peek is disabled for those timers.
 
+**Every list is most-recently-used first.** Windows, apps and builtin
+commands all sort by when you last focused or ran them; typing re-ranks by
+match, with recency breaking ties.
+
+**Window search reads inside windows.** mcmonad-core keeps an OCR index of
+every window on the displayed workspaces: each is captured through
+ScreenCaptureKit (the window's own buffer, so a covered window still reads
+whole) and read with Vision whenever its pixels change, and again each time
+the launcher opens. A query that matches no title is then matched against
+that text; such rows show the matching line beneath the title with the words
+highlighted. The index is **on by default** and needs the *Screen & System
+Audio Recording* permission for `MCMonadCore.app` — the first run lists the
+app in that pane and opens it; tick it and the index starts on the next cycle.
+Opt out with `ocrIndex = False` in `mcmonad.hs`.
+
+Everything read off the framebuffer stays in mcmonad-core's memory. It is
+never written to disk, never logged, and never sent to the Haskell brain.
+
+**"where is …" asks Claude.** Type or say `where is the deploy terminal`
+(`where's`, `where are`, `where did I put` work too) in either mode and
+press Return. The launcher hands the question, together with every window
+(workspace, app, title, focus, and an excerpt of its recognised text) to the
+Claude Code CLI already installed on the Mac — `claude -p`, model
+`claude-fable-5-1` at low effort, no tools, session persistence off — and
+shows the whole exchange while it thinks: the exact command line, the prompt
+as sent, and the answer as it streams, over a muted spinner. The result is a
+list of windows with their workspace and the model's one-line reason, the
+question's words highlighted in it; Return focuses one, Esc goes back to the
+query. The CLI must be logged in; it is looked for in `~/.local/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` and `PATH`.
+
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first
 keystroke hands off to the keyboard (so dictation never fights your typing);

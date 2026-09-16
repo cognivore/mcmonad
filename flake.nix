@@ -61,6 +61,14 @@
                 Tests/ScreenshotCommandChecks.swift \
                 -o .build/screenshot-command-checks
               .build/screenshot-command-checks
+              /usr/bin/swiftc -swift-version 6 \
+                Sources/MCMonadCore/IPC/Protocol.swift \
+                Sources/MCMonadCore/Index/TextSearch.swift \
+                Sources/MCMonadCore/Launcher/RecentUse.swift \
+                Sources/MCMonadCore/Launcher/WhereIsProtocol.swift \
+                Tests/LauncherLogicChecks.swift \
+                -o .build/launcher-logic-checks
+              .build/launcher-logic-checks
               runHook postCheck
             '';
             installPhase = ''

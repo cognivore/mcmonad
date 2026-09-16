@@ -104,11 +104,29 @@ McMonad ships a Spotlight-style overlay — one floating panel with switchable
 `↑`/`↓` move the selection, `Return` activates it, `Esc` cancels (restoring the
 window you came from).
 
+**Screenshots work in either mode**, including the `Opt+Shift+P` menu. Type
+`screenshot` (or `scr`) and press Return to open the native macOS capture tools.
+Prefix the name with seconds — `3 scr` or `3 screenshot` — to select a region,
+then capture it 3 seconds after releasing the mouse. Press Esc during selection
+to cancel. The selection overlay closes and restores the previous window before
+the countdown starts. Captures use macOS's native timer, thumbnail, and configured
+save destination; delays are non-negative whole seconds and do not block the WM.
+On the first timed capture, macOS may ask for **Screen & System Audio Recording**
+access for `MCMonadCore.app`. Enable it, then retry the command. This permission
+is separate from Accessibility and from any grant to the Haskell process.
+
 **Running timers live in the menu bar.** While any timer is counting down, a
 `⏱ 14:32` item appears in the menu bar showing the soonest one; its dropdown
 lists every running timer and lets you cancel them. When a timer finishes it
 chimes and a "time's up" banner appears. No timers running → no menu-bar
 clutter.
+
+The reminder offers **Snooze 5 min**, **Jump**, **Peek**, and **Dismiss**.
+**Peek** jumps to the timer's origin workspace and restarts the interval that
+just fired, keeping its description. For example, Peek on `timer 10 check build`
+starts another 10-minute countdown; Peek after a 5-minute Snooze restarts those
+5 minutes. Existing state files remain readable; timers saved before duration
+tracking can still fire, Snooze, and Jump, but Peek is disabled for those timers.
 
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first

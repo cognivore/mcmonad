@@ -65,6 +65,12 @@ final class ScreenIndex {
     private var scheduled = false
     private var inFlight = false
     private var openedSettings = false
+    /// Consecutive cycles the preflight said "not granted". A deploy replaces
+    /// and re-signs the bundle under the still-running old daemon, whose
+    /// preflight then fails for a few seconds before the launcher kills it;
+    /// acting on one failed check turned every deploy into a system prompt.
+    private var deniedCycles = 0
+    private static let deniedCyclesBeforeAsking = 3
 
     /// Fires after a cycle that changed at least one entry.
     var onUpdated: (() -> Void)?
@@ -124,9 +130,11 @@ final class ScreenIndex {
     private func cycle() async {
         guard isEnabled, !inFlight else { return }
         guard CGPreflightScreenCaptureAccess() else {
-            markDenied()
+            deniedCycles += 1
+            if deniedCycles >= Self.deniedCyclesBeforeAsking { markDenied() }
             return
         }
+        deniedCycles = 0
         if availability == .denied { availability = .ready }
         inFlight = true
         defer { inFlight = false }
@@ -209,12 +217,12 @@ final class ScreenIndex {
             availability = .denied
             Self.logger.error("Screen index needs Screen & System Audio Recording for MCMonadCore.app (System Settings ▸ Privacy & Security).")
         }
-        // On macOS 26 CGRequestScreenCaptureAccess prompts nothing; a
-        // ScreenCaptureKit query is what lists the app in the pane, unticked.
-        // Do that once per process and open the pane so the user can tick it.
+        // Sustained denial: list the app in the pane (a ScreenCaptureKit
+        // query does that) and open the pane, once per process. No
+        // CGRequestScreenCaptureAccess: its dialog is what a deploy's
+        // dying old daemon used to pop.
         guard !openedSettings else { return }
         openedSettings = true
-        CGRequestScreenCaptureAccess()
         Task { @MainActor in
             await Self.registerInScreenRecordingPane()
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {

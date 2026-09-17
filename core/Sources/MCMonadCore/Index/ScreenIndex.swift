@@ -134,7 +134,7 @@ final class ScreenIndex {
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
         // A sweep that hit the per-cycle cap is not over: the next cycle
         // continues it instead of waiting another `hiddenSweep`.
-        if sweepHidden, !exhausted { lastHiddenSweep = Date() }
+        if sweepHidden, exhausted { lastHiddenSweep = Date() }
         for (id, r) in readings {
             entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, imageHash: r.hash)
         }

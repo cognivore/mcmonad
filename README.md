@@ -133,10 +133,13 @@ commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.
 
 **Window search reads inside windows.** mcmonad-core keeps an OCR index of
-every window on the displayed workspaces: each is captured through
-ScreenCaptureKit (the window's own buffer, so a covered window still reads
-whole) and read with Vision whenever its pixels change, and again each time
-the launcher opens. A query that matches no title is then matched against
+every window it manages, displayed or parked on a hidden workspace: each is
+captured through ScreenCaptureKit (the window's own buffer, so a covered or
+parked window reads like a visible one) and read with Vision whenever its
+pixels change — displayed windows are checked every six seconds and on every
+layout or focus change, hidden ones every thirty seconds, at most six
+recognitions per cycle so a big sweep spreads out — and again each time the
+launcher opens. A query that matches no title is then matched against
 that text; such rows show the matching line beneath the title with the words
 highlighted. The index is **on by default** and needs the *Screen & System
 Audio Recording* permission for `MCMonadCore.app` — the first run lists the

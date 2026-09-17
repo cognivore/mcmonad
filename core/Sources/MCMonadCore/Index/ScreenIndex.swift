@@ -3,9 +3,10 @@ import ScreenCaptureKit
 import Vision
 import os
 
-/// An in-memory index of the text on every window the WM currently
-/// displays, read off their pixels with Vision, so the launcher can search
-/// inside windows and the "where is" question can cite their contents.
+/// An in-memory index of the text on every window the WM manages — the
+/// displayed ones and the ones parked on hidden workspaces — read off their
+/// pixels with Vision, so the launcher can search inside windows and the
+/// "where is" / "what's up" questions can cite their contents.
 ///
 /// Privacy contract, in one place: what comes off the framebuffer stays in
 /// this process's memory. Captures are `CGImage`s that die with the cycle;
@@ -13,11 +14,13 @@ import os
 /// persisted, or sent over the IPC socket. The brain only ever says on/off.
 ///
 /// Capture is ScreenCaptureKit's per-window screenshot (the window's own
-/// buffer, so a partly covered window still reads whole), never the
-/// `screencapture` tool (which writes a file). Recognition is understudy's
-/// Vision setup: accurate level, language correction, reading order by line.
-/// A window is re-read only when its pixels changed (byte hash), so a quiet
-/// desktop costs nothing between cycles.
+/// buffer, so a covered or parked window reads just like a visible one),
+/// never the `screencapture` tool (which writes a file). Recognition is
+/// understudy's Vision setup: accurate level, language correction, reading
+/// order by line. A window is re-read only when its pixels changed (byte
+/// hash), so a quiet desktop costs nothing between cycles. Displayed windows
+/// are checked every cycle; hidden ones every `hiddenSweep`, displayed first,
+/// at most `readsPerCycle` recognitions per cycle so a big sweep spreads out.
 @MainActor
 final class ScreenIndex {
     nonisolated private static let logger = Logger(subsystem: "com.mcmonad.core", category: "ScreenIndex")
@@ -40,10 +43,16 @@ final class ScreenIndex {
         fileprivate let imageHash: Int
     }
 
+    static let hiddenSweep: TimeInterval = 30
+    static let readsPerCycle = 6
+
     private(set) var availability: Availability = .disabled
     private var entries: [UInt32: Entry] = [:]
     /// Windows on displayed workspaces, per the brain's latest snapshot.
     private var visible: [UInt32] = []
+    /// Windows parked on hidden workspaces, per the same snapshot.
+    private var hidden: [UInt32] = []
+    private var lastHiddenSweep = Date.distantPast
     private var periodic: Timer?
     private var scheduled = false
     private var inFlight = false
@@ -77,13 +86,14 @@ final class ScreenIndex {
         }
     }
 
-    /// The brain's view of what is displayed. Entries for windows that are
-    /// gone from every workspace are dropped; the rest stay until re-read.
+    /// The brain's view of every window it manages. Entries for windows
+    /// that are gone from every workspace are dropped; the rest stay until
+    /// re-read.
     func noteSnapshot(_ snapshot: OverlaySnapshot) {
         guard isEnabled else { return }
         visible = snapshot.screens.flatMap { $0.windows.map(\.windowId) }
-        var all = Set(visible)
-        for ws in snapshot.hiddenWorkspaces { for w in ws.windows { all.insert(w.windowId) } }
+        hidden = snapshot.hiddenWorkspaces.flatMap { $0.windows.map(\.windowId) }
+        let all = Set(visible).union(hidden)
         for id in entries.keys where !all.contains(id) { entries.removeValue(forKey: id) }
         requestSoon()
     }
@@ -113,15 +123,24 @@ final class ScreenIndex {
         inFlight = true
         defer { inFlight = false }
 
+        // Displayed windows every cycle; the parked ones ride along every
+        // `hiddenSweep`, after the displayed ones so they never delay them.
+        var ids = visible
+        let sweepHidden = Date().timeIntervalSince(lastHiddenSweep) >= Self.hiddenSweep
+        if sweepHidden { ids += hidden.filter { !visible.contains($0) } }
         let known = entries.mapValues(\.imageHash)
         let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        let readings = await Self.read(ids: visible, knownHashes: known, scale: scale)
+        let (readings, exhausted) = await Self.read(ids: ids, knownHashes: known, scale: scale, limit: Self.readsPerCycle)
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
+        // A sweep that hit the per-cycle cap is not over: the next cycle
+        // continues it instead of waiting another `hiddenSweep`.
+        if sweepHidden, !exhausted { lastHiddenSweep = Date() }
         for (id, r) in readings {
             entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, imageHash: r.hash)
         }
         if !readings.isEmpty {
-            Self.logger.info("screen index: re-read \(readings.count, privacy: .public) of \(self.visible.count, privacy: .public) displayed windows")
+            let hiddenRead = readings.keys.filter { !visible.contains($0) }.count
+            Self.logger.info("screen index: re-read \(readings.count, privacy: .public) window(s) (\(readings.count - hiddenRead, privacy: .public) of \(self.visible.count, privacy: .public) displayed, \(hiddenRead, privacy: .public) of \(self.hidden.count, privacy: .public) hidden)")
             onUpdated?()
         }
     }
@@ -135,18 +154,22 @@ final class ScreenIndex {
     /// Off the main actor end to end. ScreenCaptureKit's content and
     /// windows, the captured image and Vision's observations are not
     /// Sendable, so none of them come back; only readings for windows
-    /// whose pixels differ from `knownHashes` do.
-    private nonisolated static func read(ids: [UInt32], knownHashes: [UInt32: Int], scale: CGFloat) async -> [UInt32: Reading] {
+    /// whose pixels differ from `knownHashes` do — at most `limit` of them,
+    /// in the order given. The flag says whether `ids` was fully examined
+    /// (false: the cap stopped the pass and some ids were never captured).
+    private nonisolated static func read(ids: [UInt32], knownHashes: [UInt32: Int], scale: CGFloat, limit: Int) async -> ([UInt32: Reading], Bool) {
         let content: SCShareableContent
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            // Parked windows sit 1 px on screen; ask for everything anyway.
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         } catch {
             logger.error("shareable content: \(error.localizedDescription, privacy: .public)")
-            return [:]
+            return ([:], false)
         }
         let byId = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { a, _ in a })
         var out: [UInt32: Reading] = [:]
         for id in ids {
+            if out.count >= limit { return (out, false) }
             guard let window = byId[id], window.frame.width >= 8, window.frame.height >= 8 else { continue }
             let cfg = SCStreamConfiguration()
             cfg.width = Int(window.frame.width * scale)
@@ -166,7 +189,7 @@ final class ScreenIndex {
             if knownHashes[id] == hash { continue }
             out[id] = Reading(hash: hash, text: recognise(image).joined(separator: "\n"))
         }
-        return out
+        return (out, true)
     }
 
     private func markDenied() {

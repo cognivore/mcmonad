@@ -198,24 +198,26 @@ final class WhatsUpCache {
         if !due().isEmpty { scheduleBackgroundRefresh() }
     }
 
-    /// Fold an answer in. A workspace whose fingerprint moved during the
-    /// call keeps its new summary but stays stale, so it is asked again. A
-    /// workspace the model left out counts as answered too — with no
-    /// summary — or it would be due again on the next report, forever.
+    /// Fold an answer in. Every asked workspace counts as answered — one the
+    /// model left out gets no summary, or it would be due again on the next
+    /// report, forever. A workspace whose fingerprint moved during the call
+    /// keeps its new summary and is stale by what moved: a changed window
+    /// set is due at once, changed text waits for the age gate. (It cannot
+    /// stay at its initial staleness: parked windows are read a dozen at a
+    /// time while a call is in flight, and that would ask again every time.)
     func apply(_ summaries: [WhatsUp.Summary], asked: [String: Fingerprint], at now: Date = Date()) {
-        var answered = Set<String>()
-        for s in summaries {
-            guard var e = entries[s.tag] else { continue }
-            e.summary = s
-            e.summarisedAt = now
-            if asked[s.tag] == e.fingerprint { e.staleness = .fresh }
-            entries[s.tag] = e
-            answered.insert(s.tag)
-        }
-        for (tag, fp) in asked where !answered.contains(tag) {
+        let byTag = Dictionary(summaries.map { ($0.tag, $0) }, uniquingKeysWith: { a, _ in a })
+        for (tag, fp) in asked {
             guard var e = entries[tag] else { continue }
+            if let s = byTag[tag] { e.summary = s }
             e.summarisedAt = now
-            if e.fingerprint == fp { e.staleness = .fresh }
+            if e.fingerprint == fp {
+                e.staleness = .fresh
+            } else if e.fingerprint.structure != fp.structure {
+                e.staleness = .structureChanged
+            } else {
+                e.staleness = .textChanged
+            }
             entries[tag] = e
         }
     }

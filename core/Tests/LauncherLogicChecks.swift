@@ -216,11 +216,15 @@ enum LauncherLogicChecks {
         precondition(cache.due(at: t0.addingTimeInterval(60)).isEmpty, "omitted tag is fresh")
         precondition(cache.rows[1].summary == nil && cache.rows[1].tag == "o5", "row stays, without a summary")
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [])]))
-        // An answer for a fingerprint that moved meanwhile keeps the workspace stale.
-        let stale = ["3": WhatsUpCache.Fingerprint(structure: 0, text: 0)]
-        cache.apply([.init(tag: "3", summary: "Later.", reason: "r")], asked: stale, at: t0)
-        precondition(cache.rows[0].summary?.summary == "Later." && cache.due(at: t0.addingTimeInterval(WhatsUpCache.textRefreshAge)) == ["3"])
-        precondition(cache.due(at: t0).isEmpty, "a moved-but-young text summary waits for the age gate")
+        // An answer for a fingerprint whose TEXT moved meanwhile keeps the summary and waits for the age gate…
+        let fp3 = cache.entries["3"]!.fingerprint
+        cache.apply([.init(tag: "3", summary: "Later.", reason: "r")], asked: ["3": WhatsUpCache.Fingerprint(structure: fp3.structure, text: 0)], at: t0)
+        precondition(cache.rows[0].summary?.summary == "Later.")
+        precondition(cache.due(at: t0).isEmpty, "text moved during the call: not due until the age gate")
+        precondition(cache.due(at: t0.addingTimeInterval(WhatsUpCache.textRefreshAge)) == ["3"])
+        // …whereas a moved window set is due at once.
+        cache.apply([.init(tag: "3", summary: "Later2.", reason: "r")], asked: ["3": WhatsUpCache.Fingerprint(structure: 0, text: fp3.text)], at: t0)
+        precondition(cache.due(at: t0) == ["3"], "window set moved during the call: due now")
     }
 
     // MARK: RecentUse

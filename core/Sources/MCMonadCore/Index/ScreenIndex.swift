@@ -17,8 +17,9 @@ import os
 /// buffer, so a covered or parked window reads just like a visible one),
 /// never the `screencapture` tool (which writes a file). Recognition is
 /// understudy's Vision setup: accurate level, language correction, reading
-/// order by line. A window is re-read only when its pixels changed (byte
-/// hash), so a quiet desktop costs nothing between cycles. Displayed windows
+/// order by line. A window is re-read only when its picture changed by more
+/// than a cursor blink (a coarse grey thumbnail, compared cell by cell), so a
+/// quiet desktop costs nothing between cycles. Displayed windows
 /// are checked every cycle; hidden ones every `hiddenSweep`, displayed first,
 /// at most `readsPerCycle` recognitions per cycle so a big sweep spreads out.
 @MainActor
@@ -40,11 +41,16 @@ final class ScreenIndex {
         let lower: String
         /// Changes when the words change; the "what's up" cache keys on it.
         let textHash: Int
-        fileprivate let imageHash: Int
+        /// The coarse grey thumbnail the text was read from.
+        fileprivate let thumb: [UInt8]
     }
 
     static let hiddenSweep: TimeInterval = 30
     static let readsPerCycle = 6
+    /// Thumbnail side, and how much of it must differ before a re-read: a
+    /// blinking cursor or a clock digit is a cell or two of 1024.
+    nonisolated static let thumbSide = 32
+    nonisolated static let changedFraction = 0.01
 
     private(set) var availability: Availability = .disabled
     private var entries: [UInt32: Entry] = [:]
@@ -134,13 +140,13 @@ final class ScreenIndex {
             hiddenQueue = hidden.filter { !visible.contains($0) }
         }
         let ids = visible + hiddenQueue
-        let known = entries.mapValues(\.imageHash)
+        let known = entries.mapValues(\.thumb)
         let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        let (readings, examined) = await Self.read(ids: ids, knownHashes: known, scale: scale, limit: Self.readsPerCycle)
+        let (readings, examined) = await Self.read(ids: ids, knownThumbs: known, scale: scale, limit: Self.readsPerCycle)
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
         hiddenQueue.removeAll { examined.contains($0) }
         for (id, r) in readings {
-            entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, imageHash: r.hash)
+            entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, thumb: r.thumb)
         }
         if !readings.isEmpty {
             let hiddenRead = readings.keys.filter { !visible.contains($0) }.count
@@ -151,17 +157,17 @@ final class ScreenIndex {
 
     /// One window's pixels, reduced to what may leave the reading thread.
     private struct Reading: Sendable {
-        let hash: Int
+        let thumb: [UInt8]
         let text: String
     }
 
     /// Off the main actor end to end. ScreenCaptureKit's content and
     /// windows, the captured image and Vision's observations are not
     /// Sendable, so none of them come back; only readings for windows
-    /// whose pixels differ from `knownHashes` do — at most `limit` of them,
+    /// whose picture differs from `knownThumbs` do — at most `limit` of them,
     /// in the order given — plus the set of ids that were examined before
     /// the cap stopped the pass (a window not capturable counts as examined).
-    private nonisolated static func read(ids: [UInt32], knownHashes: [UInt32: Int], scale: CGFloat, limit: Int) async -> ([UInt32: Reading], Set<UInt32>) {
+    private nonisolated static func read(ids: [UInt32], knownThumbs: [UInt32: [UInt8]], scale: CGFloat, limit: Int) async -> ([UInt32: Reading], Set<UInt32>) {
         let content: SCShareableContent
         do {
             // Parked windows sit 1 px on screen; ask for everything anyway.
@@ -191,9 +197,9 @@ final class ScreenIndex {
                 logger.debug("capture wid=\(id) failed: \(error.localizedDescription, privacy: .public)")
                 continue
             }
-            let hash = hash(image)
-            if knownHashes[id] == hash { continue }
-            out[id] = Reading(hash: hash, text: recognise(image).joined(separator: "\n"))
+            let thumb = thumbprint(image)
+            if let old = knownThumbs[id], !changed(old, thumb) { continue }
+            out[id] = Reading(thumb: thumb, text: recognise(image).joined(separator: "\n"))
         }
         return (out, examined)
     }
@@ -241,19 +247,28 @@ final class ScreenIndex {
         return TextSearch.readingOrder(observations)
     }
 
-    /// A cheap fingerprint of the pixels: every 61st byte plus the length.
-    /// Enough to notice a repaint; far cheaper than the OCR it gates.
-    private nonisolated static func hash(_ image: CGImage) -> Int {
-        guard let data = image.dataProvider?.data else { return 0 }
-        let count = CFDataGetLength(data)
-        guard let bytes = CFDataGetBytePtr(data) else { return count }
-        var hasher = Hasher()
-        hasher.combine(count)
-        var i = 0
-        while i < count {
-            hasher.combine(bytes[i])
-            i += 61
+    /// The window as a `thumbSide`² grey thumbnail: cheap to make, and
+    /// coarse enough that a cursor or a clock does not count as a repaint.
+    private nonisolated static func thumbprint(_ image: CGImage) -> [UInt8] {
+        let side = thumbSide
+        var pixels = [UInt8](repeating: 0, count: side * side)
+        pixels.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(
+                data: buf.baseAddress, width: side, height: side, bitsPerComponent: 8,
+                bytesPerRow: side, space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return }
+            ctx.interpolationQuality = .low
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
         }
-        return hasher.finalize()
+        return pixels
+    }
+
+    /// True when more than `changedFraction` of the cells moved noticeably.
+    private nonisolated static func changed(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+        guard a.count == b.count, !a.isEmpty else { return true }
+        var moved = 0
+        for i in a.indices where abs(Int(a[i]) - Int(b[i])) > 24 { moved += 1 }
+        return Double(moved) / Double(a.count) > changedFraction
     }
 }

@@ -922,7 +922,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             if let s = r.summary {
                 head = s.summary + (r.refreshing ? "   (refreshing…)" : "")
             } else {
-                head = r.refreshing ? "summarising…" : "not summarised yet"
+                head = r.refreshing ? "summarising…" : "no summary given"
             }
             return Item(
                 title: "\(r.tag)   ·  \(head)",

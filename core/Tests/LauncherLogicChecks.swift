@@ -209,6 +209,13 @@ enum LauncherLogicChecks {
         // A workspace that lost every window is gone from the rows.
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [])]))
         precondition(cache.order == ["3"] && cache.entries["o5"] == nil)
+        // A workspace the model left out is not asked again until it changes.
+        cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [w(9, "Chrome", "cats"), w(10, "Slack", "geo")])]))
+        precondition(cache.due(at: t0) == ["o5"])
+        cache.apply([], asked: ["o5": cache.entries["o5"]!.fingerprint], at: t0)
+        precondition(cache.due(at: t0.addingTimeInterval(60)).isEmpty, "omitted tag is fresh")
+        precondition(cache.rows[1].summary == nil && cache.rows[1].tag == "o5", "row stays, without a summary")
+        cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy done")])], [("o5", [])]))
         // An answer for a fingerprint that moved meanwhile keeps the workspace stale.
         let stale = ["3": WhatsUpCache.Fingerprint(structure: 0, text: 0)]
         cache.apply([.init(tag: "3", summary: "Later.", reason: "r")], asked: stale, at: t0)

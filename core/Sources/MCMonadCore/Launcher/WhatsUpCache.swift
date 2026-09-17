@@ -47,6 +47,9 @@ final class WhatsUpCache {
     static let quietPeriod: TimeInterval = 3
     static let minGap: TimeInterval = 20
     static let textRefreshAge: TimeInterval = 600
+    /// A summary needs far less of each window's text than a search does.
+    static let textBudget = 40_000
+    static let textPerWindow = 500
 
     private(set) var entries: [String: Entry] = [:]
     /// Workspaces with windows, on-screen first — the manifold's order.
@@ -173,7 +176,8 @@ final class WhatsUpCache {
             }
             return
         }
-        let manifold = Ask.manifold(question: WhatsUp.question, snapshot: snap, text: text, only: tags)
+        let manifold = Ask.manifold(question: WhatsUp.question, snapshot: snap, text: text, only: tags,
+                                    budget: Self.textBudget, perWindow: Self.textPerWindow)
         for tag in tags { inFlight[tag] = entries[tag]?.fingerprint }
         let known = manifold.tags
         runner.start(prompt: Ask.prompt(for: manifold), arguments: WhatsUp.arguments) {
@@ -195,14 +199,24 @@ final class WhatsUpCache {
     }
 
     /// Fold an answer in. A workspace whose fingerprint moved during the
-    /// call keeps its new summary but stays stale, so it is asked again.
+    /// call keeps its new summary but stays stale, so it is asked again. A
+    /// workspace the model left out counts as answered too — with no
+    /// summary — or it would be due again on the next report, forever.
     func apply(_ summaries: [WhatsUp.Summary], asked: [String: Fingerprint], at now: Date = Date()) {
+        var answered = Set<String>()
         for s in summaries {
             guard var e = entries[s.tag] else { continue }
             e.summary = s
             e.summarisedAt = now
             if asked[s.tag] == e.fingerprint { e.staleness = .fresh }
             entries[s.tag] = e
+            answered.insert(s.tag)
+        }
+        for (tag, fp) in asked where !answered.contains(tag) {
+            guard var e = entries[tag] else { continue }
+            e.summarisedAt = now
+            if e.fingerprint == fp { e.staleness = .fresh }
+            entries[tag] = e
         }
     }
 }

@@ -132,7 +132,10 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine(delta, known: known) == .delta("{\"matches\":["))
         let textDelta = #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#
         precondition(WhereIs.parseLine(textDelta, known: known) == .delta("hi"))
-        precondition(WhereIs.parseLine(#"{"type":"system","subtype":"init"}"#, known: known) == .ignore)
+        precondition(WhereIs.parseLine(#"{"type":"system","subtype":"init","model":"m"}"#, known: known) == .note("system init model=m"))
+        precondition(WhereIs.parseLine(#"{"type":"stream_event","event":{"type":"message_start"}}"#, known: known) == .note("message_start"))
+        precondition(WhereIs.parseLine(#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#, known: known) == .note("rate_limit allowed"))
+        precondition(WhereIs.parseLine(#"{"type":"assistant","message":{}}"#, known: known) == .note("assistant message"))
         precondition(WhereIs.parseLine("not json", known: known) == .ignore)
         precondition(WhereIs.parseLine("", known: known) == .ignore)
 

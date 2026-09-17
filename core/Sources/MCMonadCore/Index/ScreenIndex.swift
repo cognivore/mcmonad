@@ -52,7 +52,9 @@ final class ScreenIndex {
     private var visible: [UInt32] = []
     /// Windows parked on hidden workspaces, per the same snapshot.
     private var hidden: [UInt32] = []
-    private var lastHiddenSweep = Date.distantPast
+    /// The current sweep's remaining parked windows, drained a few per cycle.
+    private var hiddenQueue: [UInt32] = []
+    private var hiddenSweepStarted = Date.distantPast
     private var periodic: Timer?
     private var scheduled = false
     private var inFlight = false
@@ -123,18 +125,20 @@ final class ScreenIndex {
         inFlight = true
         defer { inFlight = false }
 
-        // Displayed windows every cycle; the parked ones ride along every
-        // `hiddenSweep`, after the displayed ones so they never delay them.
-        var ids = visible
-        let sweepHidden = Date().timeIntervalSince(lastHiddenSweep) >= Self.hiddenSweep
-        if sweepHidden { ids += hidden.filter { !visible.contains($0) } }
+        // Displayed windows every cycle. Parked ones are swept once per
+        // `hiddenSweep`: the sweep queues them all and each cycle drains as
+        // many as the cap leaves after the displayed ones, so every parked
+        // window is examined about once per sweep and never more often.
+        if hiddenQueue.isEmpty, Date().timeIntervalSince(hiddenSweepStarted) >= Self.hiddenSweep {
+            hiddenSweepStarted = Date()
+            hiddenQueue = hidden.filter { !visible.contains($0) }
+        }
+        let ids = visible + hiddenQueue
         let known = entries.mapValues(\.imageHash)
         let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        let (readings, exhausted) = await Self.read(ids: ids, knownHashes: known, scale: scale, limit: Self.readsPerCycle)
+        let (readings, examined) = await Self.read(ids: ids, knownHashes: known, scale: scale, limit: Self.readsPerCycle)
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
-        // A sweep that hit the per-cycle cap is not over: the next cycle
-        // continues it instead of waiting another `hiddenSweep`.
-        if sweepHidden, exhausted { lastHiddenSweep = Date() }
+        hiddenQueue.removeAll { examined.contains($0) }
         for (id, r) in readings {
             entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, imageHash: r.hash)
         }
@@ -155,21 +159,23 @@ final class ScreenIndex {
     /// windows, the captured image and Vision's observations are not
     /// Sendable, so none of them come back; only readings for windows
     /// whose pixels differ from `knownHashes` do — at most `limit` of them,
-    /// in the order given. The flag says whether `ids` was fully examined
-    /// (false: the cap stopped the pass and some ids were never captured).
-    private nonisolated static func read(ids: [UInt32], knownHashes: [UInt32: Int], scale: CGFloat, limit: Int) async -> ([UInt32: Reading], Bool) {
+    /// in the order given — plus the set of ids that were examined before
+    /// the cap stopped the pass (a window not capturable counts as examined).
+    private nonisolated static func read(ids: [UInt32], knownHashes: [UInt32: Int], scale: CGFloat, limit: Int) async -> ([UInt32: Reading], Set<UInt32>) {
         let content: SCShareableContent
         do {
             // Parked windows sit 1 px on screen; ask for everything anyway.
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         } catch {
             logger.error("shareable content: \(error.localizedDescription, privacy: .public)")
-            return ([:], false)
+            return ([:], [])
         }
         let byId = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { a, _ in a })
         var out: [UInt32: Reading] = [:]
+        var examined = Set<UInt32>()
         for id in ids {
-            if out.count >= limit { return (out, false) }
+            if out.count >= limit { return (out, examined) }
+            examined.insert(id)
             guard let window = byId[id], window.frame.width >= 8, window.frame.height >= 8 else { continue }
             let cfg = SCStreamConfiguration()
             cfg.width = Int(window.frame.width * scale)
@@ -189,7 +195,7 @@ final class ScreenIndex {
             if knownHashes[id] == hash { continue }
             out[id] = Reading(hash: hash, text: recognise(image).joined(separator: "\n"))
         }
-        return (out, true)
+        return (out, examined)
     }
 
     private func markDenied() {

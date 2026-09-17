@@ -160,6 +160,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private var askQuestion = ""
     /// The answered rows are the "what's up" cache; re-render on its updates.
     private var showingWhatsUp = false
+    /// While asking: when the call started, and a 1 s tick for the hint and
+    /// the deadline.
+    private var askStarted = Date()
+    private var askTicker: Timer?
+    private static let askDeadline: TimeInterval = 120
     private let voice = VoiceInput()
     private var voiceAuthorized: Bool?      // nil = not yet requested
     /// While true, a resign-key (e.g. the system mic/speech permission prompt
@@ -379,7 +384,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .timerPrompt:
             hintLabel.stringValue = "↩ start · ⇥ back\(voiceHint) · esc cancel"
         case .asking:
-            hintLabel.stringValue = "asking \(Ask.model) at \(Ask.effort) effort · esc cancel"
+            let secs = Int(Date().timeIntervalSince(askStarted))
+            hintLabel.stringValue = "asking \(Ask.model) at \(Ask.effort) effort · \(secs) s · esc cancel"
         case .answered:
             hintLabel.stringValue = "↩ select · esc back"
         case .browsing:
@@ -610,6 +616,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         self.transcriptView = tv
 
         askRunner.onTranscript = { [weak self] text in self?.appendTranscript(text) }
+        askRunner.onNote = { [weak self] text in self?.appendTranscript("\n· \(text)\n") }
         askRunner.onFinished = { [weak self] outcome in self?.finishAsk(outcome) }
 
         wireVoice()
@@ -953,6 +960,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         askQuestion = question
         showingWhatsUp = false
         state = .asking
+        askStarted = Date()
+        askTicker?.invalidate()
+        askTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.askTick() }
+        }
         filtered = []
         tableView.reloadData()
         applyModeChrome()
@@ -971,14 +983,30 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         )
         let prompt = Ask.prompt(for: manifold)
         let cli = AskRunner.locateCLI() ?? "claude"
+        let windows = manifold.workspaces.reduce(0) { $0 + $1.windows.count }
         appendTranscript("→ \(cli) " + arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
-        appendTranscript("→ stdin:\n\(prompt)\n\n← ")
+        appendTranscript("→ stdin (\(prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces):\n\(prompt)\n\n← ")
         askRunner.start(prompt: prompt, arguments: arguments, parse: parse(manifold))
+    }
+
+    /// Once a second while asking: the hint counts up; past the deadline the
+    /// call is given up as failed rather than left looking stuck.
+    private func askTick() {
+        guard state == .asking else { askTicker?.invalidate(); askTicker = nil; return }
+        if Date().timeIntervalSince(askStarted) >= Self.askDeadline {
+            askRunner.cancel()
+            finishAsk(.failed("no answer within \(Int(Self.askDeadline)) s; the call was stopped"))
+            return
+        }
+        updateHint()
     }
 
     private func finishAsk(_ outcome: Ask.Outcome) {
         spinner.stop()
+        askTicker?.invalidate()
+        askTicker = nil
         guard state == .asking else { return }
+        appendTranscript("\n· done in \(Int(Date().timeIntervalSince(askStarted))) s\n")
         state = .answered
         switch outcome {
         case .answered(.windows(let matches, let dropped)):
@@ -1028,6 +1056,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// Stop any question in flight and put the results table back.
     private func leaveWhereIs() {
         askRunner.cancel()
+        askTicker?.invalidate()
+        askTicker = nil
         spinner.stop()
         showTranscript(false)
         showingWhatsUp = false

@@ -145,9 +145,12 @@ enum Ask {
         /// Text the model produced so far — the structured answer arrives as
         /// JSON fragments, shown as they come.
         case delta(String)
+        /// A protocol event that is not content: shown as one dim line so a
+        /// slow call is visibly alive (init, rate limit, message boundaries).
+        case note(String)
         /// The final result line.
         case final(Outcome)
-        /// Housekeeping we do not show.
+        /// A line that is not JSON.
         case ignore
     }
 
@@ -162,12 +165,24 @@ enum Ask {
         switch type {
         case "stream_event":
             guard let event = obj["event"] as? [String: Any],
-                  event["type"] as? String == "content_block_delta",
-                  let delta = event["delta"] as? [String: Any]
-            else { return .ignore }
-            if let text = delta["partial_json"] as? String { return .delta(text) }
-            if let text = delta["text"] as? String { return .delta(text) }
-            return .ignore
+                  let eventType = event["type"] as? String
+            else { return .note("stream_event") }
+            if eventType == "content_block_delta", let delta = event["delta"] as? [String: Any] {
+                if let text = delta["partial_json"] as? String { return .delta(text) }
+                if let text = delta["text"] as? String { return .delta(text) }
+            }
+            return .note(eventType)
+        case "system":
+            let subtype = (obj["subtype"] as? String) ?? ""
+            let model = (obj["model"] as? String).map { " model=\($0)" } ?? ""
+            let status = (obj["status"] as? String).map { " \($0)" } ?? ""
+            return .note("system \(subtype)\(model)\(status)")
+        case "rate_limit_event":
+            let status = ((obj["rate_limit_info"] as? [String: Any])?["status"] as? String)
+                ?? (obj["status"] as? String) ?? ""
+            return .note("rate_limit \(status)")
+        case "assistant", "user":
+            return .note("\(type) message")
         case "result":
             if obj["is_error"] as? Bool == true {
                 let why = (obj["result"] as? String)
@@ -182,7 +197,7 @@ enum Ask {
             let shown = (obj["result"] as? String) ?? String(line.prefix(400))
             return .final(.malformed(shown))
         default:
-            return .ignore
+            return .note(type)
         }
     }
 }

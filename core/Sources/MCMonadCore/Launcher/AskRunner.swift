@@ -12,6 +12,8 @@ final class AskRunner {
 
     /// Text to append to the on-screen transcript, in order.
     var onTranscript: ((String) -> Void)?
+    /// A protocol event worth a dim line in the transcript.
+    var onNote: ((String) -> Void)?
     /// Fires once per `start`, after which the runner is idle again.
     var onFinished: ((Ask.Outcome) -> Void)?
 
@@ -76,6 +78,7 @@ final class AskRunner {
                         guard let self else { return }
                         switch item {
                         case .delta(let text): self.onTranscript?(text)
+                        case .note(let text): self.onNote?(text)
                         case .final(let outcome): self.finish(outcome)
                         case .ignore: break
                         }

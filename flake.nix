@@ -63,6 +63,7 @@
               .build/screenshot-command-checks
               /usr/bin/swiftc -swift-version 6 \
                 Sources/MCMonadCore/IPC/Protocol.swift \
+                Sources/MCMonadCore/Display/ScreenRoleMap.swift \
                 Sources/MCMonadCore/Index/TextSearch.swift \
                 Sources/MCMonadCore/Launcher/RecentUse.swift \
                 Sources/MCMonadCore/Launcher/AskProtocol.swift \

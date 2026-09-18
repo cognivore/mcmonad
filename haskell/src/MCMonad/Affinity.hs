@@ -104,8 +104,11 @@ viewOn sid tag ws = case W.lookupWorkspace sid ws of
 -- | Give every non-'Primary' screen a workspace that belongs to its role,
 -- unless it already shows one: the workspace last shown on that role if
 -- it is hidden, else the first hidden workspace (in @order@) the rules
--- send there. The screen the user is on is never touched, and focus stays
--- where it was. Run after screens come or go, and at startup.
+-- send there, else one of its workspaces stranded on another screen. The
+-- screen the user is on is never touched, and focus stays where it was.
+-- A screen with no workspace of its own keeps what it has (overflow: some
+-- workspace must be shown). Run after every view, after screens come or
+-- go, and at startup.
 placeForRoles
     :: [AffinityRule]
     -> Map.Map ScreenId ScreenRole      -- ^ role of every attached screen
@@ -127,9 +130,13 @@ placeForRoles rules roles lastOn order ws0 =
         Nothing -> ws
         Just showing
             | resolved showing == role -> ws
-            | otherwise -> maybe ws (\tag -> viewOn sid tag ws) (candidate ws role)
+            | otherwise -> maybe ws (\tag -> viewOn sid tag ws) (candidate ws sid role)
 
-    candidate ws role =
-        let hiddenTags = map W.tag (W.hidden ws)
-        in listToMaybe [ t | t <- maybeToList (Map.lookup role lastOn) ++ order
-                           , t `elem` hiddenTags, resolved t == role ]
+    candidate ws sid role =
+        let hiddenTags  = map W.tag (W.hidden ws)
+            hiddenMates = [ t | t <- maybeToList (Map.lookup role lastOn) ++ order
+                              , t `elem` hiddenTags, resolved t == role ]
+            strayMates  = [ t | s <- W.screens ws
+                              , W.screen s /= sid, W.screen s /= currentSid
+                              , let t = W.tag (W.workspace s), resolved t == role ]
+        in listToMaybe (hiddenMates ++ strayMates)

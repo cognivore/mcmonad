@@ -1524,6 +1524,33 @@ prop_affinity_unplug_replug_round_trip =
        && W.lookupWorkspace (S 2) back == Just "a"
        && invariant back
 
+-- "2" (a primary workspace) sits on the secondary screen as overflow; viewing
+-- it from the primary swaps it home and would strand "1" on the secondary —
+-- the placement pass refills the secondary with a hidden secondary workspace.
+prop_view_then_place_refills_displaced_screen :: Bool
+prop_view_then_place_refills_displaced_screen =
+    let ws = placeForRoles affinityRules' rolesPST Map.empty tags9 (viewOn (S 0) "2" fixture3)
+        res = resolveAffinity affinityRules' (roleSet [Primary, Secondary, Tertiary])
+    in W.lookupWorkspace (S 0) ws == Just "2"
+       && W.screen (W.current ws) == S 0
+       && fmap res (W.lookupWorkspace (S 1) ws) == Just Secondary
+       && "1" `elem` map W.tag (W.hidden ws)
+       && invariant ws
+
+-- With no hidden secondary workspace left, a secondary workspace stranded on
+-- another screen is pulled back; the screen it leaves then takes its own.
+prop_place_pulls_back_stranded_role_mate :: Bool
+prop_place_pulls_back_stranded_role_mate =
+    let rules = [Pin Tertiary ["a"], Pin Secondary ["o"]]
+        tags  = ["1", "2", "o", "a", "3"]          -- S0 "1", S1 "2", S2 "o"; a, 3 hidden
+        ws0   = W.new 0 tags (map snd threeScreens) :: TestStackSet
+        ws    = placeForRoles rules rolesPST Map.empty tags ws0
+    in W.lookupWorkspace (S 1) ws == Just "o"
+       && W.lookupWorkspace (S 2) ws == Just "a"
+       && W.lookupWorkspace (S 0) ws == Just "1"
+       && W.screen (W.current ws) == S 0
+       && invariant ws
+
 prop_role_names_round_trip :: Bool
 prop_role_names_round_trip =
     all (\r -> parseRole (roleName r) == Just r) [minBound .. maxBound]
@@ -1542,6 +1569,8 @@ allProperties =
     , ("affinity: placeForRoles prefers last shown", property prop_placeForRoles_prefers_last_shown)
     , ("affinity: placeForRoles idempotent", property prop_placeForRoles_idempotent)
     , ("affinity: unplug/replug round trip", property prop_affinity_unplug_replug_round_trip)
+    , ("affinity: view then place refills the displaced screen", property prop_view_then_place_refills_displaced_screen)
+    , ("affinity: place pulls back a stranded role-mate", property prop_place_pulls_back_stranded_role_mate)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("ocr-index wire format", property prop_ocr_index_wire)
     , ("timer persistence + legacy snapshot", property prop_timer_persistence)

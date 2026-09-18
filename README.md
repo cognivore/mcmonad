@@ -135,7 +135,10 @@ workspace shows it on its role's screen and moves focus there (and the
 pointer, when focus follows the mouse or the config warps on switch); it is
 never pulled onto the screen you happen to be on. While a role's screen is
 unplugged its workspaces live on the primary; plug it back and they return,
-each screen getting the workspace it showed last. The default rules:
+each screen getting the workspace it showed last. After every view the other
+screens are tidied too: a workspace displaced onto a screen it does not
+belong to gives way to one that does. A screen with none of its own
+workspaces free keeps whatever it has — some workspace must be shown. The default rules:
 
 ```haskell
 affinity = [ Pin Tertiary ["a"], Pin Secondary ["o"]

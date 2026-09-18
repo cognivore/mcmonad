@@ -1374,11 +1374,16 @@ viewWorkspace tag = do
             ws    <- gets windowset
             roles <- gets screenRoles
             rules <- gets affinityRules
+            lastOn <- gets lastOnRole
+            order  <- gets workspaceOrder
             let present = S.fromList (M.elems roles)
                 role    = resolveAffinity rules present tag
                 cur     = W.screen (W.current ws)
                 target  = fromMaybe cur (screenForRole roles role <|> screenForRole roles Primary)
-            windows (viewOn target tag)
+            -- Show it, then tidy the other screens: a workspace this view
+            -- displaced onto a screen it does not belong to gives way to a
+            -- hidden or stranded workspace that does.
+            windows (placeForRoles rules roles lastOn order . viewOn target tag)
             warp <- gets warpOnSwitch
             ffm  <- gets focusFollows
             when (target /= cur && (warp || ffm)) warpToFocus

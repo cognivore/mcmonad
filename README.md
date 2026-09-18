@@ -160,6 +160,18 @@ the launcher to see every attached display with its role and pick "make
 Secondary" or any other; the choice is kept in the daemon's defaults, and a
 role is never held by two displays.
 
+**Permissions, audited from the inside.** The menubar dropdown's
+*Permissions* section shows what the daemon itself sees: Accessibility,
+Screen Recording, Microphone and Speech Recognition as granted or not, the
+identifier and team the running code is signed with (what macOS keys every
+grant to), the bundle path, and whether the executable on disk has been
+replaced since this process launched. That last line explains most phantom
+prompts: a deploy replaces `MCMonadCore.app` while the old daemon is still
+running, macOS stops recognising that process until the launcher restarts
+it, and a naive check would ask for a grant that was never lost. The daemon
+now recognises that state and asks for nothing. "Copy audit" puts the whole
+list on the clipboard; the same lines are logged as `PERMS:` at startup.
+
 **Every list is most-recently-used first.** Windows, apps and builtin
 commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.

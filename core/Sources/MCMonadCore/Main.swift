@@ -323,6 +323,10 @@ struct MCMonadCoreApp {
         logger.info("mcmonad-core starting")
 
         // 1. Check / prompt accessibility permission.
+        // Remember what the executable looked like at launch, so a later
+        // deploy that replaces the bundle under this process is recognisable.
+        PermissionAudit.rememberLaunch()
+
         // AX is the only permission mcmonad-core needs; without it,
         // findAXWindow returns nil for every wid, frame writes no-op,
         // focus raises no-op, and hotkeys appear to do nothing. Refuse
@@ -649,6 +653,9 @@ struct MCMonadCoreApp {
         socketServer.start()
 
         logger.info("mcmonad-core fully initialized")
+        for line in PermissionAudit.take() {
+            fputs("PERMS: \(line.label)=\(line.value)\n", stderr)
+        }
 
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,

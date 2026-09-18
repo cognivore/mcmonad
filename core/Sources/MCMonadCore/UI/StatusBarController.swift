@@ -158,8 +158,38 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
+        addPermissions(to: menu)
         addDebugToggle(to: menu, currentlyOn: snap.debugOverlays)
         addFooter(to: menu)
+    }
+
+    /// The daemon's own view of its grants and identity, read fresh every
+    /// time the menu opens. Nothing in it prompts.
+    private func addPermissions(to menu: NSMenu) {
+        let lines = PermissionAudit.take()
+        let missing = lines.contains { $0.ok == false }
+        let item = NSMenuItem(title: missing ? "Permissions ⚠" : "Permissions", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        for line in lines {
+            let mark: String
+            switch line.ok {
+            case .some(true): mark = "✓ "
+            case .some(false): mark = "✗ "
+            case .none: mark = "   "
+            }
+            let row = NSMenuItem(title: "\(mark)\(line.label): \(line.value)", action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            submenu.addItem(row)
+        }
+        submenu.addItem(NSMenuItem.separator())
+        let open = NSMenuItem(title: "Open Privacy & Security…", action: #selector(openPrivacyClicked(_:)), keyEquivalent: "")
+        open.target = self
+        submenu.addItem(open)
+        let copy = NSMenuItem(title: "Copy audit", action: #selector(copyAuditClicked(_:)), keyEquivalent: "")
+        copy.target = self
+        submenu.addItem(copy)
+        item.submenu = submenu
+        menu.addItem(item)
     }
 
     private func addWorkspaceItem(
@@ -280,6 +310,18 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleDebugClicked(_ sender: Any?) {
         onToggleDebugOverlays?()
+    }
+
+    @objc private func openPrivacyClicked(_ sender: Any?) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func copyAuditClicked(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(PermissionAudit.report(), forType: .string)
     }
 
     @objc private func searchWindowsClicked(_ sender: Any?) {

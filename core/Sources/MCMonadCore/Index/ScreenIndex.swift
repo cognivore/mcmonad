@@ -65,6 +65,7 @@ final class ScreenIndex {
     private var scheduled = false
     private var inFlight = false
     private var openedSettings = false
+    private var noticedReplacement = false
     /// Consecutive cycles the preflight said "not granted". A deploy replaces
     /// and re-signs the bundle under the still-running old daemon, whose
     /// preflight then fails for a few seconds before the launcher kills it;
@@ -129,6 +130,16 @@ final class ScreenIndex {
 
     private func cycle() async {
         guard isEnabled, !inFlight else { return }
+        // A deploy replaced the bundle under this process: TCC no longer
+        // recognises it and the launcher restarts it shortly. Nothing it
+        // could ask for now would be about a grant that was lost.
+        if PermissionAudit.executableReplaced {
+            if !noticedReplacement {
+                noticedReplacement = true
+                Self.logger.info("executable replaced on disk; index paused until the restart")
+            }
+            return
+        }
         guard CGPreflightScreenCaptureAccess() else {
             deniedCycles += 1
             if deniedCycles >= Self.deniedCyclesBeforeAsking { markDenied() }

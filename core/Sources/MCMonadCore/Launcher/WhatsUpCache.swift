@@ -11,7 +11,9 @@ import Foundation
 ///   * a change to titles or recognised text refreshes in the background
 ///     too, but only once the workspace's summary is `textRefreshAge` old —
 ///     a terminal repainting all day costs a call every ten minutes at most;
-///   * never more than one call per `minGap`, always batched.
+///   * never more than one call per `minGap`, always batched;
+///   * nothing in the background while the user is at the keyboard — the
+///     recap is for when they step away; "! what's up" forces one.
 ///
 /// Opening "what's up" only reads the cache: it is instant and costs nothing.
 /// A workspace that did not change is never asked about again.
@@ -57,6 +59,9 @@ final class WhatsUpCache {
     private var snapshot: OverlaySnapshot?
     private let text: (UInt32) -> String?
     private let textHash: (UInt32) -> Int?
+    /// True while the user is away from the keyboard: the only time a
+    /// background call is worth its tokens, since the recap is read on return.
+    private let quiet: () -> Bool
     private let runner = AskRunner()
     private var inFlight: [String: Fingerprint] = [:]
     private var pendingGeneration = 0
@@ -66,9 +71,10 @@ final class WhatsUpCache {
     var onUpdated: (() -> Void)?
     var isRefreshing: Bool { !inFlight.isEmpty }
 
-    init(text: @escaping (UInt32) -> String?, textHash: @escaping (UInt32) -> Int?) {
+    init(text: @escaping (UInt32) -> String?, textHash: @escaping (UInt32) -> Int?, quiet: @escaping () -> Bool) {
         self.text = text
         self.textHash = textHash
+        self.quiet = quiet
         runner.onFinished = { [weak self] outcome in self?.finished(outcome) }
     }
 
@@ -85,11 +91,14 @@ final class WhatsUpCache {
         scheduleBackgroundRefresh()
     }
 
-    /// The user opened "what's up": skip the quiet period, nothing else —
-    /// the same age gate and call gap apply, and the rows come from the cache.
-    func refreshNow() {
-        refreshDue()
+    /// Refresh the stale workspaces now: after an idle pass (the same call
+    /// gap applies) or for a "!" query (`force`, at once).
+    func refreshNow(force: Bool = false) {
+        refreshDue(force: force)
     }
+
+    /// When the newest summary was made; the rows' disclaimer.
+    var summariesAsOf: Date? { entries.values.compactMap(\.summarisedAt).max() }
 
     var rows: [Row] {
         order.map { Row(tag: $0, summary: entries[$0]?.summary, refreshing: inFlight[$0] != nil) }
@@ -150,8 +159,10 @@ final class WhatsUpCache {
 
     // MARK: - Calls
 
-    /// Trailing debounce: the last event in a burst wins.
+    /// Trailing debounce: the last event in a burst wins. Only while the
+    /// user is away: at the keyboard they get the cache and its date.
     private func scheduleBackgroundRefresh() {
+        guard quiet() else { return }
         pendingGeneration += 1
         let generation = pendingGeneration
         Task { @MainActor [weak self] in
@@ -161,12 +172,12 @@ final class WhatsUpCache {
         }
     }
 
-    private func refreshDue() {
+    private func refreshDue(force: Bool = false) {
         guard !isRefreshing, let snap = snapshot else { return }
         let tags = due()
         guard !tags.isEmpty else { return }
         let wait = Self.minGap - Date().timeIntervalSince(lastCallEnded)
-        if wait > 0 {
+        if wait > 0, !force {
             pendingGeneration += 1
             let generation = pendingGeneration
             Task { @MainActor [weak self] in

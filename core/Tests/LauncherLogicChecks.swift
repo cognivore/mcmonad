@@ -183,7 +183,7 @@ enum LauncherLogicChecks {
                             hiddenWorkspaces: hidden.map { OverlayHiddenWorkspace(tag: $0.0, windows: $0.1) })
         }
         var hashes: [UInt32: Int] = [7: 1]
-        let cache = WhatsUpCache(text: { _ in nil }, textHash: { hashes[$0] })
+        let cache = WhatsUpCache(text: { _ in nil }, textHash: { hashes[$0] }, quiet: { true })
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy")])], [("o5", [w(9, "Chrome", "cats")]), ("z", [])]))
         precondition(cache.order == ["3", "o5"])
         precondition(cache.due() == ["3", "o5"], "new workspaces are due")

@@ -190,6 +190,8 @@ Audio Recording* permission for `MCMonadCore.app` — the first run lists the
 app in that pane and opens it; tick it and the index starts on the next cycle.
 Opt out with `ocrIndex = False` in `mcmonad.hs`.
 
+**The index reads when you step away.** Nothing is captured while you are at the keyboard. After three minutes without input the index makes one pass over every window (displayed first, then parked; a window is re-read only if its picture changed), and "what's up" refreshes the workspaces that changed, so the recap is ready when you come back. Opening "what's up" shows the cache and when it was made; `! what's up` (or `! where is …`) re-reads every window first. One accurate read of a big window costs about three CPU-seconds, which is why it is no longer done every six seconds.
+
 Everything read off the framebuffer stays in mcmonad-core's memory. It is
 never written to disk, never logged, and never sent to the Haskell brain.
 

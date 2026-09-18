@@ -19,9 +19,9 @@ import os
 /// understudy's Vision setup: accurate level, language correction, reading
 /// order by line. A window is re-read only when its picture changed by more
 /// than a cursor blink (a coarse grey thumbnail, compared cell by cell), so a
-/// quiet desktop costs nothing between cycles. Displayed windows
-/// are checked every cycle; hidden ones every `hiddenSweep`, displayed first,
-/// at most `readsPerCycle` recognitions per cycle so a big sweep spreads out.
+/// quiet desktop costs nothing between cycles. Reading happens in passes:
+/// after the user has been away for `idleAfter`, or at once for a launcher
+/// query starting with "!", never while they are typing.
 @MainActor
 final class ScreenIndex {
     nonisolated private static let logger = Logger(subsystem: "com.mcmonad.core", category: "ScreenIndex")
@@ -45,8 +45,17 @@ final class ScreenIndex {
         fileprivate let thumb: [UInt8]
     }
 
-    static let hiddenSweep: TimeInterval = 30
-    static let readsPerCycle = 6
+    /// When the index works. Nothing is captured while the user is busy:
+    /// after `idleAfter` without keyboard or mouse input it makes one pass
+    /// over every window (displayed first, then parked), `readsPerTick`
+    /// recognitions at a time, then rests until the user has been back and
+    /// gone quiet again — the recap is wanted after stepping away. A
+    /// launcher query starting with "!" runs a pass at once. One accurate
+    /// read of a big window costs about three CPU-seconds; read every six
+    /// seconds, two busy terminals were a third of a core.
+    static let idleAfter: TimeInterval = 180
+    static let tick: TimeInterval = 30
+    static let readsPerTick = 3
     /// Thumbnail side, and how much of it must differ before a re-read: a
     /// blinking cursor or a clock digit is a cell or two of 1024.
     nonisolated static let thumbSide = 32
@@ -58,9 +67,13 @@ final class ScreenIndex {
     private var visible: [UInt32] = []
     /// Windows parked on hidden workspaces, per the same snapshot.
     private var hidden: [UInt32] = []
-    /// The current sweep's remaining parked windows, drained a few per cycle.
-    private var hiddenQueue: [UInt32] = []
-    private var hiddenSweepStarted = Date.distantPast
+    /// The running pass: windows not yet looked at, displayed first.
+    private var pass: [UInt32] = []
+    private var forced = false
+    /// The user's last input as of the pass that ran last; the next idle
+    /// pass waits for input after it.
+    private var passInputMark: Date?
+    private(set) var lastPassEnded: Date?
     private var periodic: Timer?
     private var scheduled = false
     private var inFlight = false
@@ -73,20 +86,45 @@ final class ScreenIndex {
     private var deniedCycles = 0
     private static let deniedCyclesBeforeAsking = 3
 
-    /// Fires after a cycle that changed at least one entry.
+    /// Fires after a cycle that changed at least one entry, and after every
+    /// step of a forced pass so the launcher can show it moving.
     var onUpdated: (() -> Void)?
+    /// Fires when a pass has looked at every window; true for a forced one.
+    var onPassEnded: ((Bool) -> Void)?
 
     var isEnabled: Bool { availability != .disabled }
+    /// Windows the running pass has still to look at.
+    var passRemaining: Int { pass.count }
 
     func entry(for windowId: UInt32) -> Entry? { entries[windowId] }
 
-    // MARK: - Control (from the brain)
+    /// One line for the menubar.
+    var status: String {
+        switch availability {
+        case .disabled: return "off"
+        case .denied: return "needs Screen Recording"
+        case .ready:
+            let last = lastPassEnded.map { "last read \(Self.hhmm($0))" } ?? "nothing read yet"
+            return "\(entries.count) windows · \(last) · reads after \(Int(Self.idleAfter / 60)) min without input, or on “!”"
+        }
+    }
+
+    nonisolated static func hhmm(_ date: Date) -> String {
+        date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute())
+    }
+
+    /// Seconds since the user last touched keyboard or mouse.
+    nonisolated static func secondsSinceInput() -> TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
+    }
+
+    // MARK: - Control (from the brain and the launcher)
 
     func setEnabled(_ on: Bool) {
         if on {
             guard availability == .disabled else { return }
             availability = .ready
-            periodic = Timer.scheduledTimer(withTimeInterval: 6, repeats: true) { [weak self] _ in
+            periodic = Timer.scheduledTimer(withTimeInterval: Self.tick, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.requestSoon(after: 0) }
             }
             Self.logger.info("screen index enabled")
@@ -97,24 +135,35 @@ final class ScreenIndex {
             periodic?.invalidate()
             periodic = nil
             entries.removeAll()
+            pass.removeAll()
+            forced = false
             Self.logger.info("screen index disabled; memory cleared")
         }
     }
 
     /// The brain's view of every window it manages. Entries for windows
     /// that are gone from every workspace are dropped; the rest stay until
-    /// re-read.
+    /// re-read. Nothing is captured for a layout change: the next pass
+    /// sees it.
     func noteSnapshot(_ snapshot: OverlaySnapshot) {
         guard isEnabled else { return }
         visible = snapshot.screens.flatMap { $0.windows.map(\.windowId) }
         hidden = snapshot.hiddenWorkspaces.flatMap { $0.windows.map(\.windowId) }
         let all = Set(visible).union(hidden)
         for id in entries.keys where !all.contains(id) { entries.removeValue(forKey: id) }
-        requestSoon()
+        pass.removeAll { !all.contains($0) }
     }
 
-    /// Something visible probably changed (layout, focus): re-read soon,
-    /// coalescing bursts into one cycle.
+    /// A "!" query: look at every window now, whatever the user is doing.
+    func reindexNow() {
+        guard isEnabled else { return }
+        pass = visible + hidden.filter { !visible.contains($0) }
+        forced = true
+        passInputMark = Date()
+        requestSoon(after: 0)
+    }
+
+    /// Run a cycle soon, coalescing bursts into one.
     func requestSoon(after delay: TimeInterval = 0.8) {
         guard isEnabled, !scheduled else { return }
         scheduled = true
@@ -126,7 +175,7 @@ final class ScreenIndex {
         }
     }
 
-    // MARK: - One reading of the displayed windows
+    // MARK: - One step of a pass
 
     private func cycle() async {
         guard isEnabled, !inFlight else { return }
@@ -147,30 +196,50 @@ final class ScreenIndex {
         }
         deniedCycles = 0
         if availability == .denied { availability = .ready }
+
+        let idle = Self.secondsSinceInput()
+        let lastInput = Date(timeIntervalSinceNow: -idle)
+        if pass.isEmpty {
+            // An idle pass starts once the user has been quiet for
+            // `idleAfter` and has been back since the last pass began.
+            guard !forced, idle >= Self.idleAfter, CGDisplayIsAsleep(CGMainDisplayID()) == 0,
+                  passInputMark.map({ lastInput > $0 }) ?? true
+            else { return }
+            passInputMark = lastInput
+            pass = visible + hidden.filter { !visible.contains($0) }
+            guard !pass.isEmpty else { return }
+            Self.logger.info("screen index: idle pass over \(self.pass.count, privacy: .public) windows")
+        } else if !forced, idle < Self.idleAfter {
+            return   // the user is back: the pass waits for the next quiet spell
+        }
         inFlight = true
         defer { inFlight = false }
 
-        // Displayed windows every cycle. Parked ones are swept once per
-        // `hiddenSweep`: the sweep queues them all and each cycle drains as
-        // many as the cap leaves after the displayed ones, so every parked
-        // window is examined about once per sweep and never more often.
-        if hiddenQueue.isEmpty, Date().timeIntervalSince(hiddenSweepStarted) >= Self.hiddenSweep {
-            hiddenSweepStarted = Date()
-            hiddenQueue = hidden.filter { !visible.contains($0) }
-        }
-        let ids = visible + hiddenQueue
+        let started = Date()
         let known = entries.mapValues(\.thumb)
         let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        let (readings, examined) = await Self.read(ids: ids, knownThumbs: known, scale: scale, limit: Self.readsPerCycle)
+        let (readings, examined) = await Self.read(ids: pass, knownThumbs: known, scale: scale, limit: Self.readsPerTick)
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
-        hiddenQueue.removeAll { examined.contains($0) }
+        // Nothing examined means the window list itself failed: end the
+        // pass rather than spin on it.
+        if examined.isEmpty { pass.removeAll() } else { pass.removeAll { examined.contains($0) } }
         for (id, r) in readings {
             entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, thumb: r.thumb)
         }
         if !readings.isEmpty {
             let hiddenRead = readings.keys.filter { !visible.contains($0) }.count
-            Self.logger.info("screen index: re-read \(readings.count, privacy: .public) window(s) (\(readings.count - hiddenRead, privacy: .public) of \(self.visible.count, privacy: .public) displayed, \(hiddenRead, privacy: .public) of \(self.hidden.count, privacy: .public) hidden)")
-            onUpdated?()
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            Self.logger.info("screen index: re-read \(readings.count, privacy: .public) window(s) (\(readings.count - hiddenRead, privacy: .public) of \(self.visible.count, privacy: .public) displayed, \(hiddenRead, privacy: .public) of \(self.hidden.count, privacy: .public) hidden) in \(ms, privacy: .public) ms, \(self.pass.count, privacy: .public) left")
+        }
+        if !readings.isEmpty || forced { onUpdated?() }
+        if pass.isEmpty {
+            let wasForced = forced
+            forced = false
+            lastPassEnded = Date()
+            Self.logger.info("screen index: \(wasForced ? "forced" : "idle", privacy: .public) pass done")
+            onPassEnded?(wasForced)
+        } else {
+            requestSoon(after: forced ? 0 : 1)   // finish the pass without waiting for the tick
         }
     }
 

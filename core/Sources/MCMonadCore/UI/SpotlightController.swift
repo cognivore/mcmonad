@@ -130,6 +130,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         var recentKey: String? = nil
         /// Second line: a highlighted text excerpt or the model's reason.
         var subtitle: NSAttributedString? = nil
+        /// A "!" query: read every window before acting.
+        var force = false
         /// For window rows: the id to look up in the screen index.
         var windowId: UInt32? {
             if case .focusWindow(let id, _) = kind { return id }
@@ -284,9 +286,14 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         panel?.orderOut(nil)
     }
 
-    /// The screen index changed while the launcher may be open: re-rank a
-    /// live window search, unless the user has moved the selection.
+    /// The screen index changed while the launcher may be open: show a
+    /// forced pass moving, or re-rank a live window search unless the user
+    /// has moved the selection.
     func screenIndexUpdated() {
+        if reindexContinuation != nil, let left = screenIndex?.passRemaining, left > 0 {
+            appendTranscript("· \(left) windows left\n")
+            return
+        }
         guard let panel, panel.isVisible, state == .browsing, mode == .window,
               !searchField.stringValue.isEmpty,
               tableView.selectedRow <= (filtered.firstIndex { $0.activatable } ?? 0)
@@ -721,15 +728,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
              recentKey: RecentUse.screenshot)
     }
 
-    private func whereIsItem(_ query: WhereIsQuery) -> Item {
+    private func whereIsItem(_ query: WhereIsQuery, force: Bool = false) -> Item {
         Item(title: "Ask \(Ask.model) where “\(query.question)” is",
-             kind: .whereIs(query), haystack: "")
+             kind: .whereIs(query), haystack: "", force: force)
     }
 
-    private func whatsUpItem() -> Item {
+    private func whatsUpItem(force: Bool = false) -> Item {
         Item(title: "What's up — one line per workspace, from \(Ask.model)",
              kind: .whatsUp, haystack: "what's up whats up sup summary workspaces overview",
-             recentKey: RecentUse.whatsUp)
+             recentKey: RecentUse.whatsUp, force: force)
     }
 
     // MARK: - Filtering
@@ -755,14 +762,17 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             break
 
         case .browsing:
+            // A leading "!" asks for a fresh reading of every window first.
+            let force = q.hasPrefix("!")
+            let q = force ? String(q.dropFirst()).trimmingCharacters(in: .whitespaces) : q
             // Builtin commands work in both command and window-search mode.
             var items: [Item] = []
             if let ask = WhereIsQuery(q) {
-                items.append(whereIsItem(ask))
+                items.append(whereIsItem(ask, force: force))
             }
             let whatsUp = WhatsUp.matches(q)
             if whatsUp {
-                items.append(whatsUpItem())
+                items.append(whatsUpItem(force: force))
             }
             let screenshotCmd = ScreenshotCommand(q)
             if let screenshotCmd {
@@ -863,9 +873,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         if let key = item.recentKey { recentUse.touch(key) }
         switch item.kind {
         case .whereIs(let query):
-            beginWhereIs(query)
+            if item.force { reindexThen { [weak self] in self?.beginWhereIs(query) } } else { beginWhereIs(query) }
         case .whatsUp:
-            beginWhatsUp()
+            if item.force { reindexThen { [weak self] in self?.showWhatsUp(refresh: true) } } else { showWhatsUp(refresh: false) }
         case .viewWorkspace(let tag):
             finish()
             onViewWorkspace?(tag)
@@ -923,9 +933,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         }
     }
 
-    /// Cached rows at once; stale workspaces refresh behind them and the
-    /// rows update in place when the call lands.
-    private func beginWhatsUp() {
+    /// Cached rows, with when they were made. Nothing is asked unless the
+    /// query began with "!": then every window was just re-read and the
+    /// stale workspaces refresh behind the rows, updating in place.
+    private func showWhatsUp(refresh: Bool) {
         guard let cache = whatsUpCache else { return }
         leaveWhereIs()
         askTerms = []
@@ -933,13 +944,44 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         showingWhatsUp = true
         state = .answered
         applyModeChrome()
-        cache.refreshNow()
+        if refresh { cache.refreshNow(force: true) }
         renderWhatsUp()
+    }
+
+    /// A "!" query: read every window first, showing the pass in the
+    /// transcript, then carry on with `then`.
+    private var reindexContinuation: (@MainActor () -> Void)?
+    private func reindexThen(_ then: @escaping @MainActor () -> Void) {
+        guard let index = screenIndex, index.isEnabled else { then(); return }
+        leaveWhereIs()
+        showingWhatsUp = false
+        state = .asking
+        filtered = []
+        tableView.reloadData()
+        applyModeChrome()
+        transcriptView.string = ""
+        showTranscript(true)
+        spinner.start()
+        appendTranscript("· reading every window first…\n")
+        reindexContinuation = then
+        index.reindexNow()
+    }
+
+    /// The index finished a pass; a forced one continues the "!" query
+    /// that asked for it, if the panel is still up.
+    func screenIndexPassEnded(forced: Bool) {
+        guard forced, let then = reindexContinuation else { return }
+        reindexContinuation = nil
+        guard let panel, panel.isVisible, state == .asking else { return }
+        then()
     }
 
     private func renderWhatsUp() {
         guard let cache = whatsUpCache else { return }
-        filtered = cache.rows.map { r in
+        let stamps = [cache.summariesAsOf.map { "summaries \(ScreenIndex.hhmm($0))" },
+                      screenIndex?.lastPassEnded.map { "screens read \(ScreenIndex.hhmm($0))" }].compactMap { $0 }
+        let cached = stamps.isEmpty ? "Nothing cached yet" : "Cached · " + stamps.joined(separator: " · ")
+        let rows: [Item] = cache.rows.map { r in
             let head: String
             if let s = r.summary {
                 head = s.summary + (r.refreshing ? "   (refreshing…)" : "")
@@ -953,9 +995,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 subtitle: Self.highlighted("why: " + (r.summary?.reason ?? "…"), ranges: [])
             )
         }
-        if filtered.isEmpty {
-            filtered = [hintItem("No workspace has any window.")]
-        }
+        filtered = [hintItem("\(cached) · “! what's up” re-reads every window")]
+            + (rows.isEmpty ? [hintItem("No workspace has any window.")] : rows)
         if cache.isRefreshing { spinner.start() } else { spinner.stop() }
         let keep = tableView.selectedRow
         showResults()
@@ -1245,7 +1286,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             return
         }
         if WhatsUp.matches(text) {
-            beginWhatsUp()
+            showWhatsUp(refresh: false)
             return
         }
         // A spoken "timer …" sets a countdown in ANY mode — dictation isn't

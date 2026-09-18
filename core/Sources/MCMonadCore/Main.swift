@@ -402,15 +402,18 @@ struct MCMonadCoreApp {
         // config says on (the default); its text never leaves this process.
         let screenIndex = ScreenIndex()
         spotlight.screenIndex = screenIndex
+        statusBar.screenIndexStatus = { [weak screenIndex] in screenIndex?.status ?? "off" }
         executor.onSetOcrIndex = { [weak screenIndex] on in
             screenIndex?.setEnabled(on)
         }
         // "What's up" summaries, kept current by the same reports: every
         // snapshot and every re-read re-fingerprints the workspaces, and
-        // only the changed ones ever go back to the model.
+        // only the changed ones ever go back to the model — and only while
+        // the user is away, which is when a recap is wanted.
         let whatsUpCache = WhatsUpCache(
             text: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.text },
-            textHash: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.textHash }
+            textHash: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.textHash },
+            quiet: { ScreenIndex.secondsSinceInput() >= ScreenIndex.idleAfter }
         )
         spotlight.whatsUpCache = whatsUpCache
         overlayManager.onSnapshotApplied = { [weak screenIndex, weak whatsUpCache] snapshot in
@@ -420,6 +423,12 @@ struct MCMonadCoreApp {
         screenIndex.onUpdated = { [weak spotlight, weak whatsUpCache] in
             spotlight?.screenIndexUpdated()
             whatsUpCache?.noteTextChanged()
+        }
+        screenIndex.onPassEnded = { [weak spotlight, weak whatsUpCache] forced in
+            // The idle pass is the recap for when the user steps away; a
+            // forced one belongs to the "!" query that asked for it.
+            if !forced { whatsUpCache?.refreshNow() }
+            spotlight?.screenIndexPassEnded(forced: forced)
         }
         whatsUpCache.onUpdated = { [weak spotlight] in
             spotlight?.whatsUpUpdated()
@@ -547,15 +556,13 @@ struct MCMonadCoreApp {
         // first window of this PID" when the user clicks any of them.
         let focusTracker = AXFocusTracker()
         AXFocusTracker.shared = focusTracker
-        focusTracker.onFocusedWindowChanged = { [weak socketServer, weak spotlight, weak screenIndex] windowId, pid in
+        focusTracker.onFocusedWindowChanged = { [weak socketServer, weak spotlight] windowId, pid in
             FocusLog.emit(source: .emitFocusedWindowChanged,
                           windowId: windowId, pid: pid,
                           extra: "via=axFocusedWindowChanged")
             socketServer?.send(.focusedWindowChanged(windowId: windowId, pid: pid))
-            // Recency for the launcher's lists, and a nudge to re-read the
-            // screen: a focus change usually means something new to read.
+            // Recency for the launcher's lists.
             spotlight?.recentUse.touch(RecentUse.window(windowId))
-            screenIndex?.requestSoon()
         }
 
         // Wire SkyLightEventObserver (singleton, delegate-based) to socket

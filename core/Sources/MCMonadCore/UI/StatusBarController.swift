@@ -22,6 +22,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     /// Snapshot read at menu-open time, supplied by the OverlayManager.
     /// `() -> OverlaySnapshot?` so we always get the freshest value.
     var snapshotProvider: (() -> OverlaySnapshot?)?
+    /// The screen index's one-line status, read fresh on every open.
+    var screenIndexStatus: (() -> String)?
 
     /// Fires when the user clicks the "Debug frame overlays" item.
     /// The main module wires this to send `menuToggleDebug` to Haskell.
@@ -97,6 +99,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         )
         header.isEnabled = false
         menu.addItem(header)
+        if let status = screenIndexStatus?() {
+            let row = NSMenuItem(title: "Screen index: \(status)", action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            menu.addItem(row)
+        }
         menu.addItem(NSMenuItem.separator())
 
         // Fuzzy window search — opens the keyboard-driven dropdown.

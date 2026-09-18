@@ -14,6 +14,7 @@
 -- @
 module MCMonad
     ( module MCMonad.Core
+    , module MCMonad.Affinity
     , module MCMonad.Config
     , module MCMonad.Config.Keys
     , module MCMonad.Debug
@@ -28,6 +29,7 @@ module MCMonad
     ) where
 
 import MCMonad.Core
+import MCMonad.Affinity
 import MCMonad.Config
 import MCMonad.Config.Keys
 import MCMonad.Debug

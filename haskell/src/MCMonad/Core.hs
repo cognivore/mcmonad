@@ -14,6 +14,9 @@ module MCMonad.Core
     , gets, modify, asks, MonadIO(..)
       -- * Window and screen types
     , WindowRef(..), ScreenId(..), ScreenDetail(..)
+      -- * Screen roles and affinity rules (see "MCMonad.Affinity")
+    , ScreenRole(..), roleName, parseRole
+    , AffinityRule(..), ViewMode(..)
     , WindowSet, WindowSpace
       -- * Window metadata cache
     , WindowMetadata(..)
@@ -245,6 +248,56 @@ data ScreenDetail = SD { screenRect :: !Rectangle }
     deriving (Eq, Show, Read)
 
 -- ---------------------------------------------------------------------------
+-- Screen roles and affinity rules
+--
+-- What they mean and how they resolve is documented in "MCMonad.Affinity";
+-- the types live here because 'MState' carries them.
+
+-- | What a screen is /for/. Assigned per display by mcmonad-core (from the
+-- arrangement, or by the user in the launcher); the brain sees the role
+-- next to each screen's geometry and never left or right.
+data ScreenRole
+    = Primary
+    | Secondary
+    | Tertiary
+    | AuxPrimary
+    | AuxSecondary
+    | AuxTertiary
+    deriving (Eq, Ord, Show, Read, Enum, Bounded)
+
+-- | Wire spelling, shared with mcmonad-core.
+roleName :: ScreenRole -> String
+roleName Primary      = "primary"
+roleName Secondary    = "secondary"
+roleName Tertiary     = "tertiary"
+roleName AuxPrimary   = "aux-primary"
+roleName AuxSecondary = "aux-secondary"
+roleName AuxTertiary  = "aux-tertiary"
+
+parseRole :: String -> Maybe ScreenRole
+parseRole s = case [ r | r <- [minBound .. maxBound], roleName r == s ] of
+    (r:_) -> Just r
+    []    -> Nothing
+
+-- | One line of an affinity configuration ('MCMonad.Config.affinity').
+data AffinityRule
+    = Pin ScreenRole [String]
+      -- ^ These workspaces belong to this role; to 'Primary' while its
+      -- screen is not attached.
+    | SplitAcross [ScreenRole] [String]
+      -- ^ These workspaces are cut into as many contiguous chunks as
+      -- there are roles and dealt out in order; with only some roles
+      -- attached the /last/ chunks take the attached roles and the
+      -- earlier chunks return to 'Primary'.
+    deriving (Eq, Show)
+
+-- | How a workspace is viewed ('MCMonad.Config.viewMode').
+data ViewMode
+    = Affine   -- ^ On its role's screen, focus following (the default).
+    | Classic  -- ^ xmonad's greedy view: onto the screen the user is on.
+    deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
 -- Geometry
 
 -- | A rectangle in macOS screen coordinates (origin top-left, doubles).
@@ -364,7 +417,7 @@ data Connection = Connection
 data MState = MState
     { windowset         :: !WindowSet
     , mapped            :: !(Set WindowRef)
-    , affinity          :: !(Map.Map String ScreenId)
+    , learnedAffinity   :: !(Map.Map String ScreenId)
     , inputMode         :: !String
       -- ^ Current input mode (\"default\", \"resize\", etc.).
     , sticky            :: !(Set WindowRef)
@@ -382,6 +435,22 @@ data MState = MState
     , warpOnSwitch     :: !Bool
       -- ^ Whether to warp the mouse cursor to the focused window on
       -- workspace\/screen changes. Set from config at startup.
+    , focusFollows     :: !Bool
+      -- ^ 'MCMonad.Config.focusFollowsMouse'; an affinity view that moves
+      -- focus across screens takes the pointer along when this is on, or
+      -- the next mouse move would hand focus straight back.
+    , affinityRules    :: ![AffinityRule]
+      -- ^ 'MCMonad.Config.affinity'.
+    , workspaceViewMode :: !ViewMode
+      -- ^ 'MCMonad.Config.viewMode'.
+    , workspaceOrder   :: ![String]
+      -- ^ 'MCMonad.Config.mcWorkspaces': the tie-break order when a
+      -- screen needs a workspace of its role.
+    , screenRoles      :: !(Map.Map ScreenId ScreenRole)
+      -- ^ Role of every attached screen, from the latest 'ScreensChanged'.
+    , lastOnRole       :: !(Map.Map ScreenRole String)
+      -- ^ The workspace each role's screen showed most recently, so a
+      -- screen that goes away and comes back gets its workspace back.
     , windowMetadata   :: !(Map.Map WindowRef WindowMetadata)
       -- ^ Cached app/title/bundle metadata for every managed window.
       -- Populated by 'WindowCreated' (and the startup window-enumeration

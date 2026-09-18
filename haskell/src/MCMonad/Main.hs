@@ -20,6 +20,7 @@ import System.IO (hPutStrLn, stderr)
 import System.Posix.Signals (Handler(..), installHandler, sigINT, sigTERM)
 import qualified XMonad.StackSet as W
 
+import MCMonad.Affinity (placeForRoles)
 import MCMonad.Config
 import MCMonad.Core
 import MCMonad.Debug (toggleDebugOverlays, setDebugOverlays)
@@ -112,8 +113,18 @@ launch cfg = do
                     , rsNextTimerId = 1
                     , rsPending     = Map.empty
                     }
-        ws0 = rsWindowSet restored
+        -- Roles come with the geometry; give each role's screen a
+        -- workspace of its own before the first layout.
+        roles0 = Map.fromList [ (S i, siRole si) | (i, si) <- zip [0 :: Int ..] screens ]
+        ws0 = case viewMode cfg of
+            Affine  -> placeForRoles (affinity cfg) roles0 Map.empty (mcWorkspaces cfg)
+                                     (rsWindowSet restored)
+            Classic -> rsWindowSet restored
         unmatchedLives = rsUnmatched restored
+
+    hPutStrLn stderr $ "mcmonad: screens "
+        ++ unwords [ show i ++ "=" ++ roleName (siRole si) | (i, si) <- zip [0 :: Int ..] screens ]
+        ++ (case viewMode cfg of Affine -> " (affine)"; Classic -> " (classic)")
 
     snapRef  <- newIORef Nothing
     armedRef <- newIORef False
@@ -132,7 +143,7 @@ launch cfg = do
             ]
         mst0  = MState { windowset = ws0
                        , mapped = Set.empty
-                       , affinity = rsAffinity restored
+                       , learnedAffinity = rsAffinity restored
                        , inputMode = "default"
                        , sticky = Set.empty
                        , scratchpads = Map.empty
@@ -140,6 +151,12 @@ launch cfg = do
                        , pendingScratchpad = Nothing
                        , windowRects = Map.empty
                        , warpOnSwitch = mouseWarping cfg
+                       , focusFollows = focusFollowsMouse cfg
+                       , affinityRules = affinity cfg
+                       , workspaceViewMode = viewMode cfg
+                       , workspaceOrder = mcWorkspaces cfg
+                       , screenRoles = roles0
+                       , lastOnRole = Map.empty
                        , windowMetadata = seededMetadata
                        , debugOverlays = False
                        , lastSaveAt = Nothing
@@ -556,7 +573,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
             let allTags = map W.tag (W.workspace (W.current ws)
                                      : map W.workspace (W.visible ws)
                                      ++ W.hidden ws)
-            when (tag `elem` allTags) $ windows (W.greedyView tag)
+            when (tag `elem` allTags) $ viewWorkspace tag
 
         -- Timers. The brain owns timer state; mcmonad-core renders + clocks
         -- it. State mutations funnel through 'syncTimers' (push to the daemon
@@ -605,7 +622,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
                                      : map W.workspace (W.visible ws)
                                      ++ W.hidden ws)
             journalJumped label workspace
-            when (workspace `elem` allTags) $ windows (W.greedyView workspace)
+            when (workspace `elem` allTags) $ viewWorkspace workspace
 
         -- Events that arrive during init or are not actionable
         Ready                   -> return ()

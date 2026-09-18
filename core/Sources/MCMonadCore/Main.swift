@@ -458,6 +458,19 @@ struct MCMonadCoreApp {
         spotlight.onViewWorkspace = { [weak socketServer] tag in
             socketServer?.send(.menuViewWorkspace(tag: tag))
         }
+        // Screen roles: the launcher lists the attached displays with the
+        // roles this daemon assigned them; a pick is remembered here and
+        // reaches the brain as a fresh screens-changed.
+        spotlight.displays = { [weak displayManager] in
+            guard let displayManager else { return [] }
+            let roles = displayManager.currentRoles()
+            return displayManager.attachedDisplays().compactMap { d in
+                roles[d.uuid].map { (d, $0) }
+            }
+        }
+        spotlight.onSetScreenRole = { [weak displayManager] uuid, role in
+            displayManager?.assign(role, to: uuid)
+        }
         // Starting a timer is a state change: report it to the brain (which
         // stamps the current workspace, assigns an id, persists it, and pushes
         // the list back via set-timers). No origin workspace here — the brain

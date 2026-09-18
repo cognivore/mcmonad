@@ -3,6 +3,9 @@
 module MCMonad.Operations
     ( -- * Core state transition
       windows
+      -- * Viewing workspaces by learnedAffinity
+    , viewWorkspace
+    , warpToFocus
     , reassertHiddenWindows
     , frameAtParkCorner
       -- * Window lifecycle
@@ -93,6 +96,8 @@ import System.Info (arch, os)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (executeFile)
 import System.Posix.Signals (nullSignal, signalProcess)
+
+import MCMonad.Affinity (placeForRoles, resolveAffinity, screenForRole, viewOn)
 import System.Process (createProcess, shell, readProcessWithExitCode, CreateProcess(..))
 import qualified XMonad.StackSet as W
 
@@ -138,9 +143,18 @@ windows f = do
 
     let ws = f old
 
-    -- 1. Update state immediately + affinity bookkeeping
+    -- 1. Update state immediately + learnedAffinity bookkeeping
     modify $ \s -> s { windowset = ws
-                     , affinity = updateAffinities ws (affinity s) }
+                     , learnedAffinity = updateAffinities ws (learnedAffinity s) }
+
+    -- 1a. Remember which workspace each role's screen shows, so a screen
+    -- that goes away and comes back gets its workspace back.
+    roles <- gets screenRoles
+    modify $ \s -> s { lastOnRole = M.union
+        (M.fromList [ (r, W.tag (W.workspace scr))
+                    | scr <- W.current ws : W.visible ws
+                    , Just r <- [M.lookup (W.screen scr) roles] ])
+        (lastOnRole s) }
 
     -- 1b. Sticky: keep sticky windows on their original screen.
     -- Sticky windows must be floating (same as Sway). When the workspace
@@ -649,7 +663,7 @@ manage wi hook = do
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
-        -- Destroy/recreate affinity: if this pid's last window was
+        -- Destroy/recreate learnedAffinity: if this pid's last window was
         -- destroyed recently ('unmanagedOrigin'), this window is its
         -- replacement — Gecko destroys and recreates the NSWindow
         -- across a native-fullscreen round-trip — so route it back to
@@ -1017,7 +1031,7 @@ journalJumped lbl ws =
 currentSnapshot :: M StateSnapshot
 currentSnapshot = do
     ws   <- gets windowset
-    aff  <- gets affinity
+    aff  <- gets learnedAffinity
     ts   <- gets timers
     nid  <- gets nextTimerId
     pend <- gets pendingRestore
@@ -1265,14 +1279,31 @@ rescreen newScreens = do
     ws <- gets windowset
     let newDetails = zipWith (\i si -> (S i, SD (siFrame si)))
                              [0 :: Int ..] newScreens
+        roles'     = M.fromList (zipWith (\i si -> (S i, siRole si))
+                                         [0 :: Int ..] newScreens)
         liveSids   = S.fromList (map fst newDetails)
+    io $ hPutStrLn stderr $ "mcmonad: screens "
+        ++ unwords [ show i ++ "=" ++ roleName (siRole si)
+                   | (i, si) <- zip [0 :: Int ..] newScreens ]
     case reassignScreens newDetails ws of
         Nothing  -> return ()   -- no screens at all: nothing sensible to do
         Just ws' -> do
+            -- Then give each role's screen the workspace that belongs to
+            -- it: the one it showed last, or the first the rules send
+            -- there. A screen that went away takes its workspace with it
+            -- (hidden, resolving to Primary until the screen is back).
+            mode   <- gets workspaceViewMode
+            rules  <- gets affinityRules
+            lastOn <- gets lastOnRole
+            order  <- gets workspaceOrder
+            let placed = case mode of
+                    Affine  -> placeForRoles rules roles' lastOn order ws'
+                    Classic -> ws'
             modify $ \s -> s
-                { windowset = ws'
+                { windowset   = placed
+                , screenRoles = roles'
                 -- Drop affinities pointing at screens that no longer exist.
-                , affinity  = M.filter (`S.member` liveSids) (affinity s)
+                , learnedAffinity    = M.filter (`S.member` liveSids) (learnedAffinity s)
                 }
             windows id  -- trigger relayout
 
@@ -1325,6 +1356,45 @@ reassignScreens newDetails ws = case assigned of
                     let (done, rest') = assign rest leftover'
                     in (W.Screen wsp sid sd : done, rest')
                 [] -> assign rest []   -- no workspace to spare
+
+-- ---------------------------------------------------------------------------
+-- Viewing workspaces by learnedAffinity
+
+-- | View a workspace the configured way. 'Affine': it appears on its
+-- role's screen — 'Primary' while that screen is away — and focus follows
+-- it; when focus crosses screens the pointer follows too if the config
+-- warps on switch or focus follows the mouse (otherwise the next mouse
+-- move would hand focus straight back). 'Classic': xmonad's greedy view.
+viewWorkspace :: String -> M ()
+viewWorkspace tag = do
+    mode <- gets workspaceViewMode
+    case mode of
+        Classic -> windows (W.greedyView tag)
+        Affine  -> do
+            ws    <- gets windowset
+            roles <- gets screenRoles
+            rules <- gets affinityRules
+            let present = S.fromList (M.elems roles)
+                role    = resolveAffinity rules present tag
+                cur     = W.screen (W.current ws)
+                target  = fromMaybe cur (screenForRole roles role <|> screenForRole roles Primary)
+            windows (viewOn target tag)
+            warp <- gets warpOnSwitch
+            ffm  <- gets focusFollows
+            when (target /= cur && (warp || ffm)) warpToFocus
+
+-- | Put the pointer on the focused window, or in the middle of the
+-- current screen when its workspace is empty.
+warpToFocus :: M ()
+warpToFocus = do
+    ws    <- gets windowset
+    rects <- gets windowRects
+    let scr = W.current ws
+        Rectangle sx sy sw sh = screenRect (W.screenDetail scr)
+        (x, y) = case W.peek ws >>= (`M.lookup` rects) of
+            Just (Rectangle rx ry rw rh) -> (rx + rw / 2, ry + rh / 2)
+            Nothing                      -> (sx + sw / 2, sy + sh / 2)
+    withConnection $ \conn -> io $ sendCommand conn (WarpMouse x y)
 
 -- ---------------------------------------------------------------------------
 -- Utilities

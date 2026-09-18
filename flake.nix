@@ -73,6 +73,11 @@
                 Tests/LauncherLogicChecks.swift \
                 -o .build/launcher-logic-checks
               .build/launcher-logic-checks
+              /usr/bin/swiftc -swift-version 6 \
+                Sources/MCMonadCore/Display/ScreenRoleMap.swift \
+                Tests/ScreenRoleMapChecks.swift \
+                -o .build/screen-role-map-checks
+              .build/screen-role-map-checks
               runHook postCheck
             '';
             installPhase = ''

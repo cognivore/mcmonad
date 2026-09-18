@@ -78,26 +78,38 @@ extension WindowInfo: Codable {
 
 // MARK: - Shared IPC Types
 
+/// One attached display as the brain sees it: index and geometry as
+/// before, plus its identity and the role this daemon assigned it (see
+/// `ScreenRoleMap`). The brain places workspaces by role, never by side.
 struct ScreenInfo: Sendable {
     let screenId: Int
     let frame: CGRect
+    let uuid: String
+    let name: String
+    let role: ScreenRole
 }
 
 extension ScreenInfo: Codable {
     private enum CodingKeys: String, CodingKey {
-        case screenId, frame
+        case screenId, frame, uuid, name, role
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         screenId = try c.decode(Int.self, forKey: .screenId)
         frame = try c.decode(FlatRect.self, forKey: .frame).cgRect
+        uuid = try c.decodeIfPresent(String.self, forKey: .uuid) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        role = try c.decodeIfPresent(ScreenRole.self, forKey: .role) ?? .primary
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(screenId, forKey: .screenId)
         try c.encode(FlatRect(frame), forKey: .frame)
+        try c.encode(uuid, forKey: .uuid)
+        try c.encode(name, forKey: .name)
+        try c.encode(role, forKey: .role)
     }
 }
 

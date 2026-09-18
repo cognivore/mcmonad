@@ -47,6 +47,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// Fires with a workspace tag when the user picks a "what's up" row.
     var onViewWorkspace: ((String) -> Void)?
 
+    /// The attached displays with their current roles, for the "screen"
+    /// rows (wired by Main).
+    var displays: (() -> [(AttachedDisplay, ScreenRole)])?
+    /// Fires when the user gives a display a role.
+    var onSetScreenRole: ((String, ScreenRole) -> Void)?
+
     /// The in-memory OCR index of displayed windows (wired by Main). Read
     /// on every filter pass so a window can be found by what is written in
     /// it; its text is never copied anywhere else.
@@ -112,6 +118,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case whereIs(WhereIsQuery)
         case whatsUp
         case viewWorkspace(tag: String)
+        case setScreenRole(uuid: String, role: ScreenRole)
         case hint
     }
 
@@ -640,6 +647,18 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private func rebuildBases() {
         // The builtin Screenshot replaces the system app's duplicate row.
         var cmd: [Item] = [timerCommandItem(), screenshotItem(.interactive), whatsUpItem()]
+        // One row per display per other role: "screen" lists them all,
+        // typing a display or role name narrows them.
+        for (d, current) in displays?() ?? [] {
+            for role in ScreenRole.allCases where role != current {
+                let size = "\(Int(d.frame.width))×\(Int(d.frame.height))"
+                cmd.append(Item(
+                    title: "Screen \(d.name) (\(size), now \(current.label)) → make \(role.label)",
+                    kind: .setScreenRole(uuid: d.uuid, role: role),
+                    haystack: "screen display monitor \(d.name) \(current.label) \(role.label)".lowercased()
+                ))
+            }
+        }
         for app in appIndex.apps where app.bundleId != "com.apple.screenshot.launcher" {
             cmd.append(Item(
                 title: app.name,
@@ -850,6 +869,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .viewWorkspace(let tag):
             finish()
             onViewWorkspace?(tag)
+        case .setScreenRole(let uuid, let role):
+            finish()
+            onSetScreenRole?(uuid, role)
         case .launchApp(let app):
             finish()
             appIndex.launch(app)
@@ -1383,6 +1405,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .screenshot:               return symbolIcon("camera")
         case .whereIs, .whatsUp:        return symbolIcon("sparkles")
         case .viewWorkspace:            return symbolIcon("rectangle.3.group")
+        case .setScreenRole:            return symbolIcon("display.2")
         case .hint:                     return symbolIcon("info.circle")
         }
     }

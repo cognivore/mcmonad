@@ -3,7 +3,7 @@
 -- This module provides the 'withSway' combinator, which transforms an
 -- 'MConfig' into one with Sway/i3-compatible behaviour:
 --
--- * Workspaces remember which screen they belong to (affinity).
+-- * Workspaces remember which screen they belong to (learnedAffinity).
 -- * Switching to a workspace on another screen moves focus there
 --   instead of pulling the workspace (like Sway, unlike xmonad).
 -- * The layout is an i3-style binary tree of splits (not Tall/Full).
@@ -77,7 +77,7 @@ import MCMonad.Operations
 -- | Transform an mcmonad config into one with Sway-compatible behaviour.
 --
 -- This replaces the layout with an i3-style tree layout and the keybindings
--- with affinity-aware, Sway-style bindings. Without this combinator,
+-- with learnedAffinity-aware, Sway-style bindings. Without this combinator,
 -- mcmonad behaves exactly like xmonad. With it, mcmonad behaves like Sway.
 --
 -- @manageHook@, @startupHook@, @logHook@, @terminal@, and all other fields
@@ -163,7 +163,7 @@ swayKeys conf = Map.fromList $
     , ((m .|. shiftMask, kSemicolon),  cycleGlobal Next)
     ]
     ++
-    -- Workspace switching: affinity-aware (THE difference from defaultKeys)
+    -- Workspace switching: learnedAffinity-aware (THE difference from defaultKeys)
     [ ((m, key), affinityView ws')
     | (ws', key) <- zip (mcWorkspaces conf) [k1, k2, k3, k4, k5, k6, k7, k8, k9]
     ]
@@ -335,22 +335,22 @@ hideOtherScratchpads except = do
 -- ---------------------------------------------------------------------------
 -- Affinity-aware workspace switching
 
--- | Switch to workspace @tag@, respecting screen affinity.
+-- | Switch to workspace @tag@, respecting screen learnedAffinity.
 --
 -- Behaviour (matches Sway):
 --
 --   * If @tag@ is already the current workspace: no-op.
 --   * If @tag@ is visible on another screen: move focus to that screen
 --     (do NOT swap workspaces -- uses 'W.view', not 'W.greedyView').
---   * If @tag@ is hidden and has a recorded affinity for screen S:
+--   * If @tag@ is hidden and has a recorded learnedAffinity for screen S:
 --       - If S is the current screen: show @tag@ here (normal 'W.view').
 --       - If S is a different visible screen: show @tag@ on S, move focus to S.
 --       - If S is not present (monitor unplugged): show @tag@ on current screen.
---   * If @tag@ is hidden with no affinity: show on current screen.
+--   * If @tag@ is hidden with no learnedAffinity: show on current screen.
 affinityView :: String -> M ()
 affinityView tag = do
     ws <- gets windowset
-    aff <- gets affinity
+    aff <- gets learnedAffinity
     let currentSid  = W.screen (W.current ws)
         currentTag' = W.tag (W.workspace (W.current ws))
         visibleSids = map W.screen (W.visible ws)
@@ -370,8 +370,8 @@ affinityView tag = do
                         -- show the workspace there and focus that screen
                         windows (viewOnScreen sid tag)
                     _ ->
-                        -- No affinity, or affinity is current screen,
-                        -- or affinity screen doesn't exist
+                        -- No learnedAffinity, or learnedAffinity is current screen,
+                        -- or learnedAffinity screen doesn't exist
                         windows (W.view tag)
 
 -- | Shift the focused window to workspace @tag@, without changing focus.
@@ -390,7 +390,7 @@ data Direction = Prev | Next deriving (Eq, Show)
 cycleOnOutput :: Direction -> M ()
 cycleOnOutput dir = do
     ws <- gets windowset
-    aff <- gets affinity
+    aff <- gets learnedAffinity
     let currentSid  = W.screen (W.current ws)
         currentTag' = W.tag (W.workspace (W.current ws))
         allTags     = sort $ map W.tag (W.workspaces ws)
@@ -426,19 +426,19 @@ findNext dir current tags =
 -- ---------------------------------------------------------------------------
 -- Affinity helpers
 
--- | Get the affinity map.
+-- | Get the learnedAffinity map.
 getAffinity :: M (Map String ScreenId)
-getAffinity = gets affinity
+getAffinity = gets learnedAffinity
 
--- | Set affinity for a single workspace.
+-- | Set learnedAffinity for a single workspace.
 setAffinity :: String -> ScreenId -> M ()
 setAffinity tag sid =
-    modify $ \s -> s { affinity = Map.insert tag sid (affinity s) }
+    modify $ \s -> s { learnedAffinity = Map.insert tag sid (learnedAffinity s) }
 
--- | Clear affinity for a workspace (it will appear on whatever screen is current).
+-- | Clear learnedAffinity for a workspace (it will appear on whatever screen is current).
 clearAffinity :: String -> M ()
 clearAffinity tag =
-    modify $ \s -> s { affinity = Map.delete tag (affinity s) }
+    modify $ \s -> s { learnedAffinity = Map.delete tag (learnedAffinity s) }
 
 -- ---------------------------------------------------------------------------
 -- Directional focus (spatial navigation)

@@ -46,7 +46,7 @@ import System.Directory (getHomeDirectory)
 import System.FilePath ((</>))
 import System.IO (hSetBuffering, BufferMode(..), hFlush, hPutStrLn, IOMode(..), stderr)
 
-import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..))
+import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..), ScreenRole, parseRole)
 
 -- ---------------------------------------------------------------------------
 -- Protocol version
@@ -61,7 +61,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 11
+protocolVersion = 12
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -372,10 +372,12 @@ data WindowInfo = WindowInfo
     , wiFrame               :: !Rectangle
     } deriving (Show, Generic)
 
--- | Information about a screen/display.
+-- | Information about a screen/display. 'siRole' is what the daemon
+-- decided the display is for (see "MCMonad.Affinity").
 data ScreenInfo = ScreenInfo
     { siScreenId :: !Int
     , siFrame    :: !Rectangle
+    , siRole     :: !ScreenRole
     } deriving (Show, Generic)
 
 -- | Project the metadata subset of a 'WindowInfo' for caching in the
@@ -406,6 +408,7 @@ instance Aeson.FromJSON ScreenInfo where
     parseJSON = Aeson.withObject "ScreenInfo" $ \v -> ScreenInfo
         <$> v .: "screenId"
         <*> v .: "frame"
+        <*> (v .: "role" >>= \s -> maybe (fail ("unknown screen role: " ++ s)) pure (parseRole s))
 
 instance Aeson.FromJSON Event where
     parseJSON = Aeson.withObject "Event" $ \v -> do

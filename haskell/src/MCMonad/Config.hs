@@ -5,6 +5,7 @@ module MCMonad.Config
     , KeyCode, Modifiers
     , optionMask, commandMask, shiftMask, controlMask
     , defaultConfig, defaultKeys
+    , defaultAffinity, xmonadClassic
     ) where
 
 import Data.Map.Strict (Map)
@@ -23,7 +24,7 @@ import MCMonad.Layout (Tall(..), Full(..), (|||))
 import MCMonad.ManageHook (ManageHook, defaultManageHook)
 import MCMonad.Operations
     ( windows, sendMessage, kill, spawn, withFocused, screenWorkspace
-    , jumpToActiveWindow, showSpotlight
+    , jumpToActiveWindow, showSpotlight, viewWorkspace
     )
 
 -- ---------------------------------------------------------------------------
@@ -84,6 +85,14 @@ data MConfig l = MConfig
     , mouseWarping       :: !Bool
       -- ^ Whether to warp the mouse cursor to the focused window on
       -- workspace\/screen changes. Sway disables this.
+    , affinity           :: ![AffinityRule]
+      -- ^ Which screen role each workspace belongs to; see
+      -- "MCMonad.Affinity". Workspaces no rule names belong to 'Primary'.
+      -- Default: 'defaultAffinity'.
+    , viewMode           :: !ViewMode
+      -- ^ 'Affine' (a workspace appears on its role's screen and focus
+      -- follows it) or 'Classic' (xmonad's greedy view onto the screen
+      -- you are on). Default 'Affine'; 'xmonadClassic' flips it.
     , ocrIndex           :: !Bool
       -- ^ Keep an in-memory OCR index of the windows on the displayed
       -- workspaces, so the launcher's window search and its \"where is\"
@@ -121,10 +130,32 @@ defaultConfig = MConfig
     , focusedBorderColor = "#ffffff"
     , focusFollowsMouse  = True
     , mouseWarping       = True
+    , affinity           = defaultAffinity
+    , viewMode           = Affine
     , ocrIndex           = True
     , logHook            = return ()
     , startupHook        = return ()
     }
+
+-- | The default affinity: @a@ belongs to the tertiary screen, @o@ to the
+-- secondary, and 7 8 9 0 are split between them — 7 8 tertiary, 9 0
+-- secondary; with only one of those screens attached 9 0 go there and
+-- 7 8 to the primary. Everything else belongs to the primary screen.
+defaultAffinity :: [AffinityRule]
+defaultAffinity =
+    [ Pin Tertiary  ["a"]
+    , Pin Secondary ["o"]
+    , SplitAcross [Tertiary, Secondary] ["7", "8", "9", "0"]
+    ]
+
+-- | xmonad's classic behaviour: viewing a workspace pulls it onto the
+-- screen you are on and focus stays put. Affinity rules are ignored.
+--
+-- @
+-- main = mcmonad (xmonadClassic defaultConfig)
+-- @
+xmonadClassic :: MConfig l -> MConfig l
+xmonadClassic cfg = cfg { viewMode = Classic }
 
 -- ---------------------------------------------------------------------------
 -- Palinchron-style workspaces
@@ -259,10 +290,10 @@ defaultKeys conf = Map.fromList $
 
     ]
     ++
-    -- Workspaces: Mod-1..9 to view, Mod-Shift-1..9 to shift
-    [ ((mask, key), windows (action ws))
+    -- Workspaces: Mod-1..9 to view (by affinity), Mod-Shift-1..9 to shift
+    [ ((mask, key), act)
     | (ws, key) <- zip (mcWorkspaces conf) [k1, k2, k3, k4, k5, k6, k7, k8, k9]
-    , (action, mask) <- [(W.greedyView, m), (W.shift, m .|. shiftMask)]
+    , (act, mask) <- [(viewWorkspace ws, m), (windows (W.shift ws), m .|. shiftMask)]
     ]
     ++
     -- Screens: Mod-{w,e,r} to focus, Mod-Shift-{w,e,r} to shift
@@ -274,20 +305,20 @@ defaultKeys conf = Map.fromList $
     -- Personal layer: "0" and the letter workspaces. Opt+<key> views,
     -- Opt+Shift+<key> moves the focused window — except Opt+Shift+C, which
     -- stays "kill" (above), so workspace "c" is view-only.
-    [ ((mask, key), windows (act ws))
+    [ ((mask, key), act)
     | (ws, key)    <- ("0", k0) : letterWorkspaces
-    , (act, mask)  <- (W.greedyView, m)
-                    : [ (W.shift, m .|. shiftMask) | ws /= "c" ]
+    , (act, mask)  <- (viewWorkspace ws, m)
+                    : [ (windows (W.shift ws), m .|. shiftMask) | ws /= "c" ]
     ]
     ++
     -- Palinchron colour workspaces: 40 numpad-palette workspaces, each reached
     -- by its layer's modifier combo + the numpad digit (View navigates, Move
     -- sends the focused window). Ergonomic with the Keychron Q0 firmware.
-    [ ((palinchronMods layer isView, keypadKey d), windows (act ws))
+    [ ((palinchronMods layer isView, keypadKey d), act)
     | layer          <- [0 .. 3]
     , d              <- [0 .. 9]
     , let ws          = palinchronWorkspace layer d
-    , (isView, act)  <- [(True, W.greedyView), (False, W.shift)]
+    , (isView, act)  <- [(True, viewWorkspace ws), (False, windows (W.shift ws))]
     ]
   where
     m = modMask conf

@@ -9,6 +9,7 @@ library
   default-language: GHC2021
   ghc-options: -Wall -Wcompat
   exposed-modules:
+    MCMonad.Affinity
     MCMonad
     MCMonad.Core
     MCMonad.Debug

@@ -215,7 +215,16 @@ xmonad xmonad.
 7. **Nix for tooling.** Flake provides GHC + Swift toolchains, builds both
    binaries, home-manager module runs Swift daemon via launchd.
 
-8. **Layouts can be ported from xmonad-contrib.** Since our `LayoutClass` mirrors
+8. **Screens are roles, not sides.** mcmonad-core decides which attached
+   display is primary / secondary / tertiary / aux (from the arrangement,
+   overridden by the user's picks in the launcher, keyed by display UUID in
+   the daemon's defaults) and reports the role with each screen's geometry.
+   The brain places workspaces by role (`MCMonad.Affinity`) and never knows
+   left from right. Viewing a workspace shows it on its role's screen and
+   moves focus there; xmonad's greedy view survives only behind
+   `xmonadClassic`.
+
+9. **Layouts can be ported from xmonad-contrib.** Since our `LayoutClass` mirrors
    xmonad's (same methods, different monad), layouts that use only `pureLayout`
    and `pureMessage` (most of them) can be copied with trivial changes.
 

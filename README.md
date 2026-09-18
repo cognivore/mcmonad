@@ -128,6 +128,35 @@ starts another 10-minute countdown; Peek after a 5-minute Snooze restarts those
 5 minutes. Existing state files remain readable; timers saved before duration
 tracking can still fire, Snooze, and Jump, but Peek is disabled for those timers.
 
+**Workspaces belong to screens.** Each attached display carries a *role* —
+primary, secondary, tertiary, or one of three auxiliary ones — and a
+workspace belongs to a role, never to "the left" or "the right". Viewing a
+workspace shows it on its role's screen and moves focus there (and the
+pointer, when focus follows the mouse or the config warps on switch); it is
+never pulled onto the screen you happen to be on. While a role's screen is
+unplugged its workspaces live on the primary; plug it back and they return,
+each screen getting the workspace it showed last. The default rules:
+
+```haskell
+affinity = [ Pin Tertiary ["a"], Pin Secondary ["o"]
+           , SplitAcross [Tertiary, Secondary] ["7", "8", "9", "0"] ]
+```
+
+`Pin` is what it says. `SplitAcross` cuts the list into as many chunks as roles
+and deals them out in order — 7 8 to the tertiary, 9 0 to the secondary —
+and with only one of those screens attached the last chunk goes there and
+the first returns to the primary. Every workspace no rule names belongs to
+the primary. `mcmonad (xmonadClassic defaultConfig)` keeps xmonad's greedy
+behaviour instead.
+
+Roles are assigned by mcmonad-core from the arrangement — the main display
+is primary, the nearest display to its right secondary, the nearest to its
+left tertiary, displays above or below auxiliary — and remembered per
+display (by its hardware UUID) once you choose otherwise: type `screen` in
+the launcher to see every attached display with its role and pick "make
+Secondary" or any other; the choice is kept in the daemon's defaults, and a
+role is never held by two displays.
+
 **Every list is most-recently-used first.** Windows, apps and builtin
 commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.

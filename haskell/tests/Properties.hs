@@ -11,6 +11,7 @@ import MCMonad.Core
     , PendingWindow(..), Timer(..)
     )
 import MCMonad.IPC (WindowInfo(..), Command(..))
+import MCMonad.Affinity
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy.Char8 as BL
 import MCMonad.Persistence
@@ -1404,9 +1405,145 @@ prop_ocr_index_wire on =
         , counterexample json (property (("\"on\":" ++ (if on then "true" else "false")) `L.isInfixOf` json))
         ]
 
+-- ---------------------------------------------------------------------------
+-- Workspace → screen affinity
+
+affinityRules' :: [AffinityRule]
+affinityRules' =
+    [ Pin Tertiary ["a"], Pin Secondary ["o"]
+    , SplitAcross [Tertiary, Secondary] ["7", "8", "9", "0"] ]
+
+roleSet :: [ScreenRole] -> Set.Set ScreenRole
+roleSet = Set.fromList
+
+prop_affinity_pin_falls_back_to_primary :: Bool
+prop_affinity_pin_falls_back_to_primary =
+    resolveAffinity affinityRules' (roleSet [Primary, Secondary, Tertiary]) "a" == Tertiary
+    && resolveAffinity affinityRules' (roleSet [Primary, Secondary]) "a" == Primary
+    && resolveAffinity affinityRules' (roleSet [Primary, Tertiary]) "o" == Primary
+    && resolveAffinity affinityRules' (roleSet [Primary, Secondary]) "o" == Secondary
+
+-- 7 8 → Tertiary and 9 0 → Secondary with both; with one attached the
+-- last half goes there and the first half returns to Primary.
+prop_affinity_split_deals_last_chunks_to_attached :: Bool
+prop_affinity_split_deals_last_chunks_to_attached =
+    and [ r [Primary, Secondary, Tertiary] == [Tertiary, Tertiary, Secondary, Secondary]
+        , r [Primary, Tertiary]            == [Primary, Primary, Tertiary, Tertiary]
+        , r [Primary, Secondary]           == [Primary, Primary, Secondary, Secondary]
+        , r [Primary]                      == [Primary, Primary, Primary, Primary]
+        ]
+  where r present = map (resolveAffinity affinityRules' (roleSet present)) ["7", "8", "9", "0"]
+
+prop_affinity_undeclared_is_primary :: String -> Property
+prop_affinity_undeclared_is_primary tag =
+    tag `notElem` ["a", "o", "7", "8", "9", "0"] ==>
+        resolveAffinity affinityRules' (roleSet [minBound .. maxBound]) tag == Primary
+
+prop_splitChunks_covers_evenly :: Positive Int -> [Int] -> Bool
+prop_splitChunks_covers_evenly (Positive n) xs =
+    let cs = splitChunks n xs
+    in concat cs == xs
+       && length cs == max 1 n
+       && all (\c -> length c <= (length xs + n - 1) `div` n) cs
+
+-- Three screens showing 1 2 3; the rest hidden.
+threeScreens :: [(ScreenId, ScreenDetail)]
+threeScreens = [ (S i, SD (Rectangle (fromIntegral i * 1000) 0 1000 800)) | i <- [0 .. 2] ]
+
+rolesPST :: Map.Map ScreenId ScreenRole
+rolesPST = Map.fromList [(S 0, Primary), (S 1, Secondary), (S 2, Tertiary)]
+
+tags9 :: [String]
+tags9 = ["1", "2", "3", "7", "8", "9", "0", "a", "o"]
+
+fixture3 :: TestStackSet
+fixture3 = W.new 0 tags9 (map snd threeScreens)
+
+prop_viewOn_shows_on_target_and_focuses :: Bool
+prop_viewOn_shows_on_target_and_focuses =
+    let ws = viewOn (S 2) "a" fixture3
+    in W.lookupWorkspace (S 2) ws == Just "a"
+       && W.screen (W.current ws) == S 2
+       && W.lookupWorkspace (S 0) ws == Just "1"
+       && W.lookupWorkspace (S 1) ws == Just "2"
+       && "3" `elem` map W.tag (W.hidden ws)
+       && invariant ws
+
+-- "3" is on S 2; viewing it on S 1 moves it there and "2" takes S 2.
+prop_viewOn_moves_a_workspace_visible_elsewhere :: Bool
+prop_viewOn_moves_a_workspace_visible_elsewhere =
+    let ws = viewOn (S 1) "3" fixture3
+    in W.lookupWorkspace (S 1) ws == Just "3"
+       && W.lookupWorkspace (S 2) ws == Just "2"
+       && W.screen (W.current ws) == S 1
+       && invariant ws
+
+prop_viewOn_on_its_own_screen_only_focuses :: Bool
+prop_viewOn_on_its_own_screen_only_focuses =
+    viewOn (S 1) "2" fixture3 == W.view "2" fixture3
+
+prop_placeForRoles_fills_role_screens :: Bool
+prop_placeForRoles_fills_role_screens =
+    let ws  = placeForRoles affinityRules' rolesPST Map.empty tags9 fixture3
+        res = resolveAffinity affinityRules' (roleSet [Primary, Secondary, Tertiary])
+    in fmap res (W.lookupWorkspace (S 1) ws) == Just Secondary
+       && fmap res (W.lookupWorkspace (S 2) ws) == Just Tertiary
+       && W.lookupWorkspace (S 0) ws == Just "1"          -- the user's screen is untouched
+       && W.screen (W.current ws) == S 0
+       && invariant ws
+
+prop_placeForRoles_prefers_last_shown :: Bool
+prop_placeForRoles_prefers_last_shown =
+    let lastOn = Map.fromList [(Tertiary, "a"), (Secondary, "o")]
+        ws = placeForRoles affinityRules' rolesPST lastOn tags9 fixture3
+    in W.lookupWorkspace (S 2) ws == Just "a" && W.lookupWorkspace (S 1) ws == Just "o"
+
+prop_placeForRoles_idempotent :: Bool
+prop_placeForRoles_idempotent =
+    let f    = placeForRoles affinityRules' rolesPST Map.empty tags9
+        once = f fixture3
+    in f once == once
+
+-- a lives on the tertiary screen; unplug it and a is hidden and views on
+-- the primary; plug it back and a returns to it.
+prop_affinity_unplug_replug_round_trip :: Bool
+prop_affinity_unplug_replug_round_trip =
+    let lastOn  = Map.fromList [(Tertiary, "a")]
+        start   = placeForRoles affinityRules' rolesPST lastOn tags9 fixture3
+        rolesPS = Map.fromList [(S 0, Primary), (S 1, Secondary)]
+        gone    = case reassignScreens (take 2 threeScreens) start of
+                      Just ws -> placeForRoles affinityRules' rolesPS lastOn tags9 ws
+                      Nothing -> error "no screens"
+        aHidden   = "a" `elem` map W.tag (W.hidden gone)
+        onPrimary = W.lookupWorkspace (S 0) (viewOn (S 0) "a" gone) == Just "a"
+        back      = case reassignScreens threeScreens gone of
+                      Just ws -> placeForRoles affinityRules' rolesPST lastOn tags9 ws
+                      Nothing -> error "no screens"
+    in W.lookupWorkspace (S 2) start == Just "a"
+       && aHidden && onPrimary
+       && W.lookupWorkspace (S 2) back == Just "a"
+       && invariant back
+
+prop_role_names_round_trip :: Bool
+prop_role_names_round_trip =
+    all (\r -> parseRole (roleName r) == Just r) [minBound .. maxBound]
+    && parseRole "left" == Nothing
+
 allProperties :: [(String, Property)]
 allProperties =
-    [ ("ocr-index wire format", property prop_ocr_index_wire)
+    [ ("affinity: pin falls back to primary", property prop_affinity_pin_falls_back_to_primary)
+    , ("affinity: split deals last chunks to attached", property prop_affinity_split_deals_last_chunks_to_attached)
+    , ("affinity: undeclared is primary", property prop_affinity_undeclared_is_primary)
+    , ("affinity: splitChunks covers evenly", property prop_splitChunks_covers_evenly)
+    , ("affinity: viewOn shows on target and focuses", property prop_viewOn_shows_on_target_and_focuses)
+    , ("affinity: viewOn moves a workspace visible elsewhere", property prop_viewOn_moves_a_workspace_visible_elsewhere)
+    , ("affinity: viewOn on its own screen only focuses", property prop_viewOn_on_its_own_screen_only_focuses)
+    , ("affinity: placeForRoles fills role screens", property prop_placeForRoles_fills_role_screens)
+    , ("affinity: placeForRoles prefers last shown", property prop_placeForRoles_prefers_last_shown)
+    , ("affinity: placeForRoles idempotent", property prop_placeForRoles_idempotent)
+    , ("affinity: unplug/replug round trip", property prop_affinity_unplug_replug_round_trip)
+    , ("affinity: role names round trip", property prop_role_names_round_trip)
+    , ("ocr-index wire format", property prop_ocr_index_wire)
     , ("timer persistence + legacy snapshot", property prop_timer_persistence)
     , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)

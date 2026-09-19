@@ -201,9 +201,12 @@ final class ScreenIndex {
         let lastInput = Date(timeIntervalSinceNow: -idle)
         if pass.isEmpty {
             // An idle pass starts once the user has been quiet for
-            // `idleAfter` and has been back since the last pass began.
+            // `idleAfter` and has been back since the last pass began. The
+            // last-input instant is recomputed each tick from a running
+            // idle counter, so it drifts by milliseconds; a second's
+            // tolerance keeps that drift from counting as a return.
             guard !forced, idle >= Self.idleAfter, CGDisplayIsAsleep(CGMainDisplayID()) == 0,
-                  passInputMark.map({ lastInput > $0 }) ?? true
+                  passInputMark.map({ lastInput.timeIntervalSince($0) > 1 }) ?? true
             else { return }
             passInputMark = lastInput
             pass = visible + hidden.filter { !visible.contains($0) }

@@ -24,6 +24,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     var snapshotProvider: (() -> OverlaySnapshot?)?
     /// The screen index's one-line status, read fresh on every open.
     var screenIndexStatus: (() -> String)?
+    var whatsUpMonitoringEnabled: (() -> Bool)?
+    var onSetWhatsUpMonitoring: ((Bool) -> Void)?
 
     /// Fires when the user clicks the "Debug frame overlays" item.
     /// The main module wires this to send `menuToggleDebug` to Haskell.
@@ -99,6 +101,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         )
         header.isEnabled = false
         menu.addItem(header)
+        let monitoring = whatsUpMonitoringEnabled?() ?? false
+        let monitoringItem = NSMenuItem(
+            title: "What's up monitoring: \(monitoring ? "On" : "Off") — sends to Claude",
+            action: #selector(toggleWhatsUpMonitoring(_:)), keyEquivalent: "")
+        monitoringItem.target = self
+        monitoringItem.state = monitoring ? .on : .off
+        menu.addItem(monitoringItem)
         if let status = screenIndexStatus?() {
             let row = NSMenuItem(title: "Screen index: \(status)", action: nil, keyEquivalent: "")
             row.isEnabled = false
@@ -314,6 +323,19 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     // MARK: - Actions
+
+    @objc private func toggleWhatsUpMonitoring(_ sender: Any?) {
+        if whatsUpMonitoringEnabled?() == true {
+            onSetWhatsUpMonitoring?(false)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Enable background summaries with Claude?"
+        alert.informativeText = "While you are idle, mcmonad will send workspace names, app names, window titles and excerpts of recognised screen text to Anthropic through your Claude CLI. This includes covered windows and hidden workspaces. This choice is remembered. Turn it off here to stop future calls and clear summaries; data already sent cannot be recalled."
+        alert.addButton(withTitle: "Enable monitoring")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { onSetWhatsUpMonitoring?(true) }
+    }
 
     @objc private func toggleDebugClicked(_ sender: Any?) {
         onToggleDebugOverlays?()

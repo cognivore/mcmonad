@@ -15,6 +15,8 @@ import Foundation
 ///   * nothing in the background while the user is at the keyboard — the
 ///     recap is for when they step away; "! what's up" forces one.
 ///
+/// Monitoring is off until the user explicitly enables it in the menu bar.
+/// Every call (including a forced refresh) checks that choice at dispatch.
 /// Opening "what's up" only reads the cache: it is instant and costs nothing.
 /// A workspace that did not change is never asked about again.
 @MainActor
@@ -52,7 +54,9 @@ final class WhatsUpCache {
     /// A summary needs far less of each window's text than a search does.
     static let textBudget = 40_000
     static let textPerWindow = 500
+    static let preferenceKey = "whatsUpMonitoringEnabled"
 
+    private(set) var isEnabled: Bool
     private(set) var entries: [String: Entry] = [:]
     /// Workspaces with windows, on-screen first — the manifold's order.
     private(set) var order: [String] = []
@@ -62,31 +66,62 @@ final class WhatsUpCache {
     /// True while the user is away from the keyboard: the only time a
     /// background call is worth its tokens, since the recap is read on return.
     private let quiet: () -> Bool
-    private let runner = AskRunner()
+    private let runner: any AskRunning
+    private let preferences: UserDefaults
+    private let wait: (TimeInterval) async throws -> Void
     private var inFlight: [String: Fingerprint] = [:]
-    private var pendingGeneration = 0
+    private var activeCall: UUID?
+    private var pendingRefresh: Task<Void, Never>?
     private var lastCallEnded = Date.distantPast
 
     /// Fires whenever rows may have changed (a call started or landed).
     var onUpdated: (() -> Void)?
     var isRefreshing: Bool { !inFlight.isEmpty }
 
-    init(text: @escaping (UInt32) -> String?, textHash: @escaping (UInt32) -> Int?, quiet: @escaping () -> Bool) {
+    init(text: @escaping (UInt32) -> String?, textHash: @escaping (UInt32) -> Int?, quiet: @escaping () -> Bool,
+         preferences: UserDefaults = .standard, runner: any AskRunning = AskRunner(),
+         wait: @escaping (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }) {
         self.text = text
         self.textHash = textHash
         self.quiet = quiet
-        runner.onFinished = { [weak self] outcome in self?.finished(outcome) }
+        self.preferences = preferences
+        self.runner = runner
+        self.wait = wait
+        isEnabled = preferences.bool(forKey: Self.preferenceKey)
+    }
+
+    /// The menu's explicit opt-in is the only way to enable monitoring.
+    /// Turning it off revokes queued work and drops derived screen content.
+    /// Terminating a call cannot retract data already sent to the provider.
+    func setEnabled(_ enabled: Bool) {
+        guard enabled != isEnabled else { return }
+        isEnabled = enabled
+        preferences.set(enabled, forKey: Self.preferenceKey)
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
+        activeCall = nil
+        runner.cancel()
+        inFlight = [:]
+        entries = [:]
+        order = []
+        if enabled {
+            refingerprint()
+            scheduleBackgroundRefresh()
+        }
+        onUpdated?()
     }
 
     // MARK: - Told by the window manager
 
     func noteSnapshot(_ snap: OverlaySnapshot) {
         snapshot = snap
+        guard isEnabled else { return }
         refingerprint()
         scheduleBackgroundRefresh()
     }
 
     func noteTextChanged() {
+        guard isEnabled else { return }
         refingerprint()
         scheduleBackgroundRefresh()
     }
@@ -145,7 +180,8 @@ final class WhatsUpCache {
     /// Workspaces worth a call: window-set changes always, text changes
     /// once the summary is `textRefreshAge` old (or there is none).
     func due(at now: Date = Date()) -> Set<String> {
-        Set(entries.compactMap { tag, e in
+        guard isEnabled else { return [] }
+        return Set(entries.compactMap { tag, e in
             guard inFlight[tag] == nil else { return nil }
             switch e.staleness {
             case .fresh: return nil
@@ -162,35 +198,43 @@ final class WhatsUpCache {
     /// Trailing debounce: the last event in a burst wins. Only while the
     /// user is away: at the keyboard they get the cache and its date.
     private func scheduleBackgroundRefresh() {
-        guard quiet() else { return }
-        pendingGeneration += 1
-        let generation = pendingGeneration
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(Self.quietPeriod))
-            guard let self, self.pendingGeneration == generation else { return }
+        guard isEnabled, quiet() else { return }
+        schedule(after: Self.quietPeriod)
+    }
+
+    private func schedule(after delay: TimeInterval) {
+        pendingRefresh?.cancel()
+        let wait = self.wait
+        pendingRefresh = Task { @MainActor [weak self] in
+            do { try await wait(delay) } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.pendingRefresh = nil
             self.refreshDue()
         }
     }
 
     private func refreshDue(force: Bool = false) {
-        guard !isRefreshing, let snap = snapshot else { return }
+        guard isEnabled, force || quiet(), !isRefreshing, let snap = snapshot else { return }
         let tags = due()
         guard !tags.isEmpty else { return }
         let wait = Self.minGap - Date().timeIntervalSince(lastCallEnded)
         if wait > 0, !force {
-            pendingGeneration += 1
-            let generation = pendingGeneration
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(wait))
-                guard let self, self.pendingGeneration == generation else { return }
-                self.refreshDue()
-            }
+            schedule(after: wait)
             return
         }
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
         let manifold = Ask.manifold(question: WhatsUp.question, snapshot: snap, text: text, only: tags,
                                     budget: Self.textBudget, perWindow: Self.textPerWindow)
         for tag in tags { inFlight[tag] = entries[tag]?.fingerprint }
         let known = manifold.tags
+        let call = UUID()
+        activeCall = call
+        runner.onFinished = { [weak self] outcome in
+            guard let self, self.isEnabled, self.activeCall == call else { return }
+            self.activeCall = nil
+            self.finished(outcome)
+        }
         runner.start(prompt: Ask.prompt(for: manifold), arguments: WhatsUp.arguments) {
             WhatsUp.parseLine($0, knownTags: known)
         }
@@ -217,6 +261,7 @@ final class WhatsUpCache {
     /// stay at its initial staleness: parked windows are read a dozen at a
     /// time while a call is in flight, and that would ask again every time.)
     func apply(_ summaries: [WhatsUp.Summary], asked: [String: Fingerprint], at now: Date = Date()) {
+        guard isEnabled else { return }
         let byTag = Dictionary(summaries.map { ($0.tag, $0) }, uniquingKeysWith: { a, _ in a })
         for (tag, fp) in asked {
             guard var e = entries[tag] else { continue }

@@ -235,6 +235,10 @@ xmonad xmonad.
   `ocrIndex = False` opts out). On macOS 26 nothing prompts; a
   ScreenCaptureKit query lists MCMonadCore.app in the pane, unticked, and the
   daemon opens the pane once. Whatever the index reads off the framebuffer
-  stays in mcmonad-core's memory: never on disk, never logged, never on the
-  socket. The same rule binds anything else that touches window pixels.
+  is indexed in mcmonad-core's memory: never written by the index to disk,
+  logged, or put on the Haskell socket. Cloud disclosure requires a confirmed
+  one-off search or explicit menu-bar opt-in to What's up monitoring (off by
+  default). Opting out cancels queued/in-flight monitoring and clears cached
+  summaries; it cannot recall data already sent. Claude's local session
+  persistence flag is not a provider-retention guarantee.
 - No other explicit permissions needed.

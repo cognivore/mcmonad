@@ -176,28 +176,31 @@ list on the clipboard; the same lines are logged as `PERMS:` at startup.
 commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.
 
-**Window search reads inside windows.** mcmonad-core keeps an OCR index of
+**Local window search can read inside windows.** mcmonad-core keeps an OCR index of
 every window it manages, displayed or parked on a hidden workspace: each is
 captured through ScreenCaptureKit (the window's own buffer, so a covered or
-parked window reads like a visible one) and read with Vision whenever its
-pixels change — displayed windows are checked every six seconds and on every
-layout or focus change, hidden ones every thirty seconds, at most six
-recognitions per cycle so a big sweep spreads out — and again each time the
-launcher opens. A query that matches no title is then matched against
+parked window reads like a visible one) and read locally with Vision during
+an idle pass, only when its picture changed. A query that matches no title is then matched against
 that text; such rows show the matching line beneath the title with the words
 highlighted. The index is **on by default** and needs the *Screen & System
 Audio Recording* permission for `MCMonadCore.app` — the first run lists the
 app in that pane and opens it; tick it and the index starts on the next cycle.
 Opt out with `ocrIndex = False` in `mcmonad.hs`.
 
-**The index reads when you step away.** Nothing is captured while you are at the keyboard. After three minutes without input the index makes one pass over every window (displayed first, then parked; a window is re-read only if its picture changed), and "what's up" refreshes the workspaces that changed, so the recap is ready when you come back. Opening "what's up" shows the cache and when it was made; `! what's up` (or `! where is …`) re-reads every window first. One accurate read of a big window costs about three CPU-seconds, which is why it is no longer done every six seconds.
+**The local index reads when you step away.** After three minutes without input it makes one pass over every window, displayed first and then parked, at most three recognitions per tick. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries.
 
-Everything read off the framebuffer stays in mcmonad-core's memory. It is
-never written to disk, never logged, and never sent to the Haskell brain.
+The index keeps its readings in memory and does not write screenshots or OCR
+text to disk, logs or the Haskell socket. **Cloud features are a separate
+disclosure:** a confirmed search or opted-in monitoring sends window metadata
+and OCR excerpts through the installed Claude CLI. `--no-session-persistence`
+requests no local Claude session history; it does not establish provider
+retention or control other CLI configuration. Ordinary window search stays local.
 
 **"where is …" asks Claude.** Type or say `where is the deploy terminal`
 (`where's`, `where are`, `where did I put` work too) in either mode and
-press Return. The launcher hands the question, together with every window
+press Return, then confirm **Send this search**. Voice requests require the
+same confirmation. Cancel sends nothing. This approves one search and does
+not enable background monitoring. The launcher hands the question, together with every window
 (workspace, app, title, focus, and an excerpt of its recognised text) to the
 Claude Code CLI already installed on the Mac — `claude -p`, model
 `claude-fable-5-1` at low effort, no tools, session persistence off — and
@@ -208,15 +211,23 @@ question's words highlighted in it; Return focuses one, Esc goes back to the
 query. The CLI must be logged in; it is looked for in `~/.local/bin`,
 `/opt/homebrew/bin`, `/usr/local/bin` and `PATH`.
 
-**"what's up" summarises every workspace.** Type or say `what's up` (or pick
-the builtin row in command mode) and the same call goes out with a different
-contract: for every workspace that has windows, one terse sentence on what is
-going on there and one on the evidence — the titles or recognised text — that
-makes it right. The instruction asks for caveman brevity: substance only,
-structured output only. Rows come in workspace order, on-screen ones first,
-each with its reason underneath. Return views that workspace.
+**"What's up" monitoring is off by default.** The mcmonad menu bar has a
+**What's up monitoring: Off/On — sends to Claude** switch. Turning it on
+requires confirmation explaining what is sent to Anthropic: workspace names,
+app names, window titles, focus/window identifiers and OCR excerpts, including
+covered windows and hidden workspaces. Excerpts are limited to 500 characters
+per window and a shared 40,000-character budget (plus truncation markers);
+titles and metadata are included separately. The choice is remembered across
+restarts. Turning it off cancels queued refreshes and the active CLI process,
+clears cached summaries and prevents forced refreshes too. It cannot recall
+data already sent. `ocrIndex = False` removes OCR excerpts but does **not**
+disable title-based cloud monitoring; use the menu switch to stop monitoring.
 
-The answers are cached per workspace and kept current by what the window
+After opting in, type or say `what's up` to see the cached workspace summaries
+and their supporting evidence. Return views a workspace. When monitoring is
+off, opening this view explains how to enable it and sends nothing.
+
+While monitoring is enabled, answers are cached per workspace and kept current by what the window
 manager itself reports, so opening "what's up" only reads the cache — instant,
 no call — and a workspace that did not change is never asked about again.
 Every layout snapshot and every OCR re-read updates a per-workspace
@@ -225,8 +236,13 @@ moved) refreshes just the changed workspaces in the background after a
 three-second quiet period. A change only to titles or recognised text also
 refreshes in the background, but only once that workspace's summary is ten
 minutes old, so a terminal repainting all day costs a call every ten minutes
-at most. Calls are batched and at least twenty seconds apart. Rows being
+at most. Automatic calls run only while idle, are batched and at least twenty seconds apart. Rows being
 refreshed while the panel is open say "(refreshing…)" and update in place.
+
+Local diagnostic logs use salted title hashes rather than raw titles. Debug
+event logging and IPC decode failures also withhold window content. File logs
+rotate daily and keep two archives by default; that policy applies only to
+mcmonad's local log files, not to information sent to a provider.
 
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first

@@ -406,7 +406,8 @@ enum IPCCommand: Decodable, Sendable {
     case showSpotlight(mode: String)
     case setTimers(timers: [TimerSpec])
     /// Turn the in-memory OCR index of displayed windows on or off
-    /// (`MCMonad.Config.ocrIndex`). What it reads never goes back out.
+    /// (`MCMonad.Config.ocrIndex`). Recognised text never crosses this socket;
+    /// separately authorised Claude features may send excerpts to the provider.
     case setOcrIndex(on: Bool)
 
     private enum CmdType: String, Decodable {

@@ -423,7 +423,7 @@ eventLoop debug cfg hotkeyIdMap deferred = do
 -- | Dispatch a single event from the Swift daemon.
 handleEvent :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> Event -> M ()
 handleEvent debug cfg hotkeyIdMap evt = do
-    when debug $ io $ hPutStrLn stderr $ "EVENT: " ++ show evt
+    when debug $ io $ hPutStrLn stderr $ "EVENT: " ++ eventLogSummary evt
     case evt of
         WindowCreated winfo -> do
             -- A saved window the daemon is only reporting now goes back
@@ -629,7 +629,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
         QueryWindowsResponse _  -> return ()
         QueryScreensResponse _  -> return ()
 
-        IgnoredEvent name ->
+        IgnoredEvent _ ->
             -- IPC protocol skew: a wire message we couldn't decode.
             -- Logged once per occurrence so the user notices, but
             -- does not crash the loop. Most often hit when a
@@ -638,7 +638,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- check should normally prevent that pairing, but this
             -- is the defence-in-depth.
             io $ hPutStrLn stderr $
-                "mcmonad: ignoring unknown wire message: " ++ T.unpack name
+                "mcmonad: ignoring unknown wire message (peer text withheld for privacy)"
 
 -- ---------------------------------------------------------------------------
 -- Focus event dispatch

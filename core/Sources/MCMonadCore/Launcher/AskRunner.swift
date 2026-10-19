@@ -4,10 +4,17 @@ import os
 /// Runs one launcher question through the Claude Code CLI already on this
 /// Mac (`claude -p`), streaming its transcript back and ending in exactly one
 /// `Ask.Outcome`. The prompt goes in on stdin and the CLI is told not to
-/// persist the session, so the recognised screen text it carries exists only
-/// in the two processes' memory for the length of the call.
+/// persist the local session. This does not control the provider's retention.
 @MainActor
-final class AskRunner {
+protocol AskRunning: AnyObject {
+    var onFinished: ((Ask.Outcome) -> Void)? { get set }
+    func start(prompt: String, arguments: [String],
+               parse: @escaping @Sendable (String) -> Ask.StreamItem)
+    func cancel()
+}
+
+@MainActor
+final class AskRunner: AskRunning {
     private static let logger = Logger(subsystem: "com.mcmonad.core", category: "Ask")
 
     /// Text to append to the on-screen transcript, in order.
@@ -19,6 +26,7 @@ final class AskRunner {
 
     private var process: Process?
     private var finished = false
+    private var runID: UUID?
 
     /// A byte buffer one reader thread appends to; boxed so the sendable
     /// handlers may hold it.
@@ -38,6 +46,8 @@ final class AskRunner {
     func start(prompt: String, arguments: [String],
                parse: @escaping @Sendable (String) -> Ask.StreamItem) {
         cancel()
+        let runID = UUID()
+        self.runID = runID
         finished = false
         guard let cli = Self.locateCLI() else {
             let looked = Ask.candidates(home: NSHomeDirectory(),
@@ -75,7 +85,7 @@ final class AskRunner {
                 let item = parse(line)
                 DispatchQueue.main.async { [weak self] in
                     MainActor.assumeIsolated {
-                        guard let self else { return }
+                        guard let self, self.runID == runID, !self.finished else { return }
                         switch item {
                         case .delta(let text): self.onTranscript?(text)
                         case .note(let text): self.onNote?(text)
@@ -99,7 +109,7 @@ final class AskRunner {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             DispatchQueue.main.async { [weak self] in
                 MainActor.assumeIsolated {
-                    guard let self, self.process?.processIdentifier == pid else { return }
+                    guard let self, self.runID == runID, self.process?.processIdentifier == pid else { return }
                     self.process = nil
                     // A result line normally arrives before exit; if it did
                     // not, the exit status is the only evidence we have.
@@ -126,19 +136,23 @@ final class AskRunner {
         let data = Data(prompt.utf8)
         let writer = stdin.fileHandleForWriting
         DispatchQueue.global(qos: .userInitiated).async {
-            writer.write(data)
+            // Cancellation closes stdin; a cancelled write is an expected
+            // failure, not an Objective-C exception from FileHandle.write.
+            try? writer.write(contentsOf: data)
             try? writer.close()
         }
     }
 
     /// Stop a running call. No outcome is reported for a cancelled call.
     func cancel() {
-        guard let p = process else { return }
+        runID = nil
         finished = true
+        guard let p = process else { return }
         process = nil
         p.terminationHandler = nil
         (p.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         (p.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        try? (p.standardInput as? Pipe)?.fileHandleForWriting.close()
         p.terminate()
     }
 

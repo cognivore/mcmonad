@@ -6,7 +6,7 @@ import CoreGraphics
 
 @main
 enum LauncherLogicChecks {
-    static func main() {
+    @MainActor static func main() async {
         checkTerms()
         checkHits()
         checkRanges()
@@ -16,6 +16,7 @@ enum LauncherLogicChecks {
         checkStream()
         checkWhatsUp()
         checkWhatsUpCache()
+        await checkMonitoringPrivacy()
         checkRecency()
         print("Launcher logic checks passed")
     }
@@ -183,7 +184,12 @@ enum LauncherLogicChecks {
                             hiddenWorkspaces: hidden.map { OverlayHiddenWorkspace(tag: $0.0, windows: $0.1) })
         }
         var hashes: [UInt32: Int] = [7: 1]
-        let cache = WhatsUpCache(text: { _ in nil }, textHash: { hashes[$0] }, quiet: { true })
+        let suite = "mcmonad-checks-\(UUID())"
+        let preferences = UserDefaults(suiteName: suite)!
+        defer { preferences.removePersistentDomain(forName: suite) }
+        let cache = WhatsUpCache(text: { _ in nil }, textHash: { hashes[$0] }, quiet: { false },
+                                 preferences: preferences, runner: RecordingRunner())
+        cache.setEnabled(true)
         cache.noteSnapshot(snap([("3", [w(7, "Ghostty", "deploy")])], [("o5", [w(9, "Chrome", "cats")]), ("z", [])]))
         precondition(cache.order == ["3", "o5"])
         precondition(cache.due() == ["3", "o5"], "new workspaces are due")
@@ -225,6 +231,130 @@ enum LauncherLogicChecks {
         // …whereas a moved window set is due at once.
         cache.apply([.init(tag: "3", summary: "Later2.", reason: "r")], asked: ["3": WhatsUpCache.Fingerprint(structure: 0, text: fp3.text)], at: t0)
         precondition(cache.due(at: t0) == ["3"], "window set moved during the call: due now")
+    }
+
+    @MainActor final class RecordingRunner: AskRunning {
+        var onFinished: ((Ask.Outcome) -> Void)?
+        var prompts: [String] = []
+        var completions: [(Ask.Outcome) -> Void] = []
+        var running = false
+
+        func start(prompt: String, arguments: [String], parse: @escaping @Sendable (String) -> Ask.StreamItem) {
+            prompts.append(prompt)
+            completions.append(onFinished!)
+            running = true
+        }
+        func cancel() { running = false }
+    }
+
+    /// A controllable clock; even a cancelled sleep can resume, as can an
+    /// already enqueued callback in production. The cache must reject it.
+    @MainActor final class SuspendedClock {
+        var sleepers: [CheckedContinuation<Void, Never>] = []
+        func wait(_ seconds: TimeInterval) async throws {
+            await withCheckedContinuation { sleepers.append($0) }
+        }
+        func resume() {
+            let waiting = sleepers
+            sleepers = []
+            for continuation in waiting { continuation.resume() }
+        }
+    }
+
+    @MainActor static func settle() async {
+        for _ in 0..<20 { await Task.yield() }
+    }
+
+    @MainActor static func checkMonitoringPrivacy() async {
+        let suite = "mcmonad-privacy-checks-\(UUID())"
+        let preferences = UserDefaults(suiteName: suite)!
+        defer { preferences.removePersistentDomain(forName: suite) }
+        let runner = RecordingRunner()
+        let clock = SuspendedClock()
+        var quiet = true
+        var reads = 0
+        let cache = WhatsUpCache(text: { _ in reads += 1; return "private screen text" },
+                                 textHash: { _ in 1 }, quiet: { quiet }, preferences: preferences,
+                                 runner: runner, wait: clock.wait)
+        let window = OverlayWindowEntry(windowId: 7, pid: 1, appName: "App", title: "private title",
+                                         bundleId: nil, workspaceTag: nil, frame: .zero,
+                                         isFocused: true, isFloating: false)
+        let snap = OverlaySnapshot(debugOverlays: false, screens: [],
+                                    hiddenWorkspaces: [.init(tag: "hidden", windows: [window])])
+        precondition(!cache.isEnabled, "fresh installs must not send background screen data")
+        cache.noteSnapshot(snap)
+        cache.noteTextChanged()
+        cache.refreshNow()
+        cache.refreshNow(force: true)
+        await settle()
+        precondition(runner.prompts.isEmpty && reads == 0 && clock.sleepers.isEmpty,
+                     "neither idle nor forced refresh may bypass the off switch")
+
+        cache.setEnabled(true)
+        await settle()
+        precondition(!clock.sleepers.isEmpty)
+        quiet = false
+        clock.resume()
+        await settle()
+        precondition(runner.prompts.isEmpty, "returning to the keyboard revokes a queued idle call")
+
+        quiet = true
+        cache.noteTextChanged()
+        await settle()
+        precondition(!clock.sleepers.isEmpty)
+        cache.setEnabled(false)
+        quiet = false
+        cache.setEnabled(true)
+        clock.resume()
+        await settle()
+        precondition(runner.prompts.isEmpty, "off/on must not revive old queued work")
+
+        cache.refreshNow(force: true)
+        precondition(runner.prompts.count == 1 && runner.running && reads == 1)
+        precondition(runner.prompts[0].contains("private title") && runner.prompts[0].contains("private screen text"),
+                     "explicit opt-in exercises the real prompt builder")
+        let oldCompletion = runner.completions[0]
+        cache.setEnabled(false)
+        precondition(!runner.running && !cache.isRefreshing && cache.rows.isEmpty)
+        cache.noteSnapshot(snap)
+        cache.noteTextChanged()
+        cache.refreshNow(force: true)
+        precondition(runner.prompts.count == 1)
+        let answer = Ask.Outcome.answered(.workspaces(summaries: [.init(tag: "hidden", summary: "Private summary", reason: "evidence")], droppedUnknownTags: 0))
+        oldCompletion(answer)
+        precondition(cache.rows.isEmpty, "a late answer cannot restore cleared summaries")
+
+        cache.setEnabled(true)
+        cache.refreshNow(force: true)
+        precondition(runner.prompts.count == 2 && cache.isRefreshing)
+        oldCompletion(answer)
+        precondition(cache.isRefreshing && cache.summariesAsOf == nil,
+                     "an old answer cannot complete a newly authorised call")
+        runner.completions[1](answer)
+        precondition(cache.rows.first?.summary?.summary == "Private summary")
+
+        quiet = true
+        cache.noteSnapshot(OverlaySnapshot(debugOverlays: false,
+            screens: [.init(screenId: 0, frame: .zero, workspaceTag: "new", windows: [window])], hiddenWorkspaces: []))
+        cache.refreshNow() // queues the minimum-gap retry
+        await settle()
+        precondition(!clock.sleepers.isEmpty)
+        cache.setEnabled(false)
+        clock.resume()
+        await settle()
+        precondition(runner.prompts.count == 2 && cache.rows.isEmpty, "off cancels rate-limited retries too")
+
+        let restarted = WhatsUpCache(text: { _ in nil }, textHash: { _ in nil }, quiet: { true },
+                                     preferences: preferences, runner: RecordingRunner())
+        precondition(!restarted.isEnabled, "the off choice survives restart")
+        cache.setEnabled(true)
+        let optedIn = WhatsUpCache(text: { _ in nil }, textHash: { _ in nil }, quiet: { false },
+                                   preferences: preferences, runner: RecordingRunner())
+        precondition(optedIn.isEnabled, "only an explicit opt-in survives restart")
+        cache.setEnabled(false)
+        await settle()
+        clock.resume()
+        await settle()
     }
 
     // MARK: RecentUse

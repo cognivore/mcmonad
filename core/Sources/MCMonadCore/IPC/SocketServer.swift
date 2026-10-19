@@ -174,8 +174,9 @@ final class SocketServer {
                     let command = try decoder.decode(IPCCommand.self, from: lineData)
                     onCommand(command)
                 } catch {
-                    let lineStr = String(data: lineData, encoding: .utf8) ?? "<binary>"
-                    logger.error("Failed to decode command: \(error) — line: \(lineStr)")
+                    // Commands include overlay snapshots with raw window
+                    // titles; decoder descriptions can quote them as well.
+                    logger.error("Failed to decode command (\(lineData.count) bytes; payload and parser details withheld for privacy)")
                 }
             }
         }

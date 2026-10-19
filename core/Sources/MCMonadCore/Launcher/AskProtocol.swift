@@ -11,8 +11,9 @@ enum Ask {
     static let effort = "low"
 
     /// Arguments after the executable. Print mode with structured output and
-    /// a streamed transcript; no tools; no session written to disk — the
-    /// prompt carries recognised screen text and must not outlive the call.
+    /// a streamed transcript; no tools; request no local session history.
+    /// The prompt carries screen text; this flag does not control retention
+    /// at the provider or other logging configured in the user's CLI.
     static func arguments(schema: String, systemPrompt: String) -> [String] {
         [
             "-p",

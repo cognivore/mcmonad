@@ -163,6 +163,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     private let appIndex = AppIndex()
     private let screenshotPicker = ScreenshotRegionPicker()
     private let askRunner = AskRunner()
+    private var confirmingCloudSearch = false
     /// The question being asked / just answered: its words (for
     /// highlighting) and the manifold it was asked about (for row order).
     private var askTerms: [String] = []
@@ -281,6 +282,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     func hide() {
         voice.stop()
+        if let panel, let sheet = panel.attachedSheet {
+            panel.endSheet(sheet, returnCode: .abort)
+        }
         leaveWhereIs()
         removeKeyMonitor()
         panel?.orderOut(nil)
@@ -734,7 +738,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func whatsUpItem(force: Bool = false) -> Item {
-        Item(title: "What's up — one line per workspace, from \(Ask.model)",
+        let title = whatsUpCache?.isEnabled == true
+            ? "What's up — workspace summaries from Claude"
+            : "What's up — monitoring off (enable in the mcmonad menu)"
+        return Item(title: title,
              kind: .whatsUp, haystack: "what's up whats up sup summary workspaces overview",
              recentKey: RecentUse.whatsUp, force: force)
     }
@@ -873,9 +880,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         if let key = item.recentKey { recentUse.touch(key) }
         switch item.kind {
         case .whereIs(let query):
-            if item.force { reindexThen { [weak self] in self?.beginWhereIs(query) } } else { beginWhereIs(query) }
+            beginWhereIs(query, reindex: item.force)
         case .whatsUp:
-            if item.force { reindexThen { [weak self] in self?.showWhatsUp(refresh: true) } } else { showWhatsUp(refresh: false) }
+            if item.force, whatsUpCache?.isEnabled == true {
+                reindexThen { [weak self] in self?.showWhatsUp(refresh: true) }
+            } else { showWhatsUp(refresh: false) }
         case .viewWorkspace(let tag):
             finish()
             onViewWorkspace?(tag)
@@ -926,7 +935,29 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     // MARK: - Questions to the model ("where is …", "what's up")
 
-    private func beginWhereIs(_ query: WhereIsQuery) {
+    private func beginWhereIs(_ query: WhereIsQuery, reindex: Bool = false) {
+        guard let panel, !confirmingCloudSearch else { return }
+        voice.stop()
+        confirmingCloudSearch = true
+        removeKeyMonitor()
+        let alert = NSAlert()
+        alert.messageText = "Send window information to Claude for this search?"
+        alert.informativeText = "Your question, workspace names, app names, window titles and excerpts of recognised screen text from visible and hidden workspaces will be sent to Anthropic through your Claude CLI. This authorises one search; it does not enable background monitoring."
+        alert.addButton(withTitle: "Send this search")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: panel) { [weak self] response in
+            guard let self else { return }
+            self.confirmingCloudSearch = false
+            guard self.panel?.isVisible == true else { return }
+            self.installKeyMonitor()
+            guard response == .alertFirstButtonReturn else { return }
+            if reindex {
+                self.reindexThen { [weak self] in self?.askWhereIs(query) }
+            } else { self.askWhereIs(query) }
+        }
+    }
+
+    private func askWhereIs(_ query: WhereIsQuery) {
         beginAsk(question: query.question, terms: query.terms, arguments: WhereIs.arguments) { manifold in
             let known = manifold.windowIds
             return { WhereIs.parseLine($0, known: known) }
@@ -978,6 +1009,13 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private func renderWhatsUp() {
         guard let cache = whatsUpCache else { return }
+        guard cache.isEnabled else {
+            spinner.stop()
+            filtered = [hintItem("What's up monitoring is off. No background summaries are sent to Claude."),
+                        hintItem("Enable it from the mcmonad menu to share window titles and screen text.")]
+            showResults()
+            return
+        }
         let stamps = [cache.summariesAsOf.map { "summaries \(ScreenIndex.hhmm($0))" },
                       screenIndex?.lastPassEnded.map { "screens read \(ScreenIndex.hhmm($0))" }].compactMap { $0 }
         let cached = stamps.isEmpty ? "Nothing cached yet" : "Cached · " + stamps.joined(separator: " · ")
@@ -1556,7 +1594,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     func windowDidResignKey(_ notification: Notification) {
         // Don't dismiss while the mic/speech permission prompt is up or live
         // dictation is running — those steal key focus transiently.
-        if keepOpenForVoice { return }
+        if keepOpenForVoice || confirmingCloudSearch { return }
         voice.stop()
         removeKeyMonitor()
         // Click-away dismissal: don't yank focus back (user moved it).

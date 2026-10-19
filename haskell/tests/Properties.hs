@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Properties where
 
 import Test.QuickCheck
@@ -10,10 +11,11 @@ import MCMonad.Core
     , withinSettleWindow, consumeIntent
     , PendingWindow(..), Timer(..)
     )
-import MCMonad.IPC (WindowInfo(..), Command(..))
+import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent)
 import MCMonad.Affinity
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy.Char8 as BL
+import qualified Data.Text as Text
 import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     , windowSetToSerial
@@ -1556,6 +1558,29 @@ prop_role_names_round_trip =
     all (\r -> parseRole (roleName r) == Just r) [minBound .. maxBound]
     && parseRole "left" == Nothing
 
+prop_event_logs_redact_content :: String -> Bool
+prop_event_logs_redact_content content =
+    let secret = "private-window-content-" ++ content
+        info = (mkWindowInfo 7 11) { wiTitle = Just (Text.pack secret), wiAppName = Just (Text.pack secret) }
+        events = [ WindowCreated info, QueryWindowsResponse [info]
+                 , MenuViewWorkspace secret, TimerStart 60 secret
+                 , TimerSnooze 60 secret secret, TimerDismiss secret secret
+                 , TimerJump secret secret, IgnoredEvent (Text.pack secret) ]
+        logs = unlines (map eventLogSummary events)
+    in not (secret `L.isInfixOf` logs)
+       && "WindowCreated (7,11)" `L.isInfixOf` logs
+
+prop_decode_error_redacts_content :: String -> Bool
+prop_decode_error_redacts_content content =
+    let secret = "private-window-content-" ++ content
+        wire = BL.toStrict $ Aeson.encode $ Aeson.object
+            [ "event" Aeson..= ("window-created" :: String)
+            , "windowId" Aeson..= secret, "title" Aeson..= secret ]
+    in case decodeEvent wire of
+         Left message -> not (secret `L.isInfixOf` message)
+                         && "withheld for privacy" `L.isInfixOf` message
+         Right _ -> False
+
 allProperties :: [(String, Property)]
 allProperties =
     [ ("affinity: pin falls back to primary", property prop_affinity_pin_falls_back_to_primary)
@@ -1573,6 +1598,8 @@ allProperties =
     , ("affinity: place pulls back a stranded role-mate", property prop_place_pulls_back_stranded_role_mate)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("ocr-index wire format", property prop_ocr_index_wire)
+    , ("event logs redact window and peer content", property prop_event_logs_redact_content)
+    , ("decode errors redact payload and parser content", property prop_decode_error_redacts_content)
     , ("timer persistence + legacy snapshot", property prop_timer_persistence)
     , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)

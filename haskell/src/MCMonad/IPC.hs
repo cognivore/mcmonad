@@ -9,6 +9,8 @@ module MCMonad.IPC
       -- * Sending and receiving
     , sendCommand
     , readEvent
+    , decodeEvent
+    , eventLogSummary
       -- * Command types (Haskell -> Swift)
     , Command(..)
     , FrameAssignment(..)
@@ -357,6 +359,36 @@ data Event
       -- about) drops a single message rather than killing the loop.
     deriving (Show, Generic)
 
+-- | Content-free diagnostics. Never render an entire event: titles, timer
+-- labels, workspace names and unknown peer fields may contain private text.
+eventLogSummary :: Event -> String
+eventLogSummary event = case event of
+    WindowCreated info           -> "WindowCreated " ++ show (wiWindowId info, wiPid info)
+    WindowDestroyed wid          -> "WindowDestroyed " ++ show wid
+    WindowFrameChanged wid rect  -> "WindowFrameChanged " ++ show (wid, rect)
+    FrontAppChanged pid          -> "FrontAppChanged " ++ show pid
+    FocusedWindowChanged wid pid -> "FocusedWindowChanged " ++ show (wid, pid)
+    FocusedWindowQueryResponse wid pid -> "FocusedWindowQueryResponse " ++ show (wid, pid)
+    ScreensChanged screens       -> "ScreensChanged count=" ++ show (length screens)
+    HotkeyPressed key            -> "HotkeyPressed " ++ show key
+    MouseEnteredWindow wid pid   -> "MouseEnteredWindow " ++ show (wid, pid)
+    WindowDragCompleted wid pid rect -> "WindowDragCompleted " ++ show (wid, pid, rect)
+    UserMouseDown                -> "UserMouseDown"
+    MenuToggleDebug              -> "MenuToggleDebug"
+    MenuFocusWindow wid pid      -> "MenuFocusWindow " ++ show (wid, pid)
+    MenuViewWorkspace _          -> "MenuViewWorkspace [workspace withheld]"
+    TimerStart seconds _         -> "TimerStart seconds=" ++ show seconds ++ " [label withheld]"
+    TimerSnooze seconds _ _      -> "TimerSnooze seconds=" ++ show seconds ++ " [label/workspace withheld]"
+    TimerFired ident             -> "TimerFired " ++ show ident
+    TimerCancel ident            -> "TimerCancel " ++ show ident
+    TimerCancelAll               -> "TimerCancelAll"
+    TimerDismiss _ _             -> "TimerDismiss [label/workspace withheld]"
+    TimerJump _ _                -> "TimerJump [label/workspace withheld]"
+    Ready                        -> "Ready"
+    QueryWindowsResponse windows -> "QueryWindowsResponse count=" ++ show (length windows)
+    QueryScreensResponse screens -> "QueryScreensResponse count=" ++ show (length screens)
+    IgnoredEvent _               -> "IgnoredEvent [peer text withheld]"
+
 -- | Information about a window, received from the Swift daemon.
 data WindowInfo = WindowInfo
     { wiWindowId            :: !Word32
@@ -502,8 +534,14 @@ sendCommand conn cmd = do
 readEvent :: Connection -> IO Event
 readEvent conn = do
     line <- BS8.hGetLine (connHandle conn)
+    either fail return (decodeEvent line)
+
+-- | Parser diagnostics can quote field values too. Keep the operation and
+-- byte count, explicitly withhold both payload and parser text from logs.
+decodeEvent :: BS.ByteString -> Either String Event
+decodeEvent line =
     case Aeson.eitherDecodeStrict' line of
-        Left err  -> fail $ "Failed to decode event: " ++ err
-                            ++ "\nRaw: " ++ show line
-        Right evt -> return evt
+        Left _ -> Left $ "Failed to decode core event (" ++ show (BS.length line)
+                      ++ " bytes; payload and parser details withheld for privacy)"
+        Right evt -> Right evt
 

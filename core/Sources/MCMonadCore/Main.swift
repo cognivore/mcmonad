@@ -416,6 +416,8 @@ struct MCMonadCoreApp {
             quiet: { ScreenIndex.secondsSinceInput() >= ScreenIndex.idleAfter }
         )
         spotlight.whatsUpCache = whatsUpCache
+        statusBar.whatsUpMonitoringEnabled = { [weak whatsUpCache] in whatsUpCache?.isEnabled ?? false }
+        statusBar.onSetWhatsUpMonitoring = { [weak whatsUpCache] in whatsUpCache?.setEnabled($0) }
         overlayManager.onSnapshotApplied = { [weak screenIndex, weak whatsUpCache] snapshot in
             screenIndex?.noteSnapshot(snapshot)
             whatsUpCache?.noteSnapshot(snapshot)

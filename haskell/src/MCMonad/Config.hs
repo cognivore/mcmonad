@@ -99,8 +99,10 @@ data MConfig l = MConfig
       -- question can look inside windows, not only at their titles. On by
       -- default; set it to 'False' to opt out. It needs the Screen Recording
       -- permission for MCMonadCore.app, and what it reads off the
-      -- framebuffer lives only in the daemon's memory — never on disk, in a
-      -- log, or on the IPC socket.
+      -- framebuffer is indexed in memory, never in a log or on the IPC
+      -- socket. Confirmed Claude searches and separately opted-in What's up
+      -- monitoring can send excerpts to the provider. This flag does not
+      -- enable cloud monitoring.
     , logHook            :: !(M ())
       -- ^ Action run after every state change (e.g. update a status bar).
     , startupHook        :: !(M ())

@@ -8,10 +8,11 @@ import os
 /// pixels with Vision, so the launcher can search inside windows and the
 /// "where is" / "what's up" questions can cite their contents.
 ///
-/// Privacy contract, in one place: what comes off the framebuffer stays in
-/// this process's memory. Captures are `CGImage`s that die with the cycle;
-/// recognised text is stored only in `entries`; nothing here is logged,
-/// persisted, or sent over the IPC socket. The brain only ever says on/off.
+/// Captures are `CGImage`s that die with the cycle; this index keeps text
+/// only in memory and never logs it, persists it or sends it over IPC.
+/// Cloud disclosure is separate: an explicitly confirmed launcher search,
+/// or explicitly enabled What's up monitoring, may send excerpts to Claude.
+/// The brain only ever says whether local indexing is on or off.
 ///
 /// Capture is ScreenCaptureKit's per-window screenshot (the window's own
 /// buffer, so a covered or parked window reads just like a visible one),

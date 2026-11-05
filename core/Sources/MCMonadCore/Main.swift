@@ -9,6 +9,7 @@ private let logger = Logger(subsystem: "com.mcmonad.core", category: "Main")
 final class EventBridge: SkyLightEventDelegate {
     let socketServer: SocketServer
     let focusTracker: AXFocusTracker
+    let displayManager: DisplayManager
     /// Window IDs we have reported as created but not yet destroyed.
     private var managedWindowIds: Set<UInt32> = []
     /// Reverse map for destroy/close events (which only carry wid).
@@ -65,9 +66,10 @@ final class EventBridge: SkyLightEventDelegate {
         "com.apple.notificationcenterui",
     ]
 
-    init(socketServer: SocketServer, focusTracker: AXFocusTracker) {
+    init(socketServer: SocketServer, focusTracker: AXFocusTracker, displayManager: DisplayManager) {
         self.socketServer = socketServer
         self.focusTracker = focusTracker
+        self.displayManager = displayManager
     }
 
     /// Bootstrap entry for windows that already existed when mcmonad-core
@@ -151,6 +153,7 @@ final class EventBridge: SkyLightEventDelegate {
     ///     window always crosses the threshold. `windowExists` was too
     ///     permissive on its own; this is the missing upper bound.
     func validateWindows() {
+        let screens = displayManager.currentScreens()
         // Snapshot: `retire` mutates `managedWindowIds`.
         for wid in Array(managedWindowIds) {
             if !SkyLightQuery.windowExists(wid) {
@@ -159,6 +162,21 @@ final class EventBridge: SkyLightEventDelegate {
             }
             // Present in the server. Is it still a manageable window?
             if SkyLightQuery.queryWindow(wid) != nil {
+                ineligibleStreak.removeValue(forKey: wid)
+                continue
+            }
+            // queryWindow's eligibility filter (visible attribute / tag
+            // bits) can transiently fail for a window mcmonad has parked
+            // off-screen to simulate a hidden workspace — an unrelated
+            // app's own hide/show or Space churn can knock SkyLight's
+            // bookkeeping around enough to do this for several seconds.
+            // A parked window is never a mystery (mcmonad put it exactly
+            // there), so confirm via the live AX frame — same ground
+            // truth parking itself writes to, per restoreAllParkedWindows
+            // — before trusting queryWindow's verdict.
+            if let pid = windowIdToPid[wid],
+               let frame = AXWindowService.readFrame(windowId: wid, pid: pid),
+               isAlreadyParked(frame, screens: screens) {
                 ineligibleStreak.removeValue(forKey: wid)
                 continue
             }
@@ -678,7 +696,7 @@ struct MCMonadCoreApp {
         }
 
         // Wire SkyLightEventObserver (singleton, delegate-based) to socket
-        let eventBridge = EventBridge(socketServer: socketServer, focusTracker: focusTracker)
+        let eventBridge = EventBridge(socketServer: socketServer, focusTracker: focusTracker, displayManager: displayManager)
         let eventObserver = SkyLightEventObserver.shared
         eventObserver.delegate = eventBridge
 

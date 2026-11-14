@@ -103,13 +103,13 @@ import qualified Data.Set as S
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
-import System.Directory (copyFile, doesFileExist, getHomeDirectory, createDirectoryIfMissing)
+import System.Directory (copyFile, doesDirectoryExist, doesFileExist, removeFile, getHomeDirectory, createDirectoryIfMissing)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
 import System.IO (readFile')
 import System.IO.Unsafe (unsafePerformIO)
-import System.IO.Error (isPermissionError)
+import System.IO.Error (isDoesNotExistError, isPermissionError)
 import System.Info (arch, os)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (executeFile)
@@ -1627,19 +1627,42 @@ recompile = do
                 Just ghc -> do
                     bin <- getCustomBinary
                     logTS $ "mcmonad: recompiling " ++ src ++ " with " ++ ghc
+                    -- A config directory may carry extra modules under
+                    -- modules/. The bare -i clears GHC's implicit "." so
+                    -- that, on a case-insensitive filesystem, mcmonad.hs
+                    -- is not taken for the MCMonad library module. Same
+                    -- flags as the home-manager activation step.
+                    let modulesDir = takeDirectory src </> "modules"
+                    hasModules <- doesDirectoryExist modulesDir
+                    let searchPath = if hasModules then ["-i", "-i" ++ modulesDir] else []
                     (exit, _, err) <- readProcessWithExitCode ghc
-                        ["--make", src, "-o", bin, "-v0"] ""
+                        (["--make", src] ++ searchPath ++ ["-o", bin, "-v0"]) ""
                     case exit of
                         ExitSuccess -> do
-                            -- Stamp the binary with our protocol version. The
-                            -- launcher reads this sidecar and refuses to use
-                            -- the custom binary if its stamp doesn't match
-                            -- the bundle's protocol-version resource — that
+                            -- Stamp the binary with the protocol version it
+                            -- reports itself. The launcher reads this
+                            -- sidecar and refuses a custom binary whose
+                            -- stamp differs from the bundle's — that
                             -- prevents the crash-loop when the IPC has moved
-                            -- on but the user's Mod-q-compiled binary hasn't.
-                            writeFile (bin ++ ".proto") (show protocolVersion)
-                            logTS "mcmonad: recompile succeeded"
-                            return True
+                            -- on but the user's Mod-q-compiled binary
+                            -- hasn't. It has to be the new binary's answer:
+                            -- the library on disk can be newer than this
+                            -- running process, and this process's own
+                            -- version would then vouch for a binary that
+                            -- speaks a different protocol.
+                            (stampExit, stamp, _) <-
+                                readProcessWithExitCode bin ["--protocol-version"] ""
+                            case stampExit of
+                                ExitSuccess -> do
+                                    writeFile (bin ++ ".proto") stamp
+                                    logTS "mcmonad: recompile succeeded"
+                                    return True
+                                _ -> do
+                                    logTS "mcmonad: recompiled binary did not report a protocol version; not using it"
+                                    removeFile (bin ++ ".proto") `catch` \e ->
+                                        unless (isDoesNotExistError e) $
+                                            logTS ("mcmonad: could not remove the old stamp: " ++ show e)
+                                    return False
                         _ -> do
                             logTS $ "mcmonad: recompile FAILED:\n" ++ err
                             return False

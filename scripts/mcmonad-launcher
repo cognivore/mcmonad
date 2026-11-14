@@ -121,21 +121,28 @@ CUSTOM_BIN="$HOME/.config/mcmonad/mcmonad-${GHC_ARCH}-darwin"
 CUSTOM_STAMP="$CUSTOM_BIN.proto"
 BUNDLED_STAMP="$APP_DIR/Resources/protocol-version"
 
-HASKELL_BIN="$DEFAULT_HASKELL_BIN"
-if [ -x "$CUSTOM_BIN" ]; then
-    if [ -f "$CUSTOM_STAMP" ] && [ -f "$BUNDLED_STAMP" ]; then
-        custom_v=$(tr -d '[:space:]' < "$CUSTOM_STAMP")
-        bundled_v=$(tr -d '[:space:]' < "$BUNDLED_STAMP")
-        if [ -n "$custom_v" ] && [ "$custom_v" = "$bundled_v" ]; then
-            HASKELL_BIN="$CUSTOM_BIN"
-            log "Using custom binary (proto v$custom_v): $CUSTOM_BIN"
+# Decided afresh before every start of the brain, not once per launcher:
+# Mod-q can produce (or a failed activation can remove) the custom binary
+# while this launcher keeps running, and a brain respawned from a choice
+# made earlier would be the wrong program with the wrong workspace list.
+choose_haskell_bin() {
+    HASKELL_BIN="$DEFAULT_HASKELL_BIN"
+    if [ -x "$CUSTOM_BIN" ]; then
+        if [ -f "$CUSTOM_STAMP" ] && [ -f "$BUNDLED_STAMP" ]; then
+            custom_v=$(tr -d '[:space:]' < "$CUSTOM_STAMP")
+            bundled_v=$(tr -d '[:space:]' < "$BUNDLED_STAMP")
+            if [ -n "$custom_v" ] && [ "$custom_v" = "$bundled_v" ]; then
+                HASKELL_BIN="$CUSTOM_BIN"
+                log "Using custom binary (proto v$custom_v): $CUSTOM_BIN"
+            else
+                log "Custom binary proto v${custom_v:-?} != bundled v${bundled_v:-?}; using bundled"
+            fi
         else
-            log "Custom binary proto v${custom_v:-?} != bundled v${bundled_v:-?}; using bundled"
+            log "Custom binary lacks protocol stamp; using bundled"
         fi
-    else
-        log "Custom binary lacks protocol stamp; using bundled"
     fi
-fi
+}
+choose_haskell_bin
 
 install_agent() {
     mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
@@ -211,6 +218,7 @@ run_daemon() {
         fi
         if ! kill -0 "$HASKELL_PID" 2>/dev/null; then
             log "mcmonad died, restarting"
+            choose_haskell_bin
             "$HASKELL_BIN" >> "$HASKELL_LOG" 2>&1 &
             HASKELL_PID=$!
         fi

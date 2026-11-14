@@ -97,17 +97,22 @@ in
 
     onRecompileFailure = lib.mkOption {
       type = lib.types.enum [ "fallback" "fail" ];
-      default = "fallback";
+      default = "fail";
       description = ''
         What home-manager activation does when recompiling mcmonad.hs
         fails.
 
+        - "fail" (the default): abort the home-manager switch, so a
+          mcmonad.hs that does not compile is caught at once. The
+          running window manager is left as it was.
         - "fallback": log a warning, delete the stale custom binary so
-          the launcher falls back to the bundled default config, and
-          let the switch succeed anyway.
-        - "fail": abort the home-manager switch immediately, so a
-          non-compiling mcmonad.hs is caught loudly instead of silently
-          falling back to defaults.
+          the launcher starts the bundled default config, and let the
+          switch succeed. The bundled config has its own workspace
+          list: windows saved on workspaces it does not define are
+          placed as new on the current one (the saved state is kept as
+          mcmonad.state.unknown-workspaces). Choose this only if a
+          running default window manager matters more to you than your
+          workspace layout.
       '';
     };
   };

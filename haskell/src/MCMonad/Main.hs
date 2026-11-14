@@ -546,6 +546,13 @@ handleEvent debug cfg hotkeyIdMap evt = do
                     -- Float the scratchpad window
                     windows (W.float wr (W.RationalRect 0.1 0.05 0.8 0.6))
 
+        WindowTitleChanged wid pid title -> do
+            let wr = WindowRef wid pid
+            meta <- gets windowMetadata
+            when (maybe False ((/= title) . wmTitle) (Map.lookup wr meta)) $ do
+                modify $ \s -> s { windowMetadata = Map.adjust (\m -> m { wmTitle = title }) wr (windowMetadata s) }
+                pushOverlaySnapshot
+
         WindowDestroyed wid -> do
             forgetPending wid
             modify $ \s -> s { frameRepairs = Map.delete wid (frameRepairs s) }

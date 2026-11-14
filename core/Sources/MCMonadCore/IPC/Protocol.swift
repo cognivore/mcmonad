@@ -317,6 +317,7 @@ struct IgnoredAttributionFact: Encodable, Sendable {
 enum IPCEvent: Encodable, Sendable {
     case windowCreated(WindowInfo)
     case windowDestroyed(windowId: UInt32)
+    case windowTitleChanged(windowId: UInt32, pid: Int32, title: String?)
     case windowFrameChanged(windowId: UInt32, frame: CGRect)
     /// A SetFrames readback found the window off its wanted frame. Reported
     /// as a fact; the brain decides whether to re-send.
@@ -363,6 +364,11 @@ enum IPCEvent: Encodable, Sendable {
         case .windowDestroyed(let windowId):
             try container.encode("window-destroyed", forKey: .event)
             try container.encode(windowId, forKey: .windowId)
+        case .windowTitleChanged(let windowId, let pid, let title):
+            try container.encode("window-title-changed", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
+            try container.encode(pid, forKey: .pid)
+            try container.encode(title, forKey: .title)
         case .windowFrameChanged(let windowId, let frame):
             try container.encode("window-frame-changed", forKey: .event)
             try container.encode(windowId, forKey: .windowId)

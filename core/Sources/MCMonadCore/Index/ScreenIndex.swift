@@ -106,7 +106,7 @@ final class ScreenIndex {
         case .denied: return "needs Screen Recording"
         case .ready:
             let last = lastPassEnded.map { "last read \(Self.hhmm($0))" } ?? "nothing read yet"
-            return "\(entries.count) windows · \(last) · reads after \(Int(Self.idleAfter / 60)) min without input, or on “!”"
+            return "\(entries.count) windows · \(last) · reads after \(Int(Self.idleAfter / 60)) min without input, or for “where is”"
         }
     }
 
@@ -188,11 +188,13 @@ final class ScreenIndex {
                 noticedReplacement = true
                 Self.logger.info("executable replaced on disk; index paused until the restart")
             }
+            if forced { endPass(completed: false) }
             return
         }
         guard CGPreflightScreenCaptureAccess() else {
             deniedCycles += 1
             if deniedCycles >= Self.deniedCyclesBeforeAsking { markDenied() }
+            if forced { endPass(completed: false) }
             return
         }
         deniedCycles = 0
@@ -200,6 +202,7 @@ final class ScreenIndex {
 
         let idle = Self.secondsSinceInput()
         let lastInput = Date(timeIntervalSinceNow: -idle)
+        if forced, pass.isEmpty { endPass(); return }
         if pass.isEmpty {
             // An idle pass starts once the user has been quiet for
             // `idleAfter` and has been back since the last pass began. The
@@ -226,7 +229,8 @@ final class ScreenIndex {
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
         // Nothing examined means the window list itself failed: end the
         // pass rather than spin on it.
-        if examined.isEmpty { pass.removeAll() } else { pass.removeAll { examined.contains($0) } }
+        if examined.isEmpty { endPass(completed: false); return }
+        pass.removeAll { examined.contains($0) }
         for (id, r) in readings {
             entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, thumb: r.thumb)
         }
@@ -237,14 +241,19 @@ final class ScreenIndex {
         }
         if !readings.isEmpty || forced { onUpdated?() }
         if pass.isEmpty {
-            let wasForced = forced
-            forced = false
-            lastPassEnded = Date()
-            Self.logger.info("screen index: \(wasForced ? "forced" : "idle", privacy: .public) pass done")
-            onPassEnded?(wasForced)
+            endPass()
         } else {
             requestSoon(after: forced ? 0 : 1)   // finish the pass without waiting for the tick
         }
+    }
+
+    private func endPass(completed: Bool = true) {
+        let wasForced = forced
+        forced = false
+        pass.removeAll()
+        if completed { lastPassEnded = Date() }
+        Self.logger.info("screen index: \(wasForced ? "forced" : "idle", privacy: .public) pass \(completed ? "done" : "unavailable", privacy: .public)")
+        onPassEnded?(wasForced)
     }
 
     /// One window's pixels, reduced to what may leave the reading thread.

@@ -13,6 +13,7 @@ enum LauncherLogicChecks {
         checkReadingOrder()
         checkWhereIsQuery()
         checkManifold()
+        checkTitleEvent()
         checkStream()
         checkWhatsUp()
         checkWhatsUpCache()
@@ -36,6 +37,10 @@ enum LauncherLogicChecks {
         precondition(TextSearch.excerpt("  a\n\n b\tc  ", limit: 100) == "a b c")
         precondition(TextSearch.excerpt("abcdef", limit: 3) == "abc…")
         precondition(TextSearch.excerpt("abc", limit: 0) == "")
+        let terminal = "Ghostty " + String(repeating: "diff code ", count: 300) + " HMRC tax filing system in Rust"
+        let evidence = TextSearch.excerpt(terminal, limit: 160, terms: ["claude", "hmrc", "thingie"])
+        precondition(evidence.hasPrefix("Ghostty ") && evidence.contains("HMRC tax filing"), evidence)
+        precondition(evidence.count <= 161)
     }
 
     static func checkHits() {
@@ -155,6 +160,16 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine(failed, known: known) == .final(.failed("Not logged in")))
         let malformed = #"{"type":"result","is_error":false,"result":"plain prose"}"#
         precondition(WhereIs.parseLine(malformed, known: known) == .final(.malformed("plain prose")))
+    }
+
+    static func checkTitleEvent() {
+        for title: String? in ["HMRC tax filing system in Rust", "", nil] {
+            let data = try! JSONEncoder().encode(IPCEvent.windowTitleChanged(windowId: 7, pid: 42, title: title))
+            let object = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+            precondition(object["event"] as? String == "window-title-changed")
+            precondition(object["windowId"] as? Int == 7 && object["pid"] as? Int == 42)
+            precondition(object["title"] as? String == title)
+        }
     }
 
     // MARK: WhatsUp

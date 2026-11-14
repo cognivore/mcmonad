@@ -102,7 +102,7 @@ enum Ask {
                     app: w.appName ?? "?",
                     title: w.title ?? "",
                     focused: w.isFocused,
-                    text: text(w.windowId).map { TextSearch.excerpt($0, limit: cap) }
+                    text: text(w.windowId).map { TextSearch.excerpt($0, limit: cap, terms: TextSearch.terms(question)) }
                 )
             })
         }

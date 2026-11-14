@@ -38,6 +38,7 @@ import MCMonad.Layout (Full(..))
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.Text as T
 import Data.Maybe (isNothing, fromMaybe)
 import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -1499,6 +1500,12 @@ prop_overlayScreen_wire_is_active active =
     let json = BL.unpack (Aeson.encode (OverlayScreenEntry 0 (Rectangle 0 0 1 1) "1" active []))
     in counterexample json (property (("\"isActive\":" ++ (if active then "true" else "false")) `L.isInfixOf` json))
 
+prop_title_changed_wire :: Bool
+prop_title_changed_wire =
+    case Aeson.eitherDecode (BL.pack "{\"event\":\"window-title-changed\",\"windowId\":7,\"pid\":42,\"title\":\"HMRC tax filing system in Rust\"}") of
+        Right (WindowTitleChanged 7 42 (Just title)) -> title == T.pack "HMRC tax filing system in Rust"
+        _ -> False
+
 -- ---------------------------------------------------------------------------
 -- Workspace → screen affinity
 
@@ -1942,6 +1949,7 @@ allProperties =
     , ("decode errors redact payload and parser content", property prop_decode_error_redacts_content)
     , ("overlay screen wire carries isActive", property prop_overlayScreen_wire_is_active)
     , ("overlay ignored window wire carries identity", property prop_overlayIgnored_wire)
+    , ("title-changed wire format", property prop_title_changed_wire)
     , ("timer persistence + legacy snapshot", property prop_timer_persistence)
     , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)

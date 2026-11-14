@@ -187,7 +187,7 @@ Audio Recording* permission for `MCMonadCore.app` — the first run lists the
 app in that pane and opens it; tick it and the index starts on the next cycle.
 Opt out with `ocrIndex = False` in `mcmonad.hs`.
 
-**The local index reads when you step away.** After three minutes without input it makes one pass over every window, displayed first and then parked, at most three recognitions per tick. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries.
+**The local index reads when you step away.** After three minutes without input it makes one pass over every window, displayed first and then parked, at most three recognitions per tick. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries. Window title changes update the launcher immediately, independently of OCR.
 
 The index keeps its readings in memory and does not write screenshots or OCR
 text to disk, logs or the Haskell socket. **Cloud features are a separate

@@ -368,10 +368,13 @@ final class EventBridge: SkyLightEventDelegate {
             socketServer.send(.frontAppChanged(pid: pid))
 
         case .titleChanged(let windowId):
-            // Title changes are not forwarded over IPC in the current
-            // protocol, but we drop the cached hash so the next
-            // FRAME/FOCUS line for this window picks up the new title.
             TitleHash.invalidate(windowId: windowId)
+            guard let pid = windowIdToPid[windowId] else { break }
+            if let title = SkyLight.shared.getWindowTitle(windowId) {
+                socketServer.send(.windowTitleChanged(windowId: windowId, pid: pid, title: title))
+            } else if let info = AXWindowService.info(windowId: windowId, pid: pid) {
+                socketServer.send(.windowTitleChanged(windowId: windowId, pid: pid, title: info.title))
+            }
         }
     }
 

@@ -67,7 +67,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 14
+protocolVersion = 15
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -334,6 +334,7 @@ timerJSON t = Aeson.object
 data Event
     = WindowCreated WindowInfo
     | WindowDestroyed !Word32
+    | WindowTitleChanged !Word32 !Int32 !(Maybe Text)
     | WindowFrameChanged !Word32 !Rectangle
     | WindowFrameDefied !Word32 !Int32 !Rectangle !Rectangle
       -- ^ A SetFrames readback found the window off its wanted frame:
@@ -408,6 +409,7 @@ eventLogSummary :: Event -> String
 eventLogSummary event = case event of
     WindowCreated info           -> "WindowCreated " ++ show (wiWindowId info, wiPid info)
     WindowDestroyed wid          -> "WindowDestroyed " ++ show wid
+    WindowTitleChanged wid pid _ -> "WindowTitleChanged " ++ show (wid, pid) ++ " [title withheld]"
     WindowFrameChanged wid rect  -> "WindowFrameChanged " ++ show (wid, rect)
     WindowFrameDefied wid pid want actual -> "WindowFrameDefied " ++ show (wid, pid, want, actual)
     FrontAppChanged pid          -> "FrontAppChanged " ++ show pid
@@ -503,6 +505,7 @@ instance Aeson.FromJSON Event where
             (Just evt, _) -> case evt of
                 "window-created"       -> WindowCreated      <$> Aeson.parseJSON (Aeson.Object v)
                 "window-destroyed"     -> WindowDestroyed    <$> v .: "windowId"
+                "window-title-changed" -> WindowTitleChanged <$> v .: "windowId" <*> v .: "pid" <*> v .:? "title"
                 "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
                 "window-frame-defied"  -> WindowFrameDefied <$> v .: "windowId" <*> v .: "pid" <*> v .: "want" <*> v .: "frame"
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"

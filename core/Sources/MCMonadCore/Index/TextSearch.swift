@@ -119,12 +119,26 @@ enum TextSearch {
 
     /// Whitespace-collapsed, length-capped text for the "where is" manifold.
     /// A cap of zero or less yields an empty string.
-    static func excerpt(_ text: String, limit: Int) -> String {
+    static func excerpt(_ text: String, limit: Int, terms: [String] = []) -> String {
         guard limit > 0 else { return "" }
         let collapsed = text
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .joined(separator: " ")
         if collapsed.count <= limit { return collapsed }
+        // Keep the window header and evidence near a query word, even
+        // when a long terminal diff pushed it beyond the prefix budget.
+        let ns = collapsed as NSString
+        let hits = terms.map { ns.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) }
+            .filter { $0.location != NSNotFound }
+        if let hit = hits.min(by: { $0.location < $1.location }), hit.location >= limit / 2 {
+            let head = String(collapsed.prefix(limit / 2))
+            let remaining = limit - head.count - 3
+            if remaining > 0 {
+                let start = max(0, hit.location - remaining / 3)
+                let tail = ns.substring(from: start)
+                return head + " … " + String(tail.prefix(remaining)) + "…"
+            }
+        }
         return String(collapsed.prefix(limit)) + "…"
     }
 }

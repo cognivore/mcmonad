@@ -995,6 +995,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         spinner.start()
         appendTranscript("· reading every window first…\n")
         reindexContinuation = then
+        askStarted = Date()
+        askTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.askTick() }
+        }
         index.reindexNow()
     }
 
@@ -1085,6 +1089,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         let prompt = Ask.prompt(for: manifold)
         let cli = AskRunner.locateCLI() ?? "claude"
         let windows = manifold.workspaces.reduce(0) { $0 + $1.windows.count }
+        let withText = manifold.workspaces.flatMap(\.windows).filter { !($0.text ?? "").isEmpty }.count
+        Self.logger.info("ask evidence: \(windows, privacy: .public) windows, \(withText, privacy: .public) with screen text")
         appendTranscript("→ \(cli) " + arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
         appendTranscript("→ stdin (\(prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces):\n\(prompt)\n\n← ")
         askRunner.start(prompt: prompt, arguments: arguments, parse: parse(manifold))
@@ -1103,6 +1109,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func finishAsk(_ outcome: Ask.Outcome) {
+        reindexContinuation = nil
         spinner.stop()
         askTicker?.invalidate()
         askTicker = nil
@@ -1132,7 +1139,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 )
             }
             if filtered.isEmpty {
-                filtered = [hintItem("Nothing on any workspace looks like “\(askQuestion)”.")]
+                let coverage = screenIndex?.status ?? "screen index unavailable"
+                filtered = [hintItem("No match for “\(askQuestion)”. Screen evidence: \(coverage).")]
             }
             showResults()
         case .answered(.workspaces):
@@ -1156,6 +1164,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     /// Stop any question in flight and put the results table back.
     private func leaveWhereIs() {
+        reindexContinuation = nil
         askRunner.cancel()
         askTicker?.invalidate()
         askTicker = nil

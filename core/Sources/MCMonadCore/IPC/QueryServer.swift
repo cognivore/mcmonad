@@ -174,7 +174,12 @@ final class QueryServer {
             if n <= 0 { return }
             buffer.append(contentsOf: buf[0..<n])
 
-            guard let newlineIndex = buffer.firstIndex(of: newline) else { continue }
+            guard let newlineIndex = buffer.firstIndex(of: newline) else {
+                // A request is one short JSON object; a client that sends
+                // this much without a newline is not asking anything.
+                if buffer.count > 64 * 1024 { return }
+                continue
+            }
             let lineData = Data(buffer[buffer.startIndex..<newlineIndex])
             guard let request = try? JSONDecoder().decode(WorkspaceWindowsQuery.self, from: lineData) else {
                 return

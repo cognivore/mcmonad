@@ -83,6 +83,12 @@ final class SocketServer {
                     return
                 }
                 logger.info("Client connected")
+                // A brain that stops reading must not stop the daemon:
+                // writes happen on the main thread. Give each write a
+                // deadline; a brain that misses it is disconnected (see
+                // `SocketState.writeData`).
+                var deadline = timeval(tv_sec: SocketServer.writeTimeoutSeconds, tv_usec: 0)
+                setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
                 let handle = FileHandle(fileDescriptor: clientFd, closeOnDealloc: true)
 
                 sharedState.setClientHandle(handle)
@@ -129,6 +135,16 @@ final class SocketServer {
         state.writeData(payload)
     }
 
+    /// How long one write to the brain may block before the brain is
+    /// treated as wedged and disconnected.
+    nonisolated static let writeTimeoutSeconds = 2
+
+    /// The longest command line accepted from the brain. The largest real
+    /// command is an overlay snapshot of every window; this is orders of
+    /// magnitude above that and exists so a peer that never sends a
+    /// newline cannot grow the buffer without limit.
+    nonisolated static let maxLineBytes = 8 * 1024 * 1024
+
     /// Read loop runs entirely on a background thread — no @MainActor references.
     private nonisolated static func readLoop(
         handle: FileHandle,
@@ -166,7 +182,7 @@ final class SocketServer {
             // Process complete lines
             while let newlineIndex = buffer.firstIndex(of: newline) {
                 let lineData = Data(buffer[buffer.startIndex..<newlineIndex])
-                buffer = Data(buffer[(newlineIndex + 1)...])
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
 
                 guard !lineData.isEmpty else { continue }
 
@@ -178,6 +194,10 @@ final class SocketServer {
                     // titles; decoder descriptions can quote them as well.
                     logger.error("Failed to decode command (\(lineData.count) bytes; payload and parser details withheld for privacy)")
                 }
+            }
+            if buffer.count > maxLineBytes {
+                logger.error("Command line exceeds \(maxLineBytes) bytes without a newline; disconnecting the client")
+                break
             }
         }
     }
@@ -196,14 +216,30 @@ private final class SocketState: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Write one line to the brain. A write that fails or misses the
+    /// socket's send deadline means the brain is gone or wedged; what it
+    /// missed cannot be replayed, so the connection is shut down. The read
+    /// loop then ends, the brain sees end-of-file when it next looks, and
+    /// its restart resynchronises from a fresh enumeration.
     func writeData(_ data: Data) {
         lock.lock()
         defer { lock.unlock() }
         guard let handle = clientHandle else { return }
-        do {
-            try handle.write(contentsOf: data)
-        } catch {
-            logger.warning("Write to client failed: \(error)")
+        let fd = handle.fileDescriptor
+        let failure: String? = data.withUnsafeBytes { raw -> String? in
+            var sent = 0
+            while sent < raw.count {
+                let n = Darwin.write(fd, raw.baseAddress! + sent, raw.count - sent)
+                if n > 0 { sent += n; continue }
+                if n < 0 && errno == EINTR { continue }
+                return String(cString: strerror(errno))
+            }
+            return nil
+        }
+        if let failure {
+            logger.warning("Write to client failed (\(failure)); disconnecting it")
+            clientHandle = nil
+            shutdown(fd, SHUT_RDWR)
         }
     }
 }

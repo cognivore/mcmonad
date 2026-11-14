@@ -453,6 +453,12 @@ struct MCMonadCoreApp {
     static func main() {
         logger.info("mcmonad-core starting")
 
+        // Writing to a socket or pipe whose reader has gone raises SIGPIPE,
+        // whose default action ends the process. The brain exiting between
+        // two events, or the claude CLI exiting before it has read its
+        // prompt, must surface as a failed write and nothing more.
+        signal(SIGPIPE, SIG_IGN)
+
         // One application that has stopped answering Accessibility calls
         // must not stop the daemon. Every AX read and write here runs on
         // the main thread, and the default wait is about six seconds per

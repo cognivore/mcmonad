@@ -29,6 +29,7 @@ module MCMonad.Operations
     , chooseOriginTag
     , placeManaged
     , windowsToPark
+    , raiseOrder
       -- * Overlay snapshot
     , buildOverlaySnapshot
     , pushOverlaySnapshot
@@ -319,8 +320,9 @@ windows f = do
         modify $ \s -> s { frameRepairs = foldr M.delete (frameRepairs s) toClear }
         io $ sendCommand conn (SetFrames frames)
 
-    unless (null toShow) $
-        io $ sendCommand conn (ShowWindows (map wrWindowId toShow))
+    let toRaise = raiseOrder (M.keysSet (W.floating currentAfterSticky)) toShow newVisible
+    unless (null toRaise) $
+        io $ sendCommand conn (ShowWindows (map wrWindowId toRaise))
 
     let toHideAll = windowsToPark visibleChanged toHide orphaned
     unless (null toHideAll) $
@@ -880,6 +882,20 @@ placeManaged wr originTag transform ws =
     reinstateIfDropped ws'
         | isJust originTag && not (W.member wr ws') = W.insertUp wr ws'
         | otherwise = ws'
+
+-- | The windows to bring to the front after a pass, last on top, given
+-- the floating windows, the windows that just came on screen and all
+-- visible windows. Nothing is raised unless something came on screen:
+-- raising on every pass moves keyboard focus between an application's
+-- windows. When something did, the new tiled windows go up first and
+-- then every visible floating window, new or not, so that a float that
+-- was already there (a sticky one, say) is not buried by the tiles that
+-- just arrived.
+raiseOrder :: Ord a => S.Set a -> [a] -> [a] -> [a]
+raiseOrder floats shown visible
+    | null shown = []
+    | otherwise  = filter (not . isFloat) shown ++ filter isFloat visible
+  where isFloat = (`S.member` floats)
 
 -- | Windows to park after a pass. Orphans (windows a layout left without a
 -- rect) are always parked; the windows leaving the visible set only when

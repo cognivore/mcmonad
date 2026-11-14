@@ -372,6 +372,10 @@ final class SkyLight: @unchecked Sendable {
 
     // MARK: Window ordering
 
+    /// Orders one of this process's own windows (overlays, borders). It
+    /// cannot order another application's window: the transaction is
+    /// accepted and nothing moves. Those are raised with AXRaise.
+
     func orderWindow(
         _ wid: UInt32,
         relativeTo targetWid: UInt32,

@@ -105,7 +105,7 @@ enum WindowFocus {
 
     /// Returns a short result tag for FocusLog: "ok", "ax-windows-failed",
     /// "wid-not-found-among-N", etc. Caller logs.
-    private static func raiseWindow(pid: pid_t, windowId: UInt32) -> String {
+    static func raiseWindow(pid: pid_t, windowId: UInt32) -> String {
         let appElement = AXUIElementCreateApplication(pid)
         var windowsRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(

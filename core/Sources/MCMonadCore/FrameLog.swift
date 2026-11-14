@@ -43,6 +43,10 @@ enum FrameLog {
         // appears pinned at the hide position from seq=A onward".
         case cmdHideMove
 
+        // A show-windows raise that did not happen (window not found,
+        // application not answering). Successful raises are not logged.
+        case cmdShowRaise
+
         // Outcome from the SkyLight observer — ground truth for what
         // actually happened on screen, post-coalesce. Often silent for
         // self-initiated moves because of disableUpdate brackets and

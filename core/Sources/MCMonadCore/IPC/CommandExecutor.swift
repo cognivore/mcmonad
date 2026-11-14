@@ -211,18 +211,12 @@ final class CommandExecutor {
             writeSize(a, ax, phase: 3)
         }
 
-        // Phase 4: order windows to the front via SkyLight, not AXRaise —
-        // AXRaise also shifts OS keyboard focus, which would steal focus
-        // across screens for windows unrelated to the actual focus change.
-        // Kept inside the disableUpdate bracket along with the position/size
-        // writes above: raising after reenableUpdate would let the window
-        // server composite and show the moved-but-not-yet-raised state as
-        // its own separate repaint, on top of whatever phase 1-3 already
-        // produced -- two visible updates where there should be one.
-        for (a, _) in resolved {
-            skylight.orderWindow(a.windowId, relativeTo: 0, order: .above)
-        }
-
+        // No raising here. Windows that have just come on screen are
+        // raised by the show-windows command that follows, and the focused
+        // window by focus-window. Raising every visible window on every
+        // pass (as this once did, with AXRaise) moved keyboard focus
+        // between an application's windows on different screens each time
+        // anything was laid out.
         skylight.reenableUpdate()
 
         // Phase 5: deterministic readback. Independent of the SkyLight
@@ -504,8 +498,25 @@ final class CommandExecutor {
         SkyLight.shared.reenableUpdate()
     }
 
+    /// Bring windows to the front, in the order given (the last ends up
+    /// on top). The brain sends this after the set-frames that put a
+    /// workspace's windows back on screen: tiled windows first, then every
+    /// floating window in view, so floats stay above tiles.
+    ///
+    /// AXRaise is the only way to do it. A SkyLight order transaction on
+    /// another application's window is accepted and does nothing (checked
+    /// on macOS 26: the window list order is unchanged afterwards).
     private func executeShowWindows(_ windowIds: [UInt32]) {
         logStderr("CMD: show-windows ids=\(windowIds)\n")
-        // SetFrames follows immediately and repositions windows correctly.
+        for wid in windowIds {
+            guard let snap = SkyLightQuery.queryWindow(wid) else {
+                FrameLog.emit(source: .cmdShowRaise, windowId: wid, result: "no-snap")
+                continue
+            }
+            let result = WindowFocus.raiseWindow(pid: snap.pid, windowId: wid)
+            if result != "ok" {
+                FrameLog.emit(source: .cmdShowRaise, windowId: wid, pid: snap.pid, result: result)
+            }
+        }
     }
 }

@@ -28,7 +28,7 @@ import MCMonad.Persistence
 import MCMonad.Operations
     ( frameIsParked, reassignScreens
     , chooseOriginTag, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
-    , placeManaged, windowsToPark
+    , placeManaged, windowsToPark, raiseOrder
     , screenAt, rectOverlapArea, crossedScreenTag
     , RepairStep(..), repairStep, maxRepairAttempts
     , attributeIgnoredWindows
@@ -1801,6 +1801,24 @@ prop_overlayIgnored_wire wid pid =
     in counterexample json $ property $
         ("\"windowId\":" ++ show wid) `L.isInfixOf` json && ("\"pid\":" ++ show pid) `L.isInfixOf` json
 
+-- Raising after a pass: nothing unless something came on screen; then the
+-- new tiles, then every visible float, each window once.
+prop_raiseOrder :: [WindowRef] -> [WindowRef] -> [WindowRef] -> Property
+prop_raiseOrder fs extra shownRaw =
+    let floats  = Set.fromList fs
+        shown   = L.nub shownRaw
+        visible = L.nub (shown ++ extra ++ fs)
+        order   = raiseOrder floats shown visible
+        (tiles, tops) = span (`Set.notMember` floats) order
+    in conjoin
+        [ raiseOrder floats [] visible === []
+        , not (null shown) ==> conjoin
+            [ tiles === filter (`Set.notMember` floats) shown
+            , tops === filter (`Set.member` floats) visible
+            , L.nub order === order
+            ]
+        ]
+
 -- Parking after a pass: orphans always, leavers only when the visible set changed
 prop_windowsToPark_unchanged_parks_orphans :: [WindowRef] -> [WindowRef] -> Bool
 prop_windowsToPark_unchanged_parks_orphans leaving orphaned =
@@ -2153,6 +2171,7 @@ allProperties =
     , ("park: second-screen half tile is not parked", property prop_parkCorner_half_tile_on_second_screen)
     , ("park: first-screen corner is parked",         property prop_parkCorner_parked_on_first_screen)
     , ("park: second-screen corner is parked",        property prop_parkCorner_parked_on_second_screen)
+    , ("raise: new tiles then every visible float",   property prop_raiseOrder)
     , ("park: un-park sweep is drift",                property prop_parkCorner_rejects_unpark_sweep)
     , ("park: off the left edge is parked",           property prop_parkCorner_parked_off_left_edge)
     , ("park: three screens in a row",                property prop_parkCorner_three_in_a_row)

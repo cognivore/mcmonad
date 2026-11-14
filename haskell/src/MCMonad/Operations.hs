@@ -63,6 +63,7 @@ module MCMonad.Operations
       -- * State persistence
     , currentSnapshot
     , saveStateIO
+    , loadExtrasIO
     , maybeSaveState
     , loadStateIO
     , pidAlive
@@ -121,6 +122,7 @@ import MCMonad.ManageHook (ManageHook, runManageHook)
 import MCMonad.Persistence
     ( SerialState(..), persistenceVersion, windowSetToSerial
     , mergePending, placePending
+    , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras
     )
 
 -- ---------------------------------------------------------------------------
@@ -1405,9 +1407,13 @@ currentSnapshot = do
     ts   <- gets timers
     nid  <- gets nextTimerId
     pend <- gets pendingRestore
+    learned <- gets learnedAffinity
+    natives <- gets nativeFloatRects
     return StateSnapshot
         { snWindowSet   = ws
         , snAffinity    = visibleAffinities ws
+        , snLearned     = learned
+        , snNativeFloats = natives
         , snTimers      = ts
         , snNextTimerId = nid
         , snPending     = pend
@@ -1430,13 +1436,51 @@ saveStateIO snap = do
     let ws = mergePending (snPending snap) (snWindowSet snap)
         snapshot = windowSetToSerial ws (snAffinity snap)
                                      (snTimers snap) (snNextTimerId snap)
+        extras = pruneExtras
+            (S.fromList (map W.tag (W.workspaces ws)))
+            (S.fromList (W.allWindows ws))
+            (StateExtras (snLearned snap) (snNativeFloats snap))
     sf <- getStateFile
-    let tmp = sf ++ ".tmp"
-    (do writeFile tmp (show snapshot)
-        Posix.setFileMode tmp 0o600
-        Posix.rename tmp sf)
+    (do writeFileAtomic (extrasFileFor sf) (LBS.writeFile `flip` encodeExtras extras)
+        writeFileAtomic sf (`writeFile` show snapshot))
         `catch` \e ->
             logTS $ "mcmonad: state save failed: " ++ show (e :: IOException)
+
+-- | Write a file so that a reader sees either the old contents or the new,
+-- never a partial write: fill a temporary file beside it, make it private,
+-- and rename it into place.
+writeFileAtomic :: FilePath -> (FilePath -> IO ()) -> IO ()
+writeFileAtomic path fill = do
+    let tmp = path ++ ".tmp"
+    fill tmp
+    Posix.setFileMode tmp 0o600
+    Posix.rename tmp path
+
+-- | The file beside the state file that holds 'StateExtras'.
+extrasFileFor :: FilePath -> FilePath
+extrasFileFor = (++ ".extras")
+
+-- | Read the state saved beside the main file. A missing file is the
+-- ordinary first start after an upgrade from a brain that never wrote one,
+-- and yields 'noExtras'. A file that cannot be read or understood is moved
+-- aside to @.extras.bak@ and reported; what it held (which screen hidden
+-- workspaces prefer, which windows are native floats) is then unknown, and
+-- 'noExtras' says so.
+loadExtrasIO :: IO StateExtras
+loadExtrasIO = do
+    ef <- extrasFileFor <$> getStateFile
+    exists <- doesFileExist ef
+    if not exists then return noExtras else
+        (do bytes <- LBS.readFile ef
+            case decodeExtras bytes of
+                Right extras -> LBS.length bytes `seq` return extras
+                Left err -> do
+                    logTS $ "mcmonad: " ++ ef ++ " not understood (" ++ err ++ "); moving to .bak"
+                    Posix.rename ef (ef ++ ".bak")
+                    return noExtras)
+            `catch` \e -> do
+                logTS $ "mcmonad: could not read " ++ ef ++ ": " ++ show (e :: IOException)
+                return noExtras
 
 -- | Read the saved state from disk, if any. Returns 'Nothing' when:
 --

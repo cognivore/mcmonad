@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- |
 -- = mcmonad persistence
@@ -67,8 +68,19 @@ module MCMonad.Persistence
     , partitionPending
     , placePending
     , mergePending
+      -- * State kept beside the main file
+    , StateExtras(..)
+    , noExtras
+    , extrasVersion
+    , encodeExtras
+    , decodeExtras
+    , pruneExtras
     ) where
 
+import Data.Aeson ((.=), (.:))
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as Aeson
+import qualified Data.ByteString.Lazy as LBS
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -77,7 +89,7 @@ import qualified XMonad.StackSet as W
 
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Timer(..)
-    , PendingWindow(..)
+    , PendingWindow(..), Rectangle
     )
 
 -- ---------------------------------------------------------------------------
@@ -359,3 +371,80 @@ mergePending
 mergePending pend ws = Map.foldrWithKey step ws pend
   where
     step w pw acc = fromMaybe acc (placePending w pw acc)
+
+-- ---------------------------------------------------------------------------
+-- State kept beside the main file
+--
+-- @mcmonad.state@ is a @Show@ed record read back with @Read@, so adding a
+-- field to it makes every older brain reject the file outright. That is
+-- how a rolled-back brain once put every window on one workspace
+-- (2026-09-16). State that arrived later therefore lives in a second file,
+-- @mcmonad.state.extras@, as JSON:
+--
+-- * an older brain never opens it and keeps reading @mcmonad.state@ as
+--   before, so a rollback loses only what that brain could not have used;
+-- * a newer brain that finds no extras file (the first start after an
+--   upgrade) starts with none, which is exactly the state the older brain
+--   had;
+-- * the two files need not be written in one step: every entry here is
+--   about a workspace or a window named in the main file, and
+--   'pruneExtras' drops entries the main file no longer backs.
+
+-- | State saved beside the main file.
+data StateExtras = StateExtras
+    { seLearnedAffinity :: !(Map.Map String ScreenId)
+      -- ^ The screen each workspace was last shown on, hidden workspaces
+      -- included. The Sway-style bindings use it to bring a hidden
+      -- workspace back to its own screen and to cycle a screen's
+      -- workspaces. The main file's affinity field can only say what each
+      -- screen is showing.
+    , seNativeFloats    :: !(Map.Map WindowRef Rectangle)
+      -- ^ Windows placed with 'MCMonad.ManageHook.doFloatNative', with the
+      -- last frame each had on screen. Without this a restart forgets
+      -- that the window must never be sent a frame, and its placeholder
+      -- floating rectangle (the whole screen) is applied to it.
+    } deriving (Eq, Show)
+
+-- | No extra state: what a brain has before it ever saved any.
+noExtras :: StateExtras
+noExtras = StateExtras Map.empty Map.empty
+
+-- | Version of the extras file. A file with another version is not read.
+extrasVersion :: Int
+extrasVersion = 1
+
+encodeExtras :: StateExtras -> LBS.ByteString
+encodeExtras e = Aeson.encode $ Aeson.object
+    [ "version" .= extrasVersion
+    , "learnedAffinity" .=
+        [ Aeson.object ["tag" .= tag, "screen" .= n]
+        | (tag, S n) <- Map.toList (seLearnedAffinity e) ]
+    , "nativeFloats" .=
+        [ Aeson.object ["windowId" .= wrWindowId w, "pid" .= wrPid w, "frame" .= r]
+        | (w, r) <- Map.toList (seNativeFloats e) ]
+    ]
+
+decodeExtras :: LBS.ByteString -> Either String StateExtras
+decodeExtras bytes = Aeson.eitherDecode bytes >>= Aeson.parseEither parser
+  where
+    parser = Aeson.withObject "StateExtras" $ \v -> do
+        version <- v .: "version"
+        if version /= extrasVersion
+            then fail ("unsupported extras version " ++ show (version :: Int))
+            else do
+                learned <- v .: "learnedAffinity" >>= mapM learnedEntry
+                natives <- v .: "nativeFloats" >>= mapM nativeEntry
+                return (StateExtras (Map.fromList learned) (Map.fromList natives))
+    learnedEntry = Aeson.withObject "learnedAffinity entry" $ \o ->
+        (\tag n -> (tag, S n)) <$> o .: "tag" <*> o .: "screen"
+    nativeEntry = Aeson.withObject "nativeFloats entry" $ \o ->
+        (\wid pid r -> (WindowRef wid pid, r)) <$> o .: "windowId" <*> o .: "pid" <*> o .: "frame"
+
+-- | Keep only the entries the main state still backs: affinities for
+-- workspaces that exist, native floats for windows that are managed or
+-- held pending.
+pruneExtras :: Set.Set String -> Set.Set WindowRef -> StateExtras -> StateExtras
+pruneExtras tags windows' e = StateExtras
+    { seLearnedAffinity = Map.filterWithKey (\t _ -> Set.member t tags) (seLearnedAffinity e)
+    , seNativeFloats    = Map.filterWithKey (\w _ -> Set.member w windows') (seNativeFloats e)
+    }

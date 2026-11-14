@@ -240,6 +240,15 @@ data PendingWindow a = PendingWindow
 data StateSnapshot = StateSnapshot
     { snWindowSet   :: !WindowSet
     , snAffinity    :: !(Map.Map String ScreenId)
+      -- ^ The workspace each attached screen shows. Restore reads it as
+      -- "this screen had this workspace", so it holds visible workspaces only.
+    , snLearned     :: !(Map.Map String ScreenId)
+      -- ^ 'MState.learnedAffinity': the screen every workspace was last
+      -- shown on, hidden ones included. Saved beside the state file (see
+      -- 'MCMonad.Persistence.StateExtras').
+    , snNativeFloats :: !(Map.Map WindowRef Rectangle)
+      -- ^ 'MState.nativeFloatRects'. Its keys are 'MState.nativeFloats'.
+      -- Saved beside the state file.
     , snTimers      :: ![Timer]
     , snNextTimerId :: !Int
     , snPending     :: !(Map.Map WindowRef (PendingWindow WindowRef))

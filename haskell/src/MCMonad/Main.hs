@@ -29,7 +29,9 @@ import MCMonad.Debug (toggleDebugOverlays, setDebugOverlays)
 import MCMonad.IPC
 import MCMonad.Operations
 import MCMonad.Persistence
-    ( SerialState(..), serialToWindowSet, partitionPending )
+    ( SerialState(..), serialToWindowSet, partitionPending
+    , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras
+    )
 
 -- | Main entry point. Connect to the Swift daemon, initialise state, and
 -- run the event loop. This is what users call from their @mcmonad.hs@:
@@ -114,6 +116,7 @@ launch cfg = do
                     , rsTimers      = []
                     , rsNextTimerId = 1
                     , rsPending     = Map.empty
+                    , rsExtras      = noExtras
                     }
         -- Roles come with the geometry; give each role's screen a
         -- workspace of its own before the first layout.
@@ -145,7 +148,10 @@ launch cfg = do
             ]
         mst0  = MState { windowset = ws0
                        , mapped = Set.empty
-                       , learnedAffinity = rsAffinity restored
+                       -- What each screen shows now wins over what was
+                       -- learned before; the rest is the learned history.
+                       , learnedAffinity = Map.union (rsAffinity restored)
+                                               (seLearnedAffinity (rsExtras restored))
                        , inputMode = "default"
                        , sticky = Set.empty
                        , scratchpads = Map.empty
@@ -163,8 +169,8 @@ launch cfg = do
                        , debugOverlays = False
                        , ignoredWindows = Set.empty
                        , frameRepairs = Map.empty
-                       , nativeFloats = Set.empty
-                       , nativeFloatRects = Map.empty
+                       , nativeFloats = Map.keysSet (seNativeFloats (rsExtras restored))
+                       , nativeFloatRects = seNativeFloats (rsExtras restored)
                        , lastSaveAt = Nothing
                        , timers = rsTimers restored
                        , nextTimerId = rsNextTimerId restored
@@ -248,6 +254,9 @@ data Restored = Restored
       -- is still running. Held out of the 'WindowSet' with their saved
       -- placement, and put back the moment the daemon reports them
       -- ('MCMonad.Operations.restorePending').
+    , rsExtras      :: StateExtras
+      -- ^ State saved beside the main file, cut down to the workspaces and
+      -- windows this restore produced (confirmed or pending).
     }
 
 -- | Try to restore a previous snapshot. Returns 'Nothing' when no save
@@ -279,6 +288,7 @@ restoreSnapshot cfg screens existingWindows = do
     case mSaved of
         Nothing -> return Nothing
         Just savedRaw -> do
+            extrasRaw <- loadExtrasIO
             let validTags = Set.fromList (mcWorkspaces cfg)
                 saved     = filterToValidTags validTags savedRaw
                 screenTuples =
@@ -334,6 +344,9 @@ restoreSnapshot cfg screens existingWindows = do
                 , rsTimers      = ssTimers saved
                 , rsNextTimerId = ssNextTimerId saved
                 , rsPending     = pending
+                , rsExtras      = pruneExtras validTags
+                    (Set.fromList (W.allWindows ws) `Set.union` Map.keysSet pending)
+                    extrasRaw
                 }
   where
     -- A saved snapshot may carry workspace tags that don't exist in

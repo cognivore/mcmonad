@@ -23,6 +23,7 @@ import MCMonad.Persistence
     ( SerialState(..), SerStack(..), persistenceVersion, serialToWindowSet
     , windowSetToSerial
     , partitionPending, placePending, mergePending
+    , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras
     )
 import MCMonad.Operations
     ( frameIsParked, reassignScreens
@@ -1719,6 +1720,30 @@ prop_focusByRole_visible_moves_nothing =
         shown x = L.sort (map (\s -> (W.screen s, W.tag (W.workspace s))) (W.screens x))
     in W.peek ws == Just w && W.screen (W.current ws) == S 2 && shown ws == shown ws0
 
+-- The state kept beside the main file survives its JSON form.
+prop_extras_round_trip :: [(String, NonNegative Int)] -> [(WindowRef, ScreenDetail)] -> Property
+prop_extras_round_trip learned natives =
+    let extras = StateExtras (Map.fromList [ (t, S n) | (t, NonNegative n) <- learned ])
+                             (Map.fromList [ (w, r) | (w, SD r) <- natives ])
+    in decodeExtras (encodeExtras extras) === Right extras
+
+-- An extras file from another version is refused, not half-read.
+prop_extras_other_version_refused :: Bool
+prop_extras_other_version_refused =
+    case decodeExtras (BL.pack "{\"version\":999,\"learnedAffinity\":[],\"nativeFloats\":[]}") of
+        Left _  -> True
+        Right _ -> False
+
+-- Entries the main state no longer backs are dropped; the rest are kept.
+prop_extras_prune :: Bool
+prop_extras_prune =
+    let w1 = WindowRef 1 1; w2 = WindowRef 2 2
+        r  = Rectangle 0 0 10 10
+        extras = StateExtras (Map.fromList [("a", S 0), ("gone", S 1)])
+                             (Map.fromList [(w1, r), (w2, r)])
+    in pruneExtras (Set.fromList ["a", "b"]) (Set.fromList [w1]) extras
+        == StateExtras (Map.fromList [("a", S 0)]) (Map.fromList [(w1, r)])
+
 prop_role_names_round_trip :: Bool
 prop_role_names_round_trip =
     all (\r -> parseRole (roleName r) == Just r) [minBound .. maxBound]
@@ -2013,6 +2038,9 @@ allProperties =
     , ("affinity: focusing a hidden window lands on its role screen", property prop_focusByRole_hidden_lands_on_role_screen)
     , ("affinity: focusing a visible window moves no workspace", property prop_focusByRole_visible_moves_nothing)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
+    , ("state extras: JSON round trip", property prop_extras_round_trip)
+    , ("state extras: other version refused", property prop_extras_other_version_refused)
+    , ("state extras: prune to the main state", property prop_extras_prune)
     , ("ocr-index wire format", property prop_ocr_index_wire)
     , ("event logs redact window and peer content", property prop_event_logs_redact_content)
     , ("decode errors redact payload and parser content", property prop_decode_error_redacts_content)

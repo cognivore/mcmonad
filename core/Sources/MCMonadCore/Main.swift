@@ -378,28 +378,21 @@ final class EventBridge: SkyLightEventDelegate {
         }
     }
 
-    /// Centers every managed window on its screen. mcmonad has no macOS
-    /// Space to fall back on for hidden workspaces — they're simulated by
-    /// parking windows almost entirely off-screen (see
-    /// 'executeHideWindows') — so unlike AeroSpace, which parks the same
-    /// way but restores on quit, killing mcmonad with no equivalent
-    /// cleanup leaves every hidden window stuck off-screen forever.
+    /// Puts every parked window back in the middle of its screen. Hidden
+    /// workspaces are not macOS Spaces: their windows are parked almost
+    /// entirely off screen (see 'executeHideWindows'), so a daemon that
+    /// stops for good would otherwise leave them stranded there.
     ///
-    /// Deliberately unconditional, rather than only restoring windows
-    /// detected as parked: a parked frame drifts away from its exact
-    /// corner between re-asserts (AppKit nudges a mostly-off-screen
-    /// window back on-screen on its own; see the comment on
-    /// 'executeHideWindows'), so a tight "is this parked" geometry check
-    /// misses drifted windows. Recentering an already-visible window too
-    /// is harmless here: the process is exiting either way, so mcmonad
-    /// is giving up layout control of every window at once, same as
-    /// AeroSpace's own termination handler does.
+    /// Only windows that are parked right now are touched. A visible
+    /// window is already where the user can reach it, and so is one that
+    /// drifted back on screen, so there is nothing to rescue and moving
+    /// it would only scramble the layout on every restart.
     ///
     /// Exception to Rule 1 (no window-placement decisions in core): this is
     /// an exit-time mitigation. It runs after mcmonad has stopped taking
     /// layout actions, so the brain is not involved and no frames are sent
     /// to it for this purpose.
-    func restoreAllParkedWindows(displayManager: DisplayManager) {
+    func restoreParkedWindows() {
         let screens = displayManager.currentScreens()
         guard !screens.isEmpty else { return }
         for wid in managedWindowIds {
@@ -409,6 +402,7 @@ final class EventBridge: SkyLightEventDelegate {
             // itself writes to.
             guard let pid = windowIdToPid[wid],
                   let frame = AXWindowService.readFrame(windowId: wid, pid: pid),
+                  isAlreadyParked(frame, screens: screens),
                   let home = homeScreen(for: frame, among: screens)
             else { continue }
             AXWindowService.setFrame(
@@ -421,30 +415,38 @@ final class EventBridge: SkyLightEventDelegate {
     }
 }
 
-/// Set right before the process exits — see 'installTerminationHandler'.
-@MainActor private var terminationCleanup: (() -> Void)?
+/// Runs `cleanup` on the main queue when the process is asked to stop
+/// (SIGTERM from launchd or `kill`, SIGINT from a terminal), then exits.
+/// SIGKILL cannot be observed, so a hard kill still skips it.
+///
+/// The signals are delivered through dispatch sources, not a `signal()`
+/// handler: a handler runs on whatever the interrupted thread was doing,
+/// where allocating (as starting a Task does) can deadlock inside malloc
+/// and leave the daemon neither running nor exited.
+@MainActor
+final class TerminationWatch {
+    private var sources: [DispatchSourceSignal] = []
 
-/// Installs a SIGTERM/SIGINT handler that restores parked windows before
-/// the process actually exits (mirrors AeroSpace's own termination
-/// handler). SIGKILL can't be caught, so a hard kill still loses the
-/// cleanup — only a cooperative stop (e.g. `launchctl stop`, plain `kill`)
-/// is covered.
-private func installTerminationHandler() {
-    let handle: sig_t = { sig in
-        Task { @MainActor in
-            terminationCleanup?()
-            exit(sig)
+    init(cleanup: @escaping @MainActor () -> Void) {
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)   // hand the signal to the dispatch source
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                MainActor.assumeIsolated {
+                    cleanup()
+                    exit(0)
+                }
+            }
+            source.resume()
+            sources.append(source)
         }
     }
-    signal(SIGTERM, handle)
-    signal(SIGINT, handle)
 }
 
 @main
 struct MCMonadCoreApp {
     static func main() {
         logger.info("mcmonad-core starting")
-        installTerminationHandler()
 
         // 1. Check / prompt accessibility permission.
         // Remember what the executable looked like at launch, so a later
@@ -705,9 +707,8 @@ struct MCMonadCoreApp {
         let eventObserver = SkyLightEventObserver.shared
         eventObserver.delegate = eventBridge
 
-        terminationCleanup = { [weak eventBridge, weak displayManager] in
-            guard let eventBridge, let displayManager else { return }
-            eventBridge.restoreAllParkedWindows(displayManager: displayManager)
+        let terminationWatch = TerminationWatch { [weak eventBridge] in
+            eventBridge?.restoreParkedWindows()
         }
 
         // Bootstrap existing-at-startup windows into the event bridge so
@@ -812,7 +813,7 @@ struct MCMonadCoreApp {
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, queryServer, executor, eventBridge, dragHandler,
                       mouseDownMonitor, spotlight, timerController, screenIndex,
-                      whatsUpCache)
+                      whatsUpCache, terminationWatch)
     }
 
     // Static storage to prevent ARC from deallocating services

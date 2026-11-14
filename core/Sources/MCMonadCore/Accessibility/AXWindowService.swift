@@ -92,7 +92,7 @@ enum AXWindowService {
         // rather than caught by the NSError filter above — so presence
         // alone isn't a reliable signal; the element itself has to check
         // out and be enabled too.
-        let hasFullscreenButton = hasResolved(4) && isAXElementEnabled(attr(4))
+        let hasFullscreenButton = hasResolved(4) && buttonState(attr(4)) != .unusable
 
         // Read frame
         let frame: CGRect
@@ -131,7 +131,7 @@ enum AXWindowService {
         // presence.) The subrole check this used to also require never
         // actually discriminated anything: every window here (fixed or
         // not) reports "AXStandardWindow".
-        let hasZoomButton = hasResolved(7) && isAXElementEnabled(attr(7))
+        let hasZoomButton = hasResolved(7) && buttonState(attr(7)) != .unusable
         let isFixedSize = !hasZoomButton
 
         // App name and bundle ID
@@ -396,23 +396,35 @@ enum AXWindowService {
         return CFBooleanGetValue((valueRef as! CFBoolean))
     }
 
-    /// Whether an AX button element (e.g. the fullscreen button) is
-    /// present and enabled. Absent, non-element, or unreadable ⇒ false —
-    /// windows that don't really support the capability a button
-    /// stands for tend not to expose a clean readable enabled state
-    /// for it either, so treating "can't tell" as "no" catches those
-    /// rather than defaulting to the more common case.
-    private static func isAXElementEnabled(_ element: Any?) -> Bool {
+    /// What is known about a title-bar button the batch read resolved.
+    private enum ButtonState {
+        /// A real button that reports itself enabled.
+        case enabled
+        /// Not a button at all (the batch read boxes an AX error as a
+        /// value for some windows), or a button that reports itself
+        /// disabled. Either way the window lacks the capability.
+        case unusable
+        /// A real button whose enabled state could not be read: the
+        /// application did not answer in time. Nothing is known.
+        case unanswered
+    }
+
+    /// Classify a resolved title-bar button attribute. Only positive
+    /// evidence makes a button `unusable`. An application that is slow to
+    /// answer says nothing about its window, and reading that silence as
+    /// "no fullscreen button" would float a window that should tile (the
+    /// default manage hook floats windows without one).
+    private static func buttonState(_ element: Any?) -> ButtonState {
         guard let element,
               CFGetTypeID(element as CFTypeRef) == AXUIElementGetTypeID()
-        else { return false }
+        else { return .unusable }
         let axElement = unsafeDowncast(element as AnyObject, to: AXUIElement.self)
         var valueRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axElement, kAXEnabledAttribute as CFString, &valueRef) == .success,
-              let valueRef,
-              CFGetTypeID(valueRef) == CFBooleanGetTypeID()
-        else { return false }
-        return CFBooleanGetValue((valueRef as! CFBoolean))
+        let status = AXUIElementCopyAttributeValue(axElement, kAXEnabledAttribute as CFString, &valueRef)
+        guard status == .success, let valueRef, CFGetTypeID(valueRef) == CFBooleanGetTypeID() else {
+            return status == .cannotComplete ? .unanswered : .unusable
+        }
+        return CFBooleanGetValue((valueRef as! CFBoolean)) ? .enabled : .unusable
     }
 
     /// Clear AXEnhancedUserInterface on every app in `pids` where it is

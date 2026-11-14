@@ -67,7 +67,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 15
+protocolVersion = 16
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -343,6 +343,9 @@ data Event
     | FrontAppChanged !Int32
     | FocusedWindowChanged !Word32 !Int32
     | FocusedWindowQueryResponse !Word32 !Int32
+    | FocusedWindowQueryEmpty
+      -- ^ The answer to a 'QueryFocusedWindow' when macOS has no focused
+      -- window. Every query gets exactly one of the two answers.
       -- ^ Reply to 'QueryFocusedWindow': the window macOS currently
       -- considers focused. Distinct from 'FocusedWindowChanged' so it
       -- bypasses the 'focusIntent' bounce-suppression dispatch and is
@@ -415,6 +418,7 @@ eventLogSummary event = case event of
     FrontAppChanged pid          -> "FrontAppChanged " ++ show pid
     FocusedWindowChanged wid pid -> "FocusedWindowChanged " ++ show (wid, pid)
     FocusedWindowQueryResponse wid pid -> "FocusedWindowQueryResponse " ++ show (wid, pid)
+    FocusedWindowQueryEmpty      -> "FocusedWindowQueryEmpty"
     ScreensChanged screens       -> "ScreensChanged count=" ++ show (length screens)
     HotkeyPressed key            -> "HotkeyPressed " ++ show key
     MouseEnteredWindow wid pid   -> "MouseEnteredWindow " ++ show (wid, pid)
@@ -511,6 +515,7 @@ instance Aeson.FromJSON Event where
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
                 "focused-window-changed" -> FocusedWindowChanged <$> v .: "windowId" <*> v .: "pid"
                 "focused-window-query-response" -> FocusedWindowQueryResponse <$> v .: "windowId" <*> v .: "pid"
+                "focused-window-query-empty" -> pure FocusedWindowQueryEmpty
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
                 "ignored-attribution-query" -> IgnoredAttributionQuery <$> v .: "screenFrame" <*> (v .: "windows" >>= traverse parseIgnoredFact)
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"

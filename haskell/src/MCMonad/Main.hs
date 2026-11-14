@@ -170,7 +170,7 @@ launch cfg = do
                        , nextTimerId = rsNextTimerId restored
                        , focusIntent = Nothing
                        , frontmostPid = Nothing
-                       , pendingFocusQuery = Nothing
+                       , pendingFocusQueries = []
                        , suppressFrontAppUntil = Nothing
                        , emptyWorkspaceGuardUntil = Nothing
                        , unmanagedOrigin = Map.empty
@@ -662,9 +662,12 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- caller (e.g. 'MCMonad.Operations.jumpToActiveWindow',
             -- 'MCMonad.Operations.kill', or this module's own
             -- 'confirmFrontAppChange') queued for it.
-            pending <- gets pendingFocusQuery
-            modify $ \s -> s { pendingFocusQuery = Nothing }
-            whenJust pending ($ WindowRef wid pid)
+            answerFocusQuery (Just (WindowRef wid pid))
+
+        FocusedWindowQueryEmpty ->
+            -- macOS has no focused window to report. The caller that asked
+            -- gets no answer, and its place in the queue is released.
+            answerFocusQuery Nothing
 
         FrontAppChanged pid -> handleFrontAppChanged pid
 
@@ -891,6 +894,17 @@ handleFocusedWindowChanged wid pid = do
     applyAndClearIntent = do
         modify $ \s -> s { focusIntent = Nothing }
         applyClean
+
+-- | Hand the daemon's answer to the oldest outstanding
+-- 'queryFocusedWindow' caller. Answers arrive one per query, in order.
+answerFocusQuery :: Maybe WindowRef -> M ()
+answerFocusQuery answer = do
+    pending <- gets pendingFocusQueries
+    case pending of
+        []       -> return ()
+        (f:rest) -> do
+            modify $ \s -> s { pendingFocusQueries = rest }
+            whenJust answer f
 
 handleFrontAppChanged :: Int32 -> M ()
 handleFrontAppChanged pid = do

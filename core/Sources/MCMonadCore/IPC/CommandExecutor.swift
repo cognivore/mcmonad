@@ -410,12 +410,15 @@ final class CommandExecutor {
     /// window, mapped back to a CGWindowID via _AXUIElementGetWindow. This
     /// is the only reliable source after a Dock-icon click, where the
     /// activated app's focused window may sit on an off-screen workspace
-    /// that mcmonad's StackSet focus never followed. Emits nothing if the
-    /// focus can't be resolved (no fabricated answer).
+    /// that mcmonad's StackSet focus never followed. When the focus can't
+    /// be resolved the answer says so (no fabricated window): the brain
+    /// pairs each answer with the caller that asked, so a query must never
+    /// go unanswered.
     private func executeQueryFocusedWindow() {
         guard let target = WindowFocus.frontmostFocusedWindow() else {
             FocusLog.emit(source: .cmdFocusWindow,
                           result: "no-frontmost-focused-window")
+            socketServer.send(.focusedWindowQueryEmpty)
             return
         }
         FocusLog.emit(source: .cmdFocusWindow,

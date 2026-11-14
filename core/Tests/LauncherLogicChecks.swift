@@ -163,6 +163,8 @@ enum LauncherLogicChecks {
     }
 
     static func checkTitleEvent() {
+        let empty = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(IPCEvent.focusedWindowQueryEmpty)) as! [String: Any]
+        precondition(empty["event"] as? String == "focused-window-query-empty" && empty.count == 1)
         for title: String? in ["HMRC tax filing system in Rust", "", nil] {
             let data = try! JSONEncoder().encode(IPCEvent.windowTitleChanged(windowId: 7, pid: 42, title: title))
             let object = try! JSONSerialization.jsonObject(with: data) as! [String: Any]

@@ -333,6 +333,11 @@ enum IPCEvent: Encodable, Sendable {
     case menuFocusWindow(windowId: UInt32, pid: Int32)
     case menuViewWorkspace(tag: String)
     case focusedWindowQueryResponse(windowId: UInt32, pid: Int32)
+    /// The answer to `query-focused-window` when macOS has no focused
+    /// window. Every query is answered exactly once, with this or with
+    /// `focusedWindowQueryResponse`, so the brain can pair answers with
+    /// the callers that asked.
+    case focusedWindowQueryEmpty
     /// Ask the brain which ignored windows belong to `screenFrame`. Answered
     /// by an `IPCCommand.ignoredAttributionReply` echoing that frame.
     case ignoredAttributionQuery(screenFrame: CGRect, windows: [IgnoredAttributionFact])
@@ -412,6 +417,8 @@ enum IPCEvent: Encodable, Sendable {
         case .menuViewWorkspace(let tag):
             try container.encode("menu-view-workspace", forKey: .event)
             try container.encode(tag, forKey: .tag)
+        case .focusedWindowQueryEmpty:
+            try container.encode("focused-window-query-empty", forKey: .event)
         case .focusedWindowQueryResponse(let windowId, let pid):
             try container.encode("focused-window-query-response", forKey: .event)
             try container.encode(windowId, forKey: .windowId)

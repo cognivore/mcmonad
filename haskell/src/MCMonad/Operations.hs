@@ -1209,10 +1209,11 @@ kill = queryFocusedWindow $ \w -> do
 -- | Fetch the window macOS currently has focused and run an action on it,
 -- bypassing 'windowset' (see 'kill'). Asynchronous: only sends the query
 -- here, @f@ runs later when 'MCMonad.IPC.FocusedWindowQueryResponse'
--- arrives — see the handler in "MCMonad.Main".
+-- arrives — see the handler in "MCMonad.Main". When macOS has no focused
+-- window the daemon says so and @f@ is dropped without running.
 queryFocusedWindow :: (WindowRef -> M ()) -> M ()
 queryFocusedWindow f = do
-    modify $ \s -> s { pendingFocusQuery = Just f }
+    modify $ \s -> s { pendingFocusQueries = pendingFocusQueries s ++ [f] }
     conn <- asks connection
     io $ sendCommand conn QueryFocusedWindow
 

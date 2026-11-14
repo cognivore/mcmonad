@@ -1524,6 +1524,13 @@ prop_overlayScreen_wire_is_active active =
     let json = BL.unpack (Aeson.encode (OverlayScreenEntry 0 (Rectangle 0 0 1 1) "1" active []))
     in counterexample json (property (("\"isActive\":" ++ (if active then "true" else "false")) `L.isInfixOf` json))
 
+-- Every focus query is answered; the "nothing focused" answer decodes.
+prop_focus_query_empty_wire :: Bool
+prop_focus_query_empty_wire =
+    case Aeson.eitherDecode (BL.pack "{\"event\":\"focused-window-query-empty\"}") of
+        Right FocusedWindowQueryEmpty -> True
+        _ -> False
+
 prop_title_changed_wire :: Bool
 prop_title_changed_wire =
     case Aeson.eitherDecode (BL.pack "{\"event\":\"window-title-changed\",\"windowId\":7,\"pid\":42,\"title\":\"HMRC tax filing system in Rust\"}") of
@@ -2012,6 +2019,7 @@ allProperties =
     , ("overlay screen wire carries isActive", property prop_overlayScreen_wire_is_active)
     , ("overlay ignored window wire carries identity", property prop_overlayIgnored_wire)
     , ("title-changed wire format", property prop_title_changed_wire)
+    , ("focus-query-empty wire format", property prop_focus_query_empty_wire)
     , ("timer persistence + legacy snapshot", property prop_timer_persistence)
     , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)

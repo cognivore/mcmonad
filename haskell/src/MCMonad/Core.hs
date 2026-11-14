@@ -568,13 +568,17 @@ data MState = MState
       -- to tell a genuine app switch from AX re-announcing an app's
       -- window that isn't actually in front (see 'FocusedWindowChanged'
       -- in "MCMonad.Main").
-    , pendingFocusQuery :: !(Maybe (WindowRef -> M ()))
-      -- ^ Continuation for the next 'MCMonad.IPC.FocusedWindowQueryResponse'.
-      -- Set right before sending 'MCMonad.IPC.QueryFocusedWindow', run and
-      -- cleared by the response handler in "MCMonad.Main". Needed by
-      -- callers that want the window macOS actually has focused rather
-      -- than 'windowset', which omits 'MCMonad.ManageHook.doIgnore'd
-      -- windows entirely.
+    , pendingFocusQueries :: ![WindowRef -> M ()]
+      -- ^ What to do with the answers to the 'MCMonad.IPC.QueryFocusedWindow'
+      -- commands still in flight, oldest first. The daemon answers every
+      -- query exactly once and in order, with either
+      -- 'MCMonad.IPC.FocusedWindowQueryResponse' or
+      -- 'MCMonad.IPC.FocusedWindowQueryEmpty', so the head of this list
+      -- always belongs to the next answer. A single slot was not enough:
+      -- every app switch asks (see 'MCMonad.Main.confirmFrontAppChange'),
+      -- and a close-window keypress that asked a moment earlier had its
+      -- answer handed to the wrong caller. Callers ask because 'windowset'
+      -- cannot tell them: it omits 'MCMonad.ManageHook.doIgnore'd windows.
     , suppressFrontAppUntil :: !(Maybe UTCTime)
       -- ^ Set by 'MCMonad.Operations.kill' when closing a window leaves
       -- its workspace empty: there is nothing left to explicitly focus

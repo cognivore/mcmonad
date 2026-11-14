@@ -2,7 +2,6 @@ module MCMonad.Main
     ( mcmonad
     , launch
     , onHiddenWorkspace
-    , shouldFollowIntoHidden
     , pairBurst
     ) where
 
@@ -175,7 +174,6 @@ launch cfg = do
                        , timers = rsTimers restored
                        , nextTimerId = rsNextTimerId restored
                        , focusIntent = Nothing
-                       , frontmostPid = Nothing
                        , pendingFocusQueries = []
                        , suppressFrontAppUntil = Nothing
                        , emptyWorkspaceGuardUntil = Nothing
@@ -536,16 +534,6 @@ pairBurst ws pid events =
 onHiddenWorkspace :: W.StackSet i l WindowRef sid sd -> WindowRef -> Bool
 onHiddenWorkspace ws w = W.member w ws && w `notElem` visibleScreenWindows ws
 
--- | Whether a 'FocusedWindowChanged' for a hidden-workspace window should
--- be followed (switching to that window's workspace) rather than left to
--- 'handleFocusedWindowChanged'. True only when the window is on a hidden
--- workspace /and/ its app is the one NSWorkspace\/SkyLight currently
--- reports as frontmost -- AX re-announces a window that isn't actually in
--- front just as readily as it reports a genuine focus change, so the
--- frontmost check is what separates the two cases.
-shouldFollowIntoHidden :: Bool -> Bool -> Bool
-shouldFollowIntoHidden onHidden isFrontmostApp = onHidden && isFrontmostApp
-
 -- | Dispatch a single event from the Swift daemon.
 handleEvent :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> Event -> M ()
 handleEvent debug cfg hotkeyIdMap evt = do
@@ -657,17 +645,13 @@ handleEvent debug cfg hotkeyIdMap evt = do
                 windows (W.float wr (W.RationalRect rx ry rw rh) . W.shiftWin dropTag wr)
 
         FocusedWindowChanged wid pid -> do
-            -- A window on a hidden workspace whose app is frontmost:
-            -- switch to its workspace and focus it directly, as
-            -- 'MenuFocusWindow' does. Visible-screen windows, and
-            -- hidden-workspace windows whose app isn't frontmost (AX
-            -- re-announcing a background window, not a real focus
-            -- change), still go through the focus-intent classifier.
+            -- A window on a screen goes through the focus-intent
+            -- classifier. A window on a hidden workspace would bring that
+            -- workspace on screen, which needs more than the event's word.
             ws0 <- gets windowset
-            front <- gets frontmostPid
             let wr0 = WindowRef wid pid
-            if shouldFollowIntoHidden (onHiddenWorkspace ws0 wr0) (front == Just pid)
-                then focusWindowAnywhere wr0
+            if onHiddenWorkspace ws0 wr0
+                then followHiddenIfConfirmed wr0
                 else handleFocusedWindowChanged wid pid
             -- A should-be-hidden window receiving AX focus means the
             -- user reached it on screen — it drifted (fullscreen-
@@ -845,10 +829,13 @@ handleEvent debug cfg hotkeyIdMap evt = do
 --   * exact match (wid + pid) — confirmation, no-op.
 --   * same app, different window — intra-app focus change (user clicking
 --     another window of the target's app); accept it and clear intent.
---   * anything else — bounce or spurious cross-app divergence; re-issue
---     'FocusWindow' to push macOS back to the target and decrement the
---     budget. When the budget exhausts the intent clears so user-
---     initiated cross-app focus changes eventually take effect.
+--   * a window this pass just laid out, inside the settle window — our
+--     own echo, no-op.
+--   * anything else on a screen — macOS has focused another window;
+--     follow it and clear the intent.
+--
+-- Windows on hidden workspaces never reach this function; see
+-- 'followHiddenIfConfirmed'.
 --
 -- See the 'MCMonad.Core.FocusIntent' note for the full rationale.
 
@@ -865,10 +852,9 @@ handleFocusedWindowChanged wid pid = do
         Just i | withinSettleWindow now i && isSettlingEcho wid pid i ->
             -- A window this layout pass moved is reporting focus, and it's
             -- soon enough after the write to be macOS settling around our
-            -- own AX, not the user. No-op, and (unlike the cross-app
-            -- branch) do NOT spend the budget: a secondary monitor's worth
-            -- of settling echoes must not be able to exhaust suppression
-            -- and let a later echo flip the current screen. Past the
+            -- own AX, not the user. No-op: a secondary monitor's worth
+            -- of settling echoes must not be able to flip the current
+            -- screen. Past the
             -- settle deadline this guard lapses, so a genuine later switch
             -- to one of these windows still follows. A real click clears
             -- the intent outright.
@@ -881,15 +867,10 @@ handleFocusedWindowChanged wid pid = do
             -- clear the intent.
             applyAndClearIntent
         Just i | Just _ <- fiTarget i ->
-            -- Cross-app divergence: a different app's window reported
-            -- focus while mcmonad still had a specific target armed.
-            -- This used to push macOS back onto the target, treating
-            -- any divergence as a bounce. But the same event also
-            -- covers a legitimate user switch (window switching, link
-            -- following) to a window mcmonad has on a hidden workspace,
-            -- which the Swift side couldn't route as menuFocusWindow
-            -- due to a stale snapshot. There's no reliable way to tell
-            -- the two apart here, so follow it rather than fight it.
+            -- Cross-app divergence: a different app's window, on a
+            -- screen, reported focus while mcmonad had a target armed and
+            -- the settle window has passed. macOS has moved on (a
+            -- keyboard app switch, a link opening elsewhere); follow it.
             applyAndClearIntent
         Just _ ->
             -- Target-less intent (the user is deliberately viewing an
@@ -905,22 +886,36 @@ handleFocusedWindowChanged wid pid = do
   where
     -- Every candidate 'resolveFocusedWindow' can return is already
     -- displayed and just needs its focus (and, for a focus-dependent
-    -- layout, its frame) brought in line, so this always goes through
-    -- 'windows'. If the window isn't visible at all, fall back to
-    -- checking all workspaces (including hidden ones): this handles
-    -- focus events from window switching or link following that
-    -- target a hidden-workspace window when Swift Core's cachedSnapshot
-    -- was nil or stale.
+    -- layout, its frame) brought in line, so this goes through 'windows'.
     applyClean = do
         ws <- gets windowset
-        case resolveFocusedWindow wid pid ws of
-            Just ws' -> windows (const ws')
-            Nothing -> do
-                let wr = WindowRef wid pid
-                when (W.member wr ws) $ focusWindowAnywhere wr
+        whenJust (resolveFocusedWindow wid pid ws) (windows . const)
     applyAndClearIntent = do
         modify $ \s -> s { focusIntent = Nothing }
         applyClean
+
+-- | A window on a hidden workspace reported focus. Following it brings
+-- that workspace on screen, so the event alone is not enough:
+--
+--   * inside the settle window it is the echo of our own park (parked
+--     windows are part of the settling set) and is ignored;
+--   * otherwise macOS is asked which window is focused, and the workspace
+--     is brought up only if it names this one. Applications re-announce
+--     windows that are nowhere near the front; a genuine switch (an app
+--     switch landing on a parked window, a link opening in a browser on
+--     another workspace) is confirmed by the same question.
+--
+-- The workspace comes up on its own screen ('focusWindowAnywhere').
+followHiddenIfConfirmed :: WindowRef -> M ()
+followHiddenIfConfirmed wr = do
+    fi  <- gets focusIntent
+    now <- io getCurrentTime
+    let ourEcho = case fi of
+            Just i  -> withinSettleWindow now i && isSettlingEcho (wrWindowId wr) (wrPid wr) i
+            Nothing -> False
+    unless ourEcho $ queryFocusedWindow $ \focused -> do
+        ws <- gets windowset
+        when (focused == wr && W.member wr ws) $ focusWindowAnywhere wr
 
 -- | Hand the daemon's answer to the oldest outstanding
 -- 'queryFocusedWindow' caller. Answers arrive one per query, in order.
@@ -935,7 +930,6 @@ answerFocusQuery answer = do
 
 handleFrontAppChanged :: Int32 -> M ()
 handleFrontAppChanged pid = do
-    modify $ \s -> s { frontmostPid = Just pid }
     now <- io getCurrentTime
     suppressUntil <- gets suppressFrontAppUntil
     modify $ \s -> s { suppressFrontAppUntil = Nothing }
@@ -968,7 +962,7 @@ handleFrontAppChangedGenuine pid = do
         Just i | withinSettleWindow now i && isSettlingPidEcho pid i ->
             -- Front-app echo for an app we just moved a window of — our
             -- own AX write settling, not a genuine app switch. No-op
-            -- without spending the budget (see 'handleFocusedWindowChanged').
+            -- (see 'handleFocusedWindowChanged').
             -- Time-bounded, so a real Cmd-Tab later still follows.
             return ()
         Just _ -> do
@@ -1007,14 +1001,14 @@ confirmFrontAppChange pid = queryFocusedWindow $ \wr -> do
     guardUntil <- gets emptyWorkspaceGuardUntil
     let suppressed = shouldSuppressFrontApp now suppressUntil
                    || shouldSuppressFrontApp now guardUntil
-    unless suppressed $ when (wrPid wr == pid) (applyFrontAppChange pid)
+    unless suppressed $ when (wrPid wr == pid) (applyFrontAppChange wr)
 
--- | Switch to whatever workspace @pid@'s focused window lives on, once
--- 'confirmFrontAppChange' has confirmed one genuinely exists.
-applyFrontAppChange :: Int32 -> M ()
-applyFrontAppChange pid = do
+-- | Follow a confirmed app switch: @focused@ is the window macOS says is
+-- focused, and it belongs to the app that came to the front.
+applyFrontAppChange :: WindowRef -> M ()
+applyFrontAppChange focused = do
     ws <- gets windowset
-    case resolveFrontApp pid ws of
+    case resolveFrontApp (wrPid focused) ws of
         Just ws' ->
             -- Must go through 'windows', not a bare 'modify': for a
             -- focus-dependent layout (e.g. 'Full'), which window
@@ -1022,13 +1016,11 @@ applyFrontAppChange pid = do
             -- pure state update leaves frames stale.
             windows (const ws')
         Nothing ->
-            -- The app has no visible window at all - it may still
-            -- have one on a hidden workspace (this is the only
-            -- signal we get for apps whose AX focus notifications
-            -- don't fire reliably). 'windows' brings that
-            -- workspace on screen if so.
-            whenJust (find (\w -> wrPid w == pid) (W.allWindows ws)) $
-                focusWindowAnywhere
+            -- The app has no window on any screen. If the window macOS
+            -- focused is one of ours on a hidden workspace, bring that
+            -- workspace up on its own screen. (This is the only signal
+            -- for apps whose AX focus notifications do not fire.)
+            when (W.member focused ws) $ focusWindowAnywhere focused
     -- The first front-app change after a native-fullscreen Space
     -- transition is the earliest reliable moment to heal the silent
     -- un-park sweep (see the WindowFrameChanged handler) — the sweep

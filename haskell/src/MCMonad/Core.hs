@@ -58,8 +58,6 @@ module MCMonad.Core
     , isSettlingEcho
     , isSettlingPidEcho
     , withinSettleWindow
-    , consumeIntent
-    , defaultFocusBudget
     ) where
 
 import Control.Concurrent.MVar
@@ -80,7 +78,7 @@ import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 import Data.Time.Format (formatTime, defaultTimeLocale)
 import Data.Time.LocalTime (getZonedTime)
 import Data.Typeable (Typeable, cast)
-import Data.Word (Word8, Word32)
+import Data.Word (Word32)
 import GHC.Generics (Generic)
 import System.IO (Handle, hPutStrLn, stderr)
 import Text.Read (Lexeme(..), Read(..), ReadPrec, lexP, parens, (+++))
@@ -572,11 +570,6 @@ data MState = MState
       -- looping forever in a pathological case and lets user-initiated
       -- focus changes from outside mcmonad eventually take effect.
       -- See the 'FocusIntent' note at the end of this module.
-    , frontmostPid     :: !(Maybe Int32)
-      -- ^ The pid NSWorkspace\/SkyLight last reported as frontmost. Used
-      -- to tell a genuine app switch from AX re-announcing an app's
-      -- window that isn't actually in front (see 'FocusedWindowChanged'
-      -- in "MCMonad.Main").
     , pendingFocusQueries :: ![WindowRef -> M ()]
       -- ^ What to do with the answers to the 'MCMonad.IPC.QueryFocusedWindow'
       -- commands still in flight, oldest first. The daemon answers every
@@ -882,26 +875,29 @@ resolveFrontApp pid ws = case W.peek ws of
 --     certainly the user clicking another window of the target's app.
 --     Accept the change and clear the intent; this preserves the
 --     multi-window-per-app precision the AX path exists for.
---   * Any other divergence — almost certainly a bounce or spurious AX
---     event from outside the target's app. Re-issue 'FocusWindow' so
---     macOS is pushed back onto the target, decrement the budget, and
---     keep the intent armed for any further bounces.
+--   * Any other window that is on a screen — macOS has focused something
+--     else. Outside the settle window below this is taken at its word and
+--     followed. Earlier versions pushed macOS back onto the target a
+--     bounded number of times; that also fought every deliberate keyboard
+--     switch, and the settle window turned out to be what actually
+--     separates noise from intent.
+--   * A window on a hidden workspace — see
+--     'MCMonad.Main.followHiddenIfConfirmed'. Following it brings a whole
+--     workspace on screen, and applications re-announce parked windows
+--     that are nowhere near the front, so it is followed only after macOS
+--     confirms that window is the focused one.
 --
--- The budget bounds the number of re-issues so a pathological macOS
--- state cannot pin mcmonad in an infinite re-issue loop, and so user-
--- initiated cross-app focus changes (clicking a window in a different
--- app) eventually take effect rather than being fought indefinitely.
--- 'FrontAppChanged' uses the same logic but without the intra-app arm
--- (NSWorkspace doesn't carry a window id, so there's no "same app
--- different window" to recognise).
+-- 'FrontAppChanged' has no window id, so it is never taken at its word:
+-- 'MCMonad.Main.confirmFrontAppChange' asks macOS for the focused window
+-- and follows only if it belongs to the reported app.
 --
--- LOAD-BEARING ESCAPE HATCH. The budget alone is not sufficient. AX
+-- LOAD-BEARING ESCAPE HATCH. The settle window is not sufficient. AX
 -- cannot tell a legitimate mouse click on another app's window apart
 -- from a focus-settling bounce echo for the previously-focused app —
 -- both arrive at the handler as cross-app divergent 'FocusedWindowChanged'
--- \/ 'FrontAppChanged' events. Without a separate channel, every mouse
--- click on a third-app window costs (budget + 1) physical clicks before
--- it takes effect, which is unservicable. The disambiguator is the
+-- \/ 'FrontAppChanged' events. Without a separate channel, a mouse click
+-- on a window this pass just laid out is swallowed as a settling echo
+-- and has to be repeated. The disambiguator is the
 -- physical mouse-down event surfaced over IPC as 'UserMouseDown'
 -- (CGEventTap on .leftMouseDown\/.rightMouseDown\/.otherMouseDown in
 -- core; the handler in 'MCMonad.Main' clears 'focusIntent'
@@ -912,8 +908,7 @@ resolveFrontApp pid ws = case W.peek ws of
 -- one, the "mouse clicks need to be repeated" regression returns.
 
 -- | The focus mcmonad most recently told macOS to land on, plus the
--- budget for how many divergent AX\/NSWorkspace events we will fight
--- before giving up and letting macOS' view win.
+-- windows whose focus echoes are, for a short while, known to be ours.
 data FocusIntent = FocusIntent
     { fiTarget             :: !(Maybe WindowRef)
       -- ^ The window the arming 'MCMonad.Operations.windows' pass told
@@ -930,7 +925,6 @@ data FocusIntent = FocusIntent
       -- happened on the wrong screen" bug. A target-less intent keeps
       -- the settling suppression alive for those echoes while making
       -- no claim about which window is focused.
-    , fiReissuesRemaining  :: !Word8
     , fiSettling           :: !(Set WindowRef)
       -- ^ Every window the 'MCMonad.Operations.windows' pass that armed
       -- this intent wrote a frame for — the whole visible set across
@@ -939,12 +933,11 @@ data FocusIntent = FocusIntent
       -- Those AX writes make macOS emit 'FocusedWindowChanged' \/
       -- 'FrontAppChanged' echoes for windows on the *other* monitor. With
       -- only 'fiTarget' to check against, each echo read as a cross-app
-      -- divergence: it burned a re-issue from the budget, and once the
-      -- budget drained the next echo flowed through to 'resolveFocusedWindow'
+      -- divergence, flowed through to 'resolveFocusedWindow'
       -- and dragged the current screen onto the other monitor — the
       -- Opt-h\/l\/j "focus jumps to the wrong screen while I resize" bug.
       -- An event whose window is in this set is our own settling echo:
-      -- no-op it, and crucially do not spend the budget on it. A genuine
+      -- no-op it. A genuine
       -- click on any of these windows still lands, because a physical
       -- 'UserMouseDown' clears the whole intent first (see the note below).
     , fiSettleUntil        :: !UTCTime
@@ -957,14 +950,6 @@ data FocusIntent = FocusIntent
       -- a stale settling set — refreshed only by the next layout pass or a
       -- physical click — would swallow such a switch indefinitely.
     } deriving (Eq, Show)
-
--- | Initial budget for re-issues per intent. Empirically a single user
--- action triggers at most 3 cross-app divergent events (AX bounce for
--- previous window, NSWorkspace bounce for previous app, and a spurious
--- AX event for some third app during the focus-settling cascade); we
--- allow a little headroom.
-defaultFocusBudget :: Word8
-defaultFocusBudget = 4
 
 -- | How long a layout pass's settling echoes are believed to be ours.
 -- Comfortably covers the macOS AX-settle burst (the core's DEFIED
@@ -1021,8 +1006,7 @@ shouldSuppressFrontApp now (Just deadline) = now <= deadline
 -- it.
 armingIntent :: UTCTime -> Set WindowRef -> Maybe WindowRef -> Maybe FocusIntent
 armingIntent now settling target =
-    Just (FocusIntent target defaultFocusBudget settling
-                      (addUTCTime settleGrace now))
+    Just (FocusIntent target settling (addUTCTime settleGrace now))
 
 -- | Does an incoming @FocusedWindowChanged wid pid@ exactly match the
 -- intent's target? Used to recognise AX confirmation echoes.
@@ -1039,8 +1023,8 @@ isIntentTargetPid pid i = maybe False ((== pid) . wrPid) (fiTarget i)
 
 -- | Is an incoming @FocusedWindowChanged wid pid@ an echo of a window
 -- this layout pass just moved? Such an event is macOS settling around
--- our own AX write — never user intent — so the handler no-ops it
--- without spending the re-issue budget. This is what stops a
+-- our own AX write — never user intent — so the handler no-ops it.
+-- This is what stops a
 -- secondary-monitor window's settling echo from dragging the current
 -- screen across displays.
 isSettlingEcho :: Word32 -> Int32 -> FocusIntent -> Bool
@@ -1058,14 +1042,3 @@ isSettlingPidEcho pid i = any ((== pid) . wrPid) (Set.toList (fiSettling i))
 withinSettleWindow :: UTCTime -> FocusIntent -> Bool
 withinSettleWindow now i = now <= fiSettleUntil i
 
--- | Decrement the re-issue budget after a divergent event has triggered
--- a push-back. Returns 'Nothing' when the budget is exhausted so the
--- next event flows through the normal resolution path — this is how
--- legitimate user-initiated cross-app focus changes (e.g. clicking a
--- window in a third app while macOS is still bouncing the previous
--- intent) eventually take effect.
-consumeIntent :: FocusIntent -> Maybe FocusIntent
-consumeIntent i
-    | fiReissuesRemaining i > 1 =
-        Just i { fiReissuesRemaining = fiReissuesRemaining i - 1 }
-    | otherwise = Nothing

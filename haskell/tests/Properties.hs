@@ -8,12 +8,12 @@ import MCMonad.Core
     , updateAffinities, visibleAffinities, resolveFocusedWindow, resolveFrontApp
     , FocusIntent(..), armingIntent, isFocusIntentTarget
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
-    , withinSettleWindow, consumeIntent
+    , withinSettleWindow
     , armKillChurnSuppression, armEmptyWorkspaceGuard, shouldSuppressFrontApp
     , PendingWindow(..), Timer(..), LayoutClass(..)
     )
 import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent, OverlayScreenEntry(..), OverlayIgnoredWindow(..), parseIgnoredFact)
-import MCMonad.Main (onHiddenWorkspace, shouldFollowIntoHidden, pairBurst)
+import MCMonad.Main (onHiddenWorkspace, pairBurst)
 import MCMonad.Affinity
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (parseMaybe)
@@ -569,8 +569,9 @@ prop_frontApp_follows_to_other_screen ss =
 --   * exact target match — AX confirmation, no-op.
 --   * same app, different window — intra-app focus change (typically a
 --     user clicking another window in the same app); accept and clear.
---   * any other divergence — bounce or spurious AX echo; re-issue
---     'FocusWindow' and decrement the budget until it exhausts.
+--   * a window this pass just laid out, inside the settle window — our
+--     own echo, no-op.
+--   * any other window on a screen — follow it and clear the intent.
 --
 -- These properties cover the pure helpers that drive the dispatch.
 
@@ -666,21 +667,6 @@ prop_isIntentTargetPid_distinguishes_other_pid (CrossAppPair from to) =
         Just i  -> isIntentTargetPid (wrPid to) i
                    && not (isIntentTargetPid (wrPid from) i)
 
--- consumeIntent is monotonic: each call decrements 'fiReissuesRemaining'
--- and returns 'Nothing' exactly when the budget runs out, so a
--- pathological multi-bounce sequence is bounded and user-initiated
--- divergence eventually wins.
-prop_consumeIntent_drains_exactly_the_budget :: WindowRef -> Bool
-prop_consumeIntent_drains_exactly_the_budget w =
-    case armingIntent originBase Set.empty (Just w) of
-        Nothing -> False
-        Just i0 ->
-            let budget = fromIntegral (fiReissuesRemaining i0) :: Int
-                steps  = take (budget + 1)
-                              (iterate (>>= consumeIntent) (Just i0))
-            in last steps == Nothing
-               && length (filter (/= Nothing) steps) == budget
-
 -- === SETTLING-ECHO SUPPRESSION (fiSettling) ===
 --
 -- 'MCMonad.Operations.windows' writes frames to every window on every
@@ -688,8 +674,8 @@ prop_consumeIntent_drains_exactly_the_budget w =
 -- AX/NSWorkspace echoes those writes provoke — especially for windows on
 -- the *other* monitor — must be recognised as our own settling, not as
 -- the user looking elsewhere. Getting this wrong is the "Opt-h/l/j makes
--- focus jump to the wrong screen" bug: the echoes drain the budget and
--- then flip the current screen.
+-- focus jump to the wrong screen" bug: an echo is read as the user
+-- looking elsewhere and flips the current screen.
 
 -- A window that was part of the just-laid-out set is a settling echo,
 -- whatever its pid — so the handler no-ops it instead of pushing back.
@@ -1878,11 +1864,6 @@ prop_onHiddenWorkspace_matches_hidden_stacks :: TestStackSet -> WindowRef -> Boo
 prop_onHiddenWorkspace_matches_hidden_stacks ss w =
     onHiddenWorkspace ss w == (w `elem` concatMap (W.integrate' . W.stack) (W.hidden ss))
 
--- A hidden-workspace focus event is followed only when its app is also frontmost
-prop_shouldFollowIntoHidden_requires_both :: Bool -> Bool -> Bool
-prop_shouldFollowIntoHidden_requires_both onHidden isFrontmostApp =
-    shouldFollowIntoHidden onHidden isFrontmostApp == (onHidden && isFrontmostApp)
-
 -- No guard armed: never suppress
 prop_shouldSuppressFrontApp_unarmed :: Bool
 prop_shouldSuppressFrontApp_unarmed =
@@ -2138,7 +2119,6 @@ allProperties =
     , ("isFocusIntentTarget distinguishes others",     property prop_isFocusIntentTarget_distinguishes)
     , ("isIntentTargetPid matches same pid",           property prop_isIntentTargetPid_matches_same_pid)
     , ("isIntentTargetPid distinguishes cross-app",    property prop_isIntentTargetPid_distinguishes_other_pid)
-    , ("consumeIntent drains exactly the budget",      property prop_consumeIntent_drains_exactly_the_budget)
     , ("settling echo recognises laid-out window",     property prop_isSettlingEcho_recognises_laid_out)
     , ("settling echo covers whole set, not just target", property prop_isSettlingEcho_covers_whole_set)
     , ("settling echo rejects an outsider window",     property prop_isSettlingEcho_rejects_outsider)
@@ -2223,7 +2203,6 @@ allProperties =
     , ("saved affinity: two-screen fixture",          property prop_visibleAffinities_fixture)
 
     , ("focus: hidden-workspace window is routed",    property prop_onHiddenWorkspace_matches_hidden_stacks)
-    , ("focus: hidden-workspace follow requires frontmost app", property prop_shouldFollowIntoHidden_requires_both)
     , ("focus: kill-churn suppression unarmed never suppresses", property prop_shouldSuppressFrontApp_unarmed)
     , ("focus: kill-churn suppression holds within deadline",    property prop_shouldSuppressFrontApp_within_deadline)
     , ("focus: kill-churn suppression lapses after deadline",    property prop_shouldSuppressFrontApp_after_deadline)

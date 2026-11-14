@@ -247,10 +247,14 @@ final class CommandExecutor {
                          + "\(fmtCoord(dw)),\(fmtCoord(dh)))"
                 )
                 if !obeyed {
-                    // Report only; the brain decides whether to re-send.
-                    socketServer.send(.windowFrameDefied(
-                        windowId: a.windowId, pid: a.pid,
-                        want: a.frame, frame: actual))
+                    // Not reported yet. This readback is synchronous, and
+                    // an application that applies AX geometry on its own
+                    // time (Gecko, anything animating) always fails it
+                    // while being about to comply. The brain answers a
+                    // report with a full relayout, so reporting here turns
+                    // every such write into a second and third pass. The
+                    // reading taken after the grace period is the one the
+                    // brain is told about.
                     scheduleReverify(windowId: a.windowId, pid: a.pid,
                                      want: a.frame)
                 }
@@ -285,10 +289,10 @@ final class CommandExecutor {
     /// (Gecko once its a11y engine has engaged — even with
     /// AXEnhancedUserInterface suppressed around the write, the app
     /// processes the queued setter on its own time). Re-read once after a
-    /// grace period and report the result to the brain the same way the
-    /// original readback was, whether or not it settled, so a repair gets
-    /// a guaranteed check even when no frame-change event arrives for it
-    /// in the meantime, and its outcome is never left unrecorded.
+    /// grace period and report that reading to the brain as a fact,
+    /// whether or not the window settled: a settled reading closes any
+    /// repair the brain has open, an unsettled one is what it acts on.
+    /// The brain decides whether to re-send.
     private func scheduleReverify(windowId: UInt32, pid: Int32, want: CGRect) {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)

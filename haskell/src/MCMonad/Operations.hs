@@ -64,6 +64,7 @@ module MCMonad.Operations
     , currentSnapshot
     , saveStateIO
     , loadExtrasIO
+    , keepStateCopy
     , maybeSaveState
     , loadStateIO
     , pidAlive
@@ -83,6 +84,7 @@ module MCMonad.Operations
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (IOException, catch)
 import Control.Monad (forM, guard, void, unless, when)
 import Data.Aeson ((.=))
@@ -101,11 +103,12 @@ import qualified Data.Set as S
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
-import System.Directory (doesFileExist, getHomeDirectory, createDirectoryIfMissing)
+import System.Directory (copyFile, doesFileExist, getHomeDirectory, createDirectoryIfMissing)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
 import System.IO (readFile')
+import System.IO.Unsafe (unsafePerformIO)
 import System.IO.Error (isPermissionError)
 import System.Info (arch, os)
 import qualified System.Posix.Files as Posix
@@ -1311,7 +1314,13 @@ pushTimers = do
 -- (unlike the 'windows' save path): timer edits are infrequent and must
 -- survive an immediate crash or restart.
 saveTimersIO :: M ()
-saveTimersIO = currentSnapshot >>= io . saveStateIO
+saveTimersIO = do
+    snap <- currentSnapshot
+    -- Through the mirror, like every other save: the exit path and the
+    -- deferred flush write whatever the mirror holds, and a mirror that
+    -- missed this snapshot would put the previous timer list back.
+    ref <- asks latestSnapshot
+    io $ writeIORef ref (Just snap) >> saveStateIO snap
 
 -- | Resync after a timer mutation: push the new list to the daemon and
 -- persist it. The single funnel every timer event handler calls.
@@ -1441,10 +1450,19 @@ saveStateIO snap = do
             (S.fromList (W.allWindows ws))
             (StateExtras (snLearned snap) (snNativeFloats snap))
     sf <- getStateFile
-    (do writeFileAtomic (extrasFileFor sf) (LBS.writeFile `flip` encodeExtras extras)
-        writeFileAtomic sf (`writeFile` show snapshot))
-        `catch` \e ->
-            logTS $ "mcmonad: state save failed: " ++ show (e :: IOException)
+    -- One writer at a time. The event loop, the deferred flush thread and
+    -- the exit path all save, and they share the temporary files.
+    withMVar stateWriteLock $ \() ->
+        (do writeFileAtomic (extrasFileFor sf) (LBS.writeFile `flip` encodeExtras extras)
+            writeFileAtomic sf (`writeFile` show snapshot))
+            `catch` \e ->
+                logTS $ "mcmonad: state save failed: " ++ show (e :: IOException)
+
+-- | Serialises writes of the state files within this process. The brain is
+-- their only writer, but it writes from more than one thread.
+stateWriteLock :: MVar ()
+stateWriteLock = unsafePerformIO (newMVar ())
+{-# NOINLINE stateWriteLock #-}
 
 -- | Write a file so that a reader sees either the old contents or the new,
 -- never a partial write: fill a temporary file beside it, make it private,
@@ -1455,6 +1473,18 @@ writeFileAtomic path fill = do
     fill tmp
     Posix.setFileMode tmp 0o600
     Posix.rename tmp path
+
+-- | Keep a copy of the state file as it is on disk now, under
+-- @mcmonad.state@ plus the given suffix. For the moments when this start
+-- is about to save something that holds less than the file does.
+keepStateCopy :: String -> IO ()
+keepStateCopy suffix = do
+    sf <- getStateFile
+    (do copyFile sf (sf ++ suffix)
+        Posix.setFileMode (sf ++ suffix) 0o600
+        logTS $ "mcmonad: kept a copy of the saved state at " ++ sf ++ suffix)
+        `catch` \e ->
+            logTS $ "mcmonad: could not keep " ++ sf ++ suffix ++ ": " ++ show (e :: IOException)
 
 -- | The file beside the state file that holds 'StateExtras'.
 extrasFileFor :: FilePath -> FilePath
@@ -1520,8 +1550,13 @@ loadStateIO = do
                     Posix.rename sf (sf ++ ".bak")
                     return Nothing)
             `catch` \e -> do
+                -- Could not even read it. The next save would replace it,
+                -- so move it aside first; a rename needs no read access.
                 logTS $
                     "mcmonad: state load failed: " ++ show (e :: IOException)
+                    ++ "; moving the file to .bak"
+                Posix.rename sf (sf ++ ".bak") `catch` \e' ->
+                    logTS $ "mcmonad: could not move it aside: " ++ show (e' :: IOException)
                 return Nothing
   where
     keepPrevious sf contents = do

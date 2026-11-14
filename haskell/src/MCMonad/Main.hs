@@ -289,6 +289,20 @@ restoreSnapshot cfg screens existingWindows = do
         Nothing -> return Nothing
         Just savedRaw -> do
             extrasRaw <- loadExtrasIO
+            -- A saved workspace this config does not have cannot be
+            -- rebuilt, and its windows are about to be treated as new and
+            -- placed on the current workspace. That is right after a
+            -- deliberate rename and a disaster when the wrong config is
+            -- running (the bundled default started in place of the
+            -- user's own). Either way the first save replaces the file,
+            -- so keep what it said.
+            let lost = [ tag | (tag, Just _) <- ssStacks savedRaw
+                             , tag `notElem` mcWorkspaces cfg ]
+            unless (null lost) $ do
+                logTS $ "mcmonad: WARNING: the saved state has windows on "
+                    ++ show (length lost) ++ " workspace(s) this config does not define; "
+                    ++ "their windows will be placed as new"
+                keepStateCopy ".unknown-workspaces"
             let validTags = Set.fromList (mcWorkspaces cfg)
                 saved     = filterToValidTags validTags savedRaw
                 screenTuples =

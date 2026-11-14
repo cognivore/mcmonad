@@ -228,6 +228,41 @@ xmonad xmonad.
    xmonad's (same methods, different monad), layouts that use only `pureLayout`
    and `pureMessage` (most of them) can be copied with trivial changes.
 
+## Contracts both processes share
+
+- **Parked.** A hidden window is parked: on every display it shows at
+  most a two-point sliver in one dimension. `isAlreadyParked` (Swift,
+  `IPC/ParkGeometry.swift`) and `frameIsParked` (Haskell,
+  `MCMonad.Operations`) state this rule identically and must change
+  together. The core picks the corner (`parkOrigin`); it never resizes a
+  window to park it, and only uses bottom corners.
+- **Raising.** Only AXRaise brings another application's window forward
+  (a SkyLight order transaction on one is accepted and does nothing). The
+  brain's `show-windows` is the one place windows are raised, and it is
+  sent only when something came on screen.
+- **Focus into a hidden workspace.** Every focus change that can bring a
+  hidden workspace on screen goes through `focusWindowAnywhere`, so the
+  workspace lands on its role's screen. A bare AX focus event for a
+  hidden window is followed only after macOS confirms that window is
+  focused.
+- **Focus queries.** The core answers every `query-focused-window`
+  exactly once (a window, or `focused-window-query-empty`); the brain
+  pairs answers with callers in order.
+
+## State on disk
+
+`~/.config/mcmonad/mcmonad.state` is a `Show`ed record read with `Read`.
+Adding a field to it makes every older brain reject the file, which once
+collapsed every workspace after a rollback. So:
+
+- New persistent state goes in `mcmonad.state.extras` (JSON, versioned,
+  `MCMonad.Persistence.StateExtras`), never in the main record. An older
+  brain ignores it; a newer one that finds none starts with none.
+- A file the brain cannot use is moved aside (`.bak`), never overwritten.
+  A saved workspace the running config lacks is logged and the file kept
+  as `mcmonad.state.unknown-workspaces` before anything is saved.
+- The brain is the only writer, from several threads, behind one lock.
+
 ## Permissions
 
 - Accessibility: required by mcmonad-core. Prompt via `AXIsProcessTrustedWithOptions`.

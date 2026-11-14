@@ -331,7 +331,8 @@ windows f = do
     -- 6b. Store window positions for directional focus navigation
     modify $ \s -> s { windowRects = M.fromList allPositions }
 
-    -- 7. Focus the top window (only if focus actually changed) and arm
+    -- 7. Focus the top window (if focus changed, or windows were just
+    --    raised) and arm
     --    'focusIntent' so the event-handler path treats mcmonad's
     --    StackSet as the source of truth for focus state until macOS
     --    settles — see the 'FocusIntent' note in 'MCMonad.Core'. We
@@ -342,7 +343,11 @@ windows f = do
     currentWS' <- gets windowset
     let oldFocus = W.peek old
         newFocus = W.peek currentWS'
-    when (newFocus /= oldFocus) $
+    -- Also after any raise: raising a window makes it its application's
+    -- key window, so bringing up a workspace on another screen that holds
+    -- a second window of the focused application would otherwise leave the
+    -- keyboard there while the StackSet focus has not moved.
+    when (newFocus /= oldFocus || not (null toRaise)) $
         case newFocus of
             Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
             Nothing -> return ()

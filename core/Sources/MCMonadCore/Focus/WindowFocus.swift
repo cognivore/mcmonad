@@ -60,17 +60,7 @@ enum WindowFocus {
     static func focusWindow(pid: pid_t, windowId: UInt32) {
         let tHash = TitleHash.hash(windowId: windowId, pid: pid)
 
-        // Step 1: Activate the application via NSRunningApplication
-        if let app = NSRunningApplication(processIdentifier: pid) {
-            app.activate()
-            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
-                          tHash: tHash, result: "ok")
-        } else {
-            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
-                          tHash: tHash, result: "no-running-app")
-        }
-
-        // Step 2: Set front process with private API
+        // Step 1: Set front process with private API
         var psn = ProcessSerialNumber()
         let psnStatus = getProcessForPID(pid, &psn)
         guard psnStatus == noErr else {
@@ -85,15 +75,30 @@ enum WindowFocus {
                       result: slpsStatus == noErr ? "ok" : "err",
                       extra: "osStatus=\(slpsStatus)")
 
-        // Step 3: Post synthetic key-window events
+        // Step 2: Post synthetic key-window events
         makeKeyWindow(psn: &psn, windowId: windowId)
         FocusLog.emit(source: .cmdFocusKey, windowId: windowId, pid: pid,
                       tHash: tHash, result: "ok")
 
-        // Step 4: Raise the window via Accessibility
+        // Step 3: Raise the window via Accessibility
         let raiseResult = raiseWindow(pid: pid, windowId: windowId)
         FocusLog.emit(source: .cmdFocusRaise, windowId: windowId, pid: pid,
                       tHash: tHash, result: raiseResult)
+
+        // Step 4: activate last — this fires the OS activation notification that
+        // external AX observers react to, so doing it last gives the app time to
+        // update its own focus state first
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
+                          tHash: tHash, result: "already-frontmost")
+        } else if let app = NSRunningApplication(processIdentifier: pid) {
+            app.activate()
+            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
+                          tHash: tHash, result: "ok")
+        } else {
+            FocusLog.emit(source: .cmdFocusActivate, windowId: windowId, pid: pid,
+                          tHash: tHash, result: "no-running-app")
+        }
     }
 
     // MARK: - AXRaise

@@ -7,18 +7,27 @@ module MCMonad.Operations
     , viewWorkspace
     , warpToFocus
     , reassertHiddenWindows
+    , repairFrame
+    , RepairStep(..)
+    , repairStep
+    , maxRepairAttempts
     , frameAtParkCorner
+    , attributeIgnoredWindows
       -- * Window lifecycle
     , manage
     , manageSilent
     , restorePending
     , forgetPending
     , unmanage
+    , replaceWindowIdentity
+    , handleManagedReplacement
     , unmanagedOriginTTL
     , reclaimOriginTTL
     , reclaimOriginCap
     , pruneReclaims
     , chooseOriginTag
+    , placeManaged
+    , windowsToPark
       -- * Overlay snapshot
     , buildOverlaySnapshot
     , pushOverlaySnapshot
@@ -27,6 +36,7 @@ module MCMonad.Operations
     , sendMessageWithNoRefresh
       -- * Window actions
     , kill
+    , queryFocusedWindow
     , withFocused
     , reveal
     , setFocus
@@ -64,21 +74,24 @@ module MCMonad.Operations
       -- * Utilities
     , whenJust
     , findScreenForWindow
+    , screenAt
+    , rectOverlapArea
+    , crossedScreenTag
     ) where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (IOException, catch)
-import Control.Monad (forM, void, unless, when)
+import Control.Monad (forM, guard, void, unless, when)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Pair)
 import qualified Data.ByteString.Lazy as LBS
 import Data.IORef (atomicModifyIORef', readIORef, writeIORef)
 import Data.Int (Int32)
-import Data.List (find, sortBy)
+import Data.List (find, maximumBy, minimumBy, sortBy)
 import Data.Word (Word32)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Monoid (Endo(..))
 import Data.Ord (Down(..), comparing)
 import qualified Data.Map.Strict as M
@@ -90,7 +103,7 @@ import System.Directory (doesFileExist, getHomeDirectory, createDirectoryIfMissi
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
-import System.IO (hPutStrLn, readFile', stderr)
+import System.IO (readFile')
 import System.IO.Error (isPermissionError)
 import System.Info (arch, os)
 import qualified System.Posix.Files as Posix
@@ -194,28 +207,25 @@ windows f = do
     conn <- asks connection
     prevMapped <- gets mapped
 
-    -- 2. Hide every window that should NOT be visible — declaratively, across
-    --    ALL workspaces, not just the ones that were visible last cycle. A
-    --    window parked on a hidden workspace that drifted back on-screen (a
-    --    prior off-screen clamp, or an app re-asserting its own position) is
-    --    therefore re-parked on the next switch, instead of being remembered
-    --    as "already hidden" forever (the bug behind the stuck background).
-    --    Never hide sticky windows. Fire only when the visible set actually
-    --    changed, so pure focus-follows-mouse churn doesn't re-issue hides on
-    --    every event.
+    -- 2. Work out which windows should no longer be visible —
+    --    declaratively, across ALL workspaces, not just the ones that were
+    --    visible last cycle. A window parked on a hidden workspace that
+    --    drifted back on-screen (a prior off-screen clamp, or an app
+    --    re-asserting its own position) is therefore re-parked on the next
+    --    switch, instead of being remembered as "already hidden" forever
+    --    (the bug behind the stuck background). Never hide sticky windows.
+    --    Only fire when the visible set actually changed, so pure
+    --    focus-follows-mouse churn doesn't re-issue hides on every event.
+    --    Sent later, in step 6, after the new frames.
     let visibleChanged = S.fromList newVisible /= prevMapped
         toHide = filter (\w -> w `notElem` newVisible && not (S.member w stickySet))
                         (allManagedWindows currentAfterSticky)
-    io $ hPutStrLn stderr $ "WINDOWS: visibleChanged=" ++ show visibleChanged
+    io $ logTS $ "WINDOWS: visibleChanged=" ++ show visibleChanged
         ++ " newVisible=" ++ show (length newVisible)
         ++ " toHide=" ++ show (map wrWindowId toHide)
-    when (visibleChanged && not (null toHide)) $
-        io $ sendCommand conn (HideWindows (map wrWindowId toHide))
 
     -- 3. Show windows that became visible
     let toShow = filter (`notElem` oldVisible) newVisible
-    unless (null toShow) $
-        io $ sendCommand conn (ShowWindows (map wrWindowId toShow))
 
     -- 4. Run layouts for each visible screen. Lay out
     --    'currentAfterSticky', not the raw @f old@: step 1b may have
@@ -250,16 +260,65 @@ windows f = do
                                 } }
                         return rects
 
-    -- 5. Resolve floating window positions
-    currentWS <- gets windowset
-    let floatRects = resolveFloating currentWS
+    -- 4b. A layout can leave some stack members without a rect (e.g.
+    --     'Full' only lays out the focused window). Step 2's 'toHide'
+    --     won't catch those: it only tracks workspace-level visibility,
+    --     not per-window layout coverage. Left alone, such a window
+    --     just keeps its last frame — a stale ghost that can surface
+    --     on screen behind whatever's focused now. Park any such
+    --     window every pass, same as hidden-workspace windows. Not
+    --     gated on 'visibleChanged' (unlike step 2): who's orphaned can
+    --     change on every focus move even with the visible set
+    --     unchanged, and re-parking an already-parked window is a
+    --     cheap no-op on the daemon side.
+    let laidOutWindows = S.fromList (map fst allRects)
+        orphaned = filter (\w -> w `elem` newVisible
+                              && not (S.member w laidOutWindows)
+                              && not (M.member w (W.floating currentAfterSticky)))
+                          (allManagedWindows currentAfterSticky)
 
-    -- 6. Send frame assignments
-    let allPositions = allRects ++ floatRects
-        frames = map toFrameAssignment allPositions
-    io $ hPutStrLn stderr $ "FRAMES: " ++ show [(wrWindowId w, rect_x r, rect_y r, rect_w r, rect_h r) | (w, r) <- allPositions]
-    unless (null frames) $
+    -- 5. Resolve floating window positions. Native floats (doFloatNative)
+    --    are excluded: mcmonad never writes a frame for them, so there's
+    --    nothing here to resolve on their behalf.
+    currentWS <- gets windowset
+    natives <- gets nativeFloats
+    let floatRects = filter (\(w, _) -> not (S.member w natives)) (resolveFloating currentWS)
+
+    -- 6. Send frame assignments, then show/hide. Placing (and raising)
+    --    the incoming windows before parking the outgoing ones avoids a
+    --    gap where neither covers the screen. Native floats that just
+    --    became visible are a special case: 'executeShowWindows' is a
+    --    no-op by design (it counts on the SetFrames that normally
+    --    follows), but step 5 deliberately excludes natives from
+    --    'floatRects' -- so without this, one would stay stuck at
+    --    wherever 'HideWindows' parked it. Restore it to its own last
+    --    known frame instead of a layout-computed one.
+    nativeFloatLastKnown <- gets nativeFloatRects
+    let restoredNatives = [ (w, r) | w <- toShow, S.member w natives
+                           , Just r <- [M.lookup w nativeFloatLastKnown] ]
+        allPositions = allRects ++ floatRects
+        frames = map toFrameAssignment (allPositions ++ restoredNatives)
+    io $ logTS $ "FRAMES: " ++ show [(wrWindowId w, rect_x r, rect_y r, rect_w r, rect_h r) | (w, r) <- allPositions]
+    unless (null frames) $ do
+        -- A genuinely new target frame for a window voids its earlier
+        -- repair count. Re-sending the *same* target (because a sibling
+        -- window's repair triggered this full relayout, not a new
+        -- decision for this window) must not reset it -- otherwise two
+        -- windows that are each individually off-target can keep
+        -- clearing each other's attempt count on every pass and never
+        -- reach 'maxRepairAttempts'.
+        reps <- gets frameRepairs
+        let stillSameTarget fa = (frWant <$> M.lookup (faWindowId fa) reps) == Just (faFrame fa)
+            toClear = [faWindowId fa | fa <- frames, not (stillSameTarget fa)]
+        modify $ \s -> s { frameRepairs = foldr M.delete (frameRepairs s) toClear }
         io $ sendCommand conn (SetFrames frames)
+
+    unless (null toShow) $
+        io $ sendCommand conn (ShowWindows (map wrWindowId toShow))
+
+    let toHideAll = windowsToPark visibleChanged toHide orphaned
+    unless (null toHideAll) $
+        io $ sendCommand conn (HideWindows (map wrWindowId toHideAll))
 
     -- 6b. Store window positions for directional focus navigation
     modify $ \s -> s { windowRects = M.fromList allPositions }
@@ -279,6 +338,16 @@ windows f = do
         case newFocus of
             Just w  -> io $ sendCommand conn (FocusWindow (wrWindowId w) (wrPid w))
             Nothing -> return ()
+    -- Leaving the current workspace empty -- whether this pass switched
+    -- to one (whichever of 'viewWorkspace', 'W.view', 'W.greedyView',
+    -- etc. a hotkey binding used to get here, they all funnel through
+    -- this one 'windows' primitive) or closed its last window -- arms
+    -- 'emptyWorkspaceGuardUntil'. Either way, a launching app's handoff
+    -- can bounce 'FrontAppChanged' back onto the previous workspace (see
+    -- 'MCMonad.Main.handleFrontAppChanged'/'MCMonad.Main.confirmFrontAppChange').
+    when (isNothing newFocus) $ do
+        nowGuard <- io getCurrentTime
+        modify $ \s -> s { emptyWorkspaceGuardUntil = Just (armEmptyWorkspaceGuard nowGuard) }
     -- Arm suppression against every window we just wrote a frame for, not
     -- only 'newFocus'. This pass moved windows on *both* monitors, and the
     -- AX echoes from the secondary monitor's writes must not be mistaken
@@ -286,7 +355,7 @@ windows f = do
     -- The timestamp bounds how long those echoes are believed to be ours.
     nowArm <- io getCurrentTime
     modify $ \s -> s
-        { focusIntent = armingIntent nowArm (S.fromList newVisible) newFocus }
+        { focusIntent = armingIntent nowArm (S.fromList newVisible `S.union` S.fromList toHide) newFocus }
 
     -- 8. Send workspace indicator update (with mode indicator)
     mode <- gets inputMode
@@ -447,6 +516,74 @@ frameAtParkCorner r ws = any nearRightEdge screenRects && widestExposure <= 2
         | otherwise = span_ (rect_x r) (rect_w r) (rect_x sr) (rect_w sr)
     span_ a la b lb = max 0 (min (a + la) (b + lb) - max a b)
 
+-- | Decide what to do about a window whose frame is off the one we last
+-- asked for. Called from a SetFrames readback ('WindowFrameDefied'), from
+-- a grace-period re-read of the same readback that is still off target,
+-- and from later frame-change events for a window still awaiting repair
+-- — so a repair gets checked again whether or not the window ever
+-- reports a frame change on its own.
+--
+-- A frame written while the window was still on another display can be
+-- clamped or outright refused, and the app's own late correction is not
+-- always reported. A lone single-window SetFrames for it doesn't reliably
+-- take, the same way a full layout pass (e.g. the one triggered by raising
+-- a different window) does, so the re-send goes through a full relayout
+-- rather than a bespoke single-window command. This happens up to
+-- 'maxRepairAttempts' times across this layout decision, so a window that
+-- genuinely refuses cannot loop forever.
+repairFrame :: Word32 -> Int32 -> Rectangle -> Rectangle -> M ()
+repairFrame wid pid want actual = do
+    reps <- gets frameRepairs
+    let attempts = maybe 0 frAttempts (M.lookup wid reps)
+        keep r = modify $ \s -> s { frameRepairs = M.insert wid r (frameRepairs s) }
+    case repairStep want actual attempts of
+        RepairForget -> do
+            modify $ \s -> s { frameRepairs = M.delete wid (frameRepairs s) }
+            when (attempts > 0) $
+                io $ logTS $ "REPAIR: " ++ show wid ++ " settled after "
+                           ++ show attempts ++ " attempt(s)"
+        RepairDone ->
+            io $ logTS $ "REPAIR: " ++ show wid ++ " still off after "
+                       ++ show attempts ++ " attempt(s); giving up"
+        RepairResend -> do
+            io $ logTS $ "REPAIR: re-sending frame for " ++ show wid
+            windows id
+            -- 'windows' clears any tracking entry for a window it just sent
+            -- a frame for, so the attempt count is kept *after* it runs,
+            -- not before, or it would be wiped by the very call that
+            -- records it.
+            keep (FrameRepair pid want (attempts + 1))
+
+-- | What to do with a window whose readback found it off its wanted frame.
+data RepairStep
+    = RepairForget   -- ^ position and size both match: the layout landed, drop the entry
+    | RepairDone     -- ^ already re-sent the maximum number of times: leave it
+    | RepairResend   -- ^ position and/or size are off: re-send the frame
+    deriving (Eq, Show)
+
+-- | How many times a frame is re-sent for a single layout decision before
+-- a window that keeps refusing it is left alone.
+maxRepairAttempts :: Int
+maxRepairAttempts = 3
+
+-- | The repair step for a wanted frame, the observed frame, and how many
+-- times the frame has already been re-sent for this layout decision.
+--
+-- Position and size are treated symmetrically: a window can refuse a
+-- cross-display position write outright, with no later event ever
+-- correcting it, so a defiance of position alone has to be actively
+-- re-sent the same as a defiance of size.
+repairStep :: Rectangle -> Rectangle -> Int -> RepairStep
+repairStep want actual attempts
+    | sameSize && samePosition = RepairForget
+    | attempts >= maxRepairAttempts = RepairDone
+    | otherwise = RepairResend
+  where
+    samePosition = abs (rect_x want - rect_x actual) < 1.5
+                && abs (rect_y want - rect_y actual) < 1.5
+    sameSize = abs (rect_w want - rect_w actual) < 1.5
+            && abs (rect_h want - rect_h actual) < 1.5
+
 -- | Convert a (WindowRef, Rectangle) pair to a FrameAssignment.
 toFrameAssignment :: (WindowRef, Rectangle) -> FrameAssignment
 toFrameAssignment (wr, rect) = FrameAssignment (wrWindowId wr) (wrPid wr) rect
@@ -496,6 +633,7 @@ buildOverlaySnapshot = do
             { oseScreenId     = let S s = W.screen scr in s
             , oseFrame        = screenRect (W.screenDetail scr)
             , oseWorkspaceTag = W.tag (W.workspace scr)
+            , oseIsActive     = W.screen scr == W.screen (W.current ws)
             , oseWindows      = workspaceWindows ws meta rects focused (W.workspace scr)
             }
         mkHidden wsp = OverlayHiddenWorkspace
@@ -504,10 +642,15 @@ buildOverlaySnapshot = do
             }
         screens = map mkScreen (W.current ws : W.visible ws)
         hidden  = map mkHidden (W.hidden ws)
+    ignored <- gets ignoredWindows
     return OverlaySnapshot
         { osDebugOverlays    = dbg
         , osScreens          = screens
         , osHiddenWorkspaces = hidden
+        , osIgnoredWindows   = map (\wr -> OverlayIgnoredWindow
+                                        { oiwWindowId = wrWindowId wr
+                                        , oiwPid      = wrPid wr
+                                        }) (S.toList ignored)
         }
 
 -- | Build a snapshot of the current state and push it to mcmonad-core
@@ -549,6 +692,50 @@ workspaceWindows ws meta rects focused wsp =
     floatingMap = W.floating ws
     zeroRect    = Rectangle 0 0 0 0
 
+-- | The ignored windows (see 'MCMonad.ManageHook.doIgnore') that belong to
+-- the screen nearest a queried screen frame. mcmonad-core supplies each
+-- ignored window's live frame; the brain alone knows the screens. A window
+-- is parked (see 'isIgnoredParked') and parked windows belong to no screen.
+-- Otherwise its home is the screen it overlaps most. Only windows in
+-- 'ignoredWindows' are considered.
+attributeIgnoredWindows
+    :: S.Set WindowRef -> W.StackSet String l a ScreenId ScreenDetail -> Rectangle
+    -> [(Word32, Int32, Rectangle)] -> [Word32]
+attributeIgnoredWindows ignored ws target facts =
+    [ wid | (wid, pid, fr) <- facts
+          , S.member (WindowRef wid pid) ignored
+          , not (isIgnoredParked (map snd screens) fr)
+          , homeOf fr == nearest ]
+  where
+    screens = [ (W.screen s, screenRect (W.screenDetail s)) | s <- screensOf ws ]
+    nearest = fst (minimumBy (comparing (\(_, r) -> originDist2 r target)) screens)
+    homeOf fr = fst (maximumBy (comparing (\(_, r) -> rectOverlapArea fr r)) screens)
+    originDist2 a b =
+        (rect_x a - rect_x b) ^ (2 :: Int) + (rect_y a - rect_y b) ^ (2 :: Int)
+
+-- | The park test for ignored windows: the frame's best overlap with any
+-- screen is at most a 2x2 sliver. Matches the Swift isAlreadyParked
+-- (core/Sources/MCMonadCore/IPC/ParkGeometry.swift).
+isIgnoredParked :: [Rectangle] -> Rectangle -> Bool
+isIgnoredParked screenRects fr =
+    let (w, h) = overlapSides fr (maximumBy (comparing (rectOverlapArea fr)) screenRects)
+    in w <= 2 && h <= 2
+
+-- | Per-axis extent of the overlap of two rects (0 where they don't meet).
+overlapSides :: Rectangle -> Rectangle -> (Double, Double)
+overlapSides a b = (axis rect_x rect_w, axis rect_y rect_h)
+  where
+    axis pos len = max 0 (min (pos a + len a) (pos b + len b) - max (pos a) (pos b))
+
+-- | Area of the intersection of two rects (0 if they don't overlap).
+rectOverlapArea :: Rectangle -> Rectangle -> Double
+rectOverlapArea a b =
+    let x1 = max (rect_x a) (rect_x b)
+        y1 = max (rect_y a) (rect_y b)
+        x2 = min (rect_x a + rect_w a) (rect_x b + rect_w b)
+        y2 = min (rect_y a + rect_h a) (rect_y b + rect_h b)
+    in max 0 (x2 - x1) * max 0 (y2 - y1)
+
 -- | Find the screen rectangle for a given window. Falls back to the current
 -- screen if the window is not found on any screen.
 findScreenForWindow :: WindowRef -> WindowSet -> Rectangle
@@ -559,6 +746,36 @@ findScreenForWindow w ws =
   where
     windowOnScreen win scr =
         win `elem` W.integrate' (W.stack (W.workspace scr))
+
+-- | The currently-displayed screen whose rect has the greatest overlap
+-- with a given frame -- e.g. the landing position of a completed window
+-- drag. Falls back to the current screen if the frame overlaps no
+-- display (shouldn't normally happen: AppKit constrains window frames to
+-- the display union).
+screenAt :: Rectangle -> W.StackSet String l a ScreenId ScreenDetail
+         -> W.Screen String l a ScreenId ScreenDetail
+screenAt r ws = case sortBy (comparing (Down . overlapArea)) (screensOf ws) of
+    (best:_) -> best
+    []       -> W.current ws
+  where
+    overlapArea scr = rectOverlapArea r (screenRect (W.screenDetail scr))
+
+-- | The workspace tag to reassign @wr@ to, if @rect@ (its new frame) lands
+-- on a different screen than the workspace it's currently in -- e.g. a
+-- drag that crossed screens. 'Nothing' if it's already on the right one
+-- (including if @wr@ isn't a member of @ws@ at all), so callers can treat
+-- it as "nothing to do" directly. Shared by every place a window's frame
+-- can change out from under mcmonad's own bookkeeping: an Option-drag
+-- ('MCMonad.Main' \/ @WindowDragCompleted@) and, for native floats, any
+-- AX frame change at all ('MCMonad.Main' \/ @WindowFrameChanged@), since
+-- those are real native windows a user can drag by their own title bar.
+crossedScreenTag :: Eq a => a -> Rectangle -> W.StackSet String l a ScreenId ScreenDetail
+                 -> Maybe String
+crossedScreenTag wr rect ws = do
+    cur <- W.findTag wr ws
+    let dropTag = W.tag (W.workspace (screenAt rect ws))
+    guard (cur /= dropTag)
+    pure dropTag
 
 -- ---------------------------------------------------------------------------
 -- Window lifecycle
@@ -654,6 +871,40 @@ pruneReclaims now m
   where
     fresh = M.filter (\(_, at) -> diffUTCTime now at <= reclaimOriginTTL) m
 
+-- | Insert a window, apply the manage hook's transform, then the
+-- destroy/recreate route. The route runs last, so it wins when both apply;
+-- with no origin it is 'id'.
+--
+-- A recognized origin also overrides a hook decision that would delete
+-- the window outright (e.g. 'MCMonad.ManageHook.doIgnore'): an origin
+-- means this isn't a window the hook is seeing for the first time, it's
+-- one mcmonad already managed, continuing under a new identity, so a
+-- rule meant for genuinely new windows must not be able to drop it. The
+-- shiftWin route below can't undo that deletion on its own -- it's a
+-- no-op on a window that isn't present -- so the reinsertion has to
+-- happen before it runs.
+placeManaged
+    :: WindowRef
+    -> Maybe String
+    -> (W.StackSet String l WindowRef ScreenId ScreenDetail
+        -> W.StackSet String l WindowRef ScreenId ScreenDetail)
+    -> W.StackSet String l WindowRef ScreenId ScreenDetail
+    -> W.StackSet String l WindowRef ScreenId ScreenDetail
+placeManaged wr originTag transform ws =
+    maybe id (`W.shiftWin` wr) originTag (reinstateIfDropped (transform (W.insertUp wr ws)))
+  where
+    reinstateIfDropped ws'
+        | isJust originTag && not (W.member wr ws') = W.insertUp wr ws'
+        | otherwise = ws'
+
+-- | Windows to park after a pass. Orphans (windows a layout left without a
+-- rect) are always parked; the windows leaving the visible set only when
+-- that set changed.
+windowsToPark :: Bool -> [WindowRef] -> [WindowRef] -> [WindowRef]
+windowsToPark visibleChanged leaving orphaned
+    | visibleChanged = leaving ++ orphaned
+    | otherwise = orphaned
+
 -- | Manage a new window: run the manage hook, insert it into the current
 -- workspace, and apply any hook-specified transformations (float, shift, etc.).
 manage :: WindowInfo -> ManageHook -> M ()
@@ -663,13 +914,21 @@ manage wi hook = do
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
-        -- Destroy/recreate learnedAffinity: if this pid's last window was
-        -- destroyed recently ('unmanagedOrigin'), this window is its
-        -- replacement — Gecko destroys and recreates the NSWindow
-        -- across a native-fullscreen round-trip — so route it back to
-        -- the workspace the destroyed window lived on. The route runs
-        -- before the manage hook's transform, so an explicit doShift
-        -- in the user's config still wins.
+        -- Destroy/recreate routing: if this pid's last window was
+        -- destroyed recently ('unmanagedOrigin'), or this exact window
+        -- was offered again ('reclaimOrigin'), it is not a genuinely
+        -- new window — it's a window mcmonad has already seen,
+        -- continuing under a new identity (Gecko destroys and
+        -- recreates the NSWindow across a native-fullscreen
+        -- round-trip; mcmonad-core's reconcile sweep can re-offer a
+        -- window a bogus destroy took away). Route it back to the
+        -- workspace it already belonged to. The route runs *after*
+        -- the manage hook's transform and wins when both apply, so a
+        -- pinning rule like @doShift@ in the user's config only
+        -- places a window the first time mcmonad sees it — it can't
+        -- yank an already-known window back to a pinned workspace
+        -- after the user has moved it elsewhere. 'route' is 'id' when
+        -- there is no origin, so a genuinely new window is unaffected.
         now <- io getCurrentTime
         origins <- gets unmanagedOrigin
         reclaims <- gets reclaimOrigin
@@ -678,19 +937,49 @@ manage wi hook = do
                                  ++ W.hidden ws)
             originTag =
                 chooseOriginTag now allTags wr (wiPid wi) reclaims origins
-            route = maybe id (`W.shiftWin` wr) originTag
+            -- Computed here, not read back via 'gets windowset' after
+            -- 'windows' below runs: 'windows' pushes the OverlaySnapshot
+            -- as its very last step, so recording the ignore *after* it
+            -- would miss that first push, and the window wouldn't reach
+            -- the per-screen query until some unrelated later event pushed
+            -- a fresh one.
+            finalWs = placeManaged wr originTag transform ws
         modify $ \s -> s
             { windowMetadata  = M.insert wr (metadataFromInfo wi) (windowMetadata s)
             , unmanagedOrigin = M.delete (wiPid wi) (unmanagedOrigin s)
             , reclaimOrigin   = M.delete wr (pruneReclaims now (reclaimOrigin s))
             }
-        windows (transform . route . W.insertUp wr)
+        recordIfIgnored wr finalWs
+        windows (const finalWs)
         -- A window routed to a hidden workspace never enters the
         -- visible set, so the 'windows' call above did not change it
         -- and issued no hides — the new window would sit on screen at
         -- whatever frame its app chose. Park it (and any other
         -- straggler) explicitly.
         whenJust originTag $ \_ -> reassertHiddenWindows
+
+-- | If the manage hook (e.g. 'MCMonad.ManageHook.doIgnore') left this
+-- window out of the given (post-hook) 'WindowSet', track it in
+-- 'ignoredWindows' instead. mcmonad never positions or hides an ignored
+-- window, so it has no workspace of its own — it's simply always
+-- visible on whatever screen it physically sits on, under whatever
+-- workspace that screen currently shows. 'MCMonad.IPC.QueryServer'
+-- resolves that live, per query, from this identity-only record, so
+-- there's nothing here to go stale across a workspace switch.
+--
+-- Takes the resulting 'WindowSet' explicitly rather than re-deriving it
+-- via 'gets windowset', since at both call sites ('manage', before
+-- 'windows' applies the hook's transform to the real state; and
+-- 'manageSilent', right after its own direct 'modify') the authoritative
+-- answer already exists locally — recomputing or re-reading it would
+-- either run the hook's logic twice or, in 'manage', read stale state.
+--
+-- Logs each addition to 'ignoredWindows'.
+recordIfIgnored :: WindowRef -> WindowSet -> M ()
+recordIfIgnored wr finalWs =
+    when (not (W.member wr finalWs)) $ do
+        modify $ \s -> s { ignoredWindows = S.insert wr (ignoredWindows s) }
+        io $ logTS $ "IGNORED: added " ++ show wr
 
 -- | Insert a window into the StackSet without triggering layout.
 -- Used during startup to batch-insert all existing windows.
@@ -700,10 +989,12 @@ manageSilent wi hook = do
     ws <- gets windowset
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
+        let finalWs = transform (W.insertUp wr ws)
         modify $ \s -> s
-            { windowset = transform (W.insertUp wr (windowset s))
+            { windowset = finalWs
             , windowMetadata = M.insert wr (metadataFromInfo wi) (windowMetadata s)
             }
+        recordIfIgnored wr finalWs
 
 -- | If this window is one the restore is still waiting for, put it back
 -- on the workspace it was saved on — at its saved position, with its
@@ -736,7 +1027,7 @@ restorePending wi = do
                         , windowMetadata = M.insert wr (metadataFromInfo wi)
                                                        (windowMetadata s)
                         }
-                    io $ hPutStrLn stderr $
+                    io $ logTS $
                         "mcmonad: window " ++ show (wiWindowId wi)
                         ++ " (pid " ++ show (wiPid wi)
                         ++ ") enumerated late; restored to workspace "
@@ -765,6 +1056,19 @@ forgetPending wid = do
 unmanage :: WindowRef -> M ()
 unmanage w = do
     ws <- gets windowset
+    -- A window the manage hook ignored was never a 'windowset' member,
+    -- so the block below (gated on membership) would otherwise never
+    -- run for it — leaving both 'ignoredWindows' and 'windowMetadata'
+    -- stale forever once it closes. Handled unconditionally, up front,
+    -- since it's mutually exclusive with the membership case anyway.
+    wasIgnored <- gets (S.member w . ignoredWindows)
+    when wasIgnored $ do
+        modify $ \s -> s
+            { ignoredWindows = S.delete w (ignoredWindows s)
+            , windowMetadata = M.delete w (windowMetadata s)
+            }
+        -- Logs each removal from 'ignoredWindows'.
+        io $ logTS $ "IGNORED: removed " ++ show w ++ " (destroyed)"
     when (W.member w ws) $ do
         -- Remember where the pid's LAST window lived so 'manage' can
         -- route a destroy/recreate replacement (Gecko's fullscreen
@@ -791,11 +1095,14 @@ unmanage w = do
                                  (pruneOrigins now (unmanagedOrigin s))
                     }
             Nothing -> return ()
-        -- Clean from sticky, scratchpads, and metadata before removing
+        -- Clean from sticky, scratchpads, native floats, and metadata
+        -- before removing
         modify $ \s -> s
-            { sticky         = S.delete w (sticky s)
-            , scratchpads    = M.filter (/= w) (scratchpads s)
-            , windowMetadata = M.delete w (windowMetadata s)
+            { sticky           = S.delete w (sticky s)
+            , scratchpads      = M.filter (/= w) (scratchpads s)
+            , nativeFloats     = S.delete w (nativeFloats s)
+            , nativeFloatRects = M.delete w (nativeFloatRects s)
+            , windowMetadata   = M.delete w (windowMetadata s)
             }
         -- W.delete, not W.delete': delete' deliberately leaves the
         -- floating entry behind (xmonad keeps it for temporary
@@ -803,6 +1110,62 @@ unmanage w = do
         -- the leaked entries accumulated in mcmonad.state by the
         -- hundreds before this used the full delete.
         windows (W.delete w)
+
+-- | Replace every occurrence of one window with another across every
+-- workspace, preserving exact stack position and floating geometry —
+-- unlike removing and reinserting, which loses position. The two refs
+-- are taken as a given correspondence; this does not look for or
+-- validate one itself.
+replaceWindowIdentity
+    :: Ord a => a -> a
+    -> W.StackSet String l a ScreenId ScreenDetail
+    -> W.StackSet String l a ScreenId ScreenDetail
+replaceWindowIdentity old new ws
+    | old == new = ws
+    | otherwise = (W.mapWorkspace replaceInWorkspace ws)
+        { W.floating = case M.lookup old (W.floating ws) of
+            Just rect -> M.insert new rect (M.delete old (W.floating ws))
+            Nothing   -> W.floating ws
+        }
+  where
+    replaceInWorkspace wsp = wsp { W.stack = fmap replaceInStack (W.stack wsp) }
+    replaceInStack stk = stk
+        { W.focus = sub (W.focus stk)
+        , W.up    = map sub (W.up stk)
+        , W.down  = map sub (W.down stk)
+        }
+    sub w = if w == old then new else w
+
+-- | Collapse a destroy immediately followed by a create for the same
+-- process into one state transition and one relayout, instead of the
+-- destroy's removal and the create's insertion each pushing their own
+-- layout pass — visible otherwise as the tiles briefly reflowing twice
+-- in a row. Only called once the caller has already confirmed exactly
+-- one destroy and one create for this pid arrived together; this does
+-- not establish that correspondence itself, only acts on it.
+--
+-- Skips the manage hook: the window is inheriting the old window's
+-- placement, which already went through the hook once.
+handleManagedReplacement :: WindowRef -> WindowInfo -> M ()
+handleManagedReplacement old winfo = do
+    ws <- gets windowset
+    when (W.member old ws) $ do
+        let new = WindowRef (wiWindowId winfo) (wiPid winfo)
+        modify $ \s -> s
+            { sticky = if S.member old (sticky s)
+                           then S.insert new (S.delete old (sticky s))
+                           else sticky s
+            , nativeFloats = if S.member old (nativeFloats s)
+                           then S.insert new (S.delete old (nativeFloats s))
+                           else nativeFloats s
+            , nativeFloatRects = case M.lookup old (nativeFloatRects s) of
+                Just r  -> M.insert new r (M.delete old (nativeFloatRects s))
+                Nothing -> nativeFloatRects s
+            , scratchpads = M.map (\w -> if w == old then new else w) (scratchpads s)
+            , windowMetadata = M.insert new (metadataFromInfo winfo)
+                                   (M.delete old (windowMetadata s))
+            }
+        windows (replaceWindowIdentity old new)
 
 -- ---------------------------------------------------------------------------
 -- Layout messages
@@ -837,11 +1200,42 @@ sendMessageWithNoRefresh m = do
 -- ---------------------------------------------------------------------------
 -- Window actions
 
--- | Close the focused window by asking the Swift daemon to close it.
+-- | Close whatever window macOS currently has focused, not just a
+-- 'windowset' member: a 'MCMonad.ManageHook.doIgnore'd window (e.g.
+-- System Settings) is never in 'windowset', so 'withFocused' would
+-- silently do nothing while one is focused. Asynchronous, same as
+-- 'jumpToActiveWindow' — the close happens when
+-- 'MCMonad.IPC.FocusedWindowQueryResponse' arrives.
+--
+-- If another window remains on the current workspace, explicitly focus
+-- it right away rather than letting macOS decide: closing the last
+-- *visible* window of its app normally hands focus to whatever app was
+-- active before, which can be on a different workspace entirely, and
+-- 'MCMonad.Main' would otherwise read that as a deliberate switch and
+-- follow it there. Asserting our own choice first pre-empts that. If no
+-- window remains (the workspace becomes empty), there is nothing to
+-- assert — arm 'suppressFrontAppUntil' instead, so that same reflex is
+-- read as noise from this close rather than real intent.
 kill :: M ()
-kill = withFocused $ \w -> do
+kill = queryFocusedWindow $ \w -> do
     conn <- asks connection
+    ws <- gets windowset
+    when (W.member w ws) $ case W.peek (W.delete w ws) of
+        Just nw -> io $ sendCommand conn (FocusWindow (wrWindowId nw) (wrPid nw))
+        Nothing -> do
+            now <- io getCurrentTime
+            modify $ \s -> s { suppressFrontAppUntil = Just (armKillChurnSuppression now) }
     io $ sendCommand conn (CloseWindow (wrWindowId w) (wrPid w))
+
+-- | Fetch the window macOS currently has focused and run an action on it,
+-- bypassing 'windowset' (see 'kill'). Asynchronous: only sends the query
+-- here, @f@ runs later when 'MCMonad.IPC.FocusedWindowQueryResponse'
+-- arrives — see the handler in "MCMonad.Main".
+queryFocusedWindow :: (WindowRef -> M ()) -> M ()
+queryFocusedWindow f = do
+    modify $ \s -> s { pendingFocusQuery = Just f }
+    conn <- asks connection
+    io $ sendCommand conn QueryFocusedWindow
 
 -- | Perform an action on the focused window, if there is one.
 withFocused :: (WindowRef -> M ()) -> M ()
@@ -866,15 +1260,12 @@ setFocus w = do
 -- whose window sits on an off-screen workspace: mcmonad's StackSet focus
 -- does not follow such activations (the AX\/NSWorkspace resolve helpers
 -- only act on the current workspace), so we ask the daemon where focus
--- actually landed and follow it.
---
--- Asynchronous: this only fires the 'QueryFocusedWindow' query. The
--- actual workspace switch happens when the 'FocusedWindowQueryResponse'
--- event arrives — see the handler in "MCMonad.Main".
+-- actually landed and follow it. See 'queryFocusedWindow' for the
+-- asynchronous mechanics.
 jumpToActiveWindow :: M ()
-jumpToActiveWindow = do
-    conn <- asks connection
-    io $ sendCommand conn QueryFocusedWindow
+jumpToActiveWindow = queryFocusedWindow $ \wr -> do
+    ws <- gets windowset
+    when (W.member wr ws) $ windows (W.focusWindow wr)
 
 -- | Open the fuzzy window-search dropdown. The daemon owns the picker
 -- UI; a selection returns as a 'MCMonad.IPC.MenuFocusWindow' event,
@@ -980,7 +1371,7 @@ journalTimer event extra = io $ do
         createDirectoryIfMissing True (takeDirectory f)
         LBS.appendFile f line)
         `catch` \e ->
-            hPutStrLn stderr $ "mcmonad: timer journal write failed: "
+            logTS $ "mcmonad: timer journal write failed: "
                 ++ show (e :: IOException)
 
 -- | Common identity fields shared by most journal events.
@@ -1031,13 +1422,12 @@ journalJumped lbl ws =
 currentSnapshot :: M StateSnapshot
 currentSnapshot = do
     ws   <- gets windowset
-    aff  <- gets learnedAffinity
     ts   <- gets timers
     nid  <- gets nextTimerId
     pend <- gets pendingRestore
     return StateSnapshot
         { snWindowSet   = ws
-        , snAffinity    = aff
+        , snAffinity    = visibleAffinities ws
         , snTimers      = ts
         , snNextTimerId = nid
         , snPending     = pend
@@ -1066,7 +1456,7 @@ saveStateIO snap = do
         Posix.setFileMode tmp 0o600
         Posix.rename tmp sf)
         `catch` \e ->
-            hPutStrLn stderr $ "mcmonad: state save failed: " ++ show (e :: IOException)
+            logTS $ "mcmonad: state save failed: " ++ show (e :: IOException)
 
 -- | Read the saved state from disk, if any. Returns 'Nothing' when:
 --
@@ -1095,18 +1485,18 @@ loadStateIO = do
             case reads contents of
                 [(saved, _)]
                     | ssVersion saved `elem` [3, persistenceVersion] -> do
-                        hPutStrLn stderr $
+                        logTS $
                             "mcmonad: loaded saved state from " ++ sf
                         keepPrevious sf contents
                         return (Just saved)
                 _ -> do
-                    hPutStrLn stderr $
+                    logTS $
                         "mcmonad: saved state at " ++ sf
                         ++ " is unreadable or has wrong version; moving to .bak"
                     Posix.rename sf (sf ++ ".bak")
                     return Nothing)
             `catch` \e -> do
-                hPutStrLn stderr $
+                logTS $
                     "mcmonad: state load failed: " ++ show (e :: IOException)
                 return Nothing
   where
@@ -1117,7 +1507,7 @@ loadStateIO = do
             Posix.setFileMode tmp 0o600
             Posix.rename tmp prev)
             `catch` \e ->
-                hPutStrLn stderr $ "mcmonad: could not keep " ++ prev
+                logTS $ "mcmonad: could not keep " ++ prev
                     ++ ": " ++ show (e :: IOException)
 
 -- | Is a process with this pid still running?
@@ -1168,7 +1558,7 @@ recompile = do
             mGhc <- lookupEnv "MCMONAD_GHC"
             case mGhc of
                 Nothing -> do
-                    hPutStrLn stderr $ unlines
+                    logTS $ unlines
                         [ "mcmonad: MCMONAD_GHC is not set."
                         , "  Set MCMONAD_GHC to a ghc that has the mcmonad library"
                         , "  in its package database. The home-manager module and"
@@ -1177,7 +1567,7 @@ recompile = do
                     return False
                 Just ghc -> do
                     bin <- getCustomBinary
-                    hPutStrLn stderr $ "mcmonad: recompiling " ++ src ++ " with " ++ ghc
+                    logTS $ "mcmonad: recompiling " ++ src ++ " with " ++ ghc
                     (exit, _, err) <- readProcessWithExitCode ghc
                         ["--make", src, "-o", bin, "-v0"] ""
                     case exit of
@@ -1189,10 +1579,10 @@ recompile = do
                             -- prevents the crash-loop when the IPC has moved
                             -- on but the user's Mod-q-compiled binary hasn't.
                             writeFile (bin ++ ".proto") (show protocolVersion)
-                            hPutStrLn stderr "mcmonad: recompile succeeded"
+                            logTS "mcmonad: recompile succeeded"
                             return True
                         _ -> do
-                            hPutStrLn stderr $ "mcmonad: recompile FAILED:\n" ++ err
+                            logTS $ "mcmonad: recompile FAILED:\n" ++ err
                             return False
 
 -- | Recompile and restart the Haskell process.  The Swift daemon stays
@@ -1212,11 +1602,11 @@ restart = do
     io $ do
         sf <- getStateFile
         saveStateIO snap
-        hPutStrLn stderr $ "mcmonad: state written to " ++ sf
+        logTS $ "mcmonad: state written to " ++ sf
 
     -- 2. Recompile
     ok <- io recompile
-    unless ok $ io $ hPutStrLn stderr "mcmonad: recompile failed, restarting with old binary"
+    unless ok $ io $ logTS "mcmonad: recompile failed, restarting with old binary"
 
     -- 3. Determine which binary to exec.
     --    Use the custom binary only when its protocol-version stamp
@@ -1231,10 +1621,10 @@ restart = do
         self <- getExecutablePath
         let bin = if hasCustom && customStampOk then customBin else self
         when (hasCustom && not customStampOk) $
-            hPutStrLn stderr $
+            logTS $
                 "mcmonad: custom binary " ++ customBin
                 ++ " has missing/mismatched protocol stamp; using bundled"
-        hPutStrLn stderr $ "mcmonad: exec " ++ bin ++ " --resume"
+        logTS $ "mcmonad: exec " ++ bin ++ " --resume"
         executeFile bin False ["--resume"] Nothing
   where
     checkProtoStamp customBin = do
@@ -1282,7 +1672,7 @@ rescreen newScreens = do
         roles'     = M.fromList (zipWith (\i si -> (S i, siRole si))
                                          [0 :: Int ..] newScreens)
         liveSids   = S.fromList (map fst newDetails)
-    io $ hPutStrLn stderr $ "mcmonad: screens "
+    io $ logTS $ "mcmonad: screens "
         ++ unwords [ show i ++ "=" ++ roleName (siRole si)
                    | (i, si) <- zip [0 :: Int ..] newScreens ]
     case reassignScreens newDetails ws of

@@ -399,10 +399,10 @@ final class SkyLight: @unchecked Sendable {
 
         for (wid, origin) in positions {
             let err = _transactionMoveWindowWithGroup(transaction, wid, origin)
-            fputs("SKYLIGHT: batchMove wid=\(wid) to=(\(origin.x),\(origin.y)) err=\(err.rawValue)\n", stderr)
+            logStderr("SKYLIGHT: batchMove wid=\(wid) to=(\(origin.x),\(origin.y)) err=\(err.rawValue)\n")
         }
         let commitErr = _transactionCommit(transaction, 0)
-        fputs("SKYLIGHT: batchCommit err=\(commitErr.rawValue)\n", stderr)
+        logStderr("SKYLIGHT: batchCommit err=\(commitErr.rawValue)\n")
     }
 
     // MARK: Window title (via CGWindowListCopyWindowInfo)

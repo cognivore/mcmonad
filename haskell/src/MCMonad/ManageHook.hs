@@ -15,13 +15,15 @@ module MCMonad.ManageHook
     , isDialog, isFixedSize, hasCloseButton, hasFullscreenButton
     , subrole
       -- * Actions
-    , doFloat, doShift, doIgnore
+    , doFloat, doFloatNative, doShift, doIgnore
       -- * Default
     , defaultManageHook
     ) where
 
 import Control.Monad.Reader
 import Data.Monoid (Endo(..))
+import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import Data.Text (Text)
 import qualified XMonad.StackSet as W
 
@@ -180,6 +182,23 @@ doIgnore = Query $ do
     wi <- ask
     let wr = WindowRef (wiWindowId wi) (wiPid wi)
     return $ Endo $ W.delete' wr
+
+-- | Like 'doFloat', but mcmonad never writes a frame for it — neither
+-- when placing it nor on any later layout pass. The window's own
+-- position and size stand. Still a normal managed window otherwise: it
+-- gets a home workspace, and parks \/ shows with it like any other.
+doFloatNative :: ManageHook
+doFloatNative = Query $ do
+    wi <- ask
+    let wr = WindowRef (wiWindowId wi) (wiPid wi)
+    lift $ modify $ \s -> s
+        { nativeFloats = S.insert wr (nativeFloats s)
+        -- Seed with its frame at manage time, so a park/restore cycle
+        -- before the first 'WindowFrameChanged' still has somewhere to
+        -- restore it to.
+        , nativeFloatRects = M.insert wr (wiFrame wi) (nativeFloatRects s)
+        }
+    return $ Endo $ W.float wr (W.RationalRect 0 0 1 1)
 
 -- ---------------------------------------------------------------------------
 -- Default manage hook

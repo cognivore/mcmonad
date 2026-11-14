@@ -7,7 +7,7 @@ windows — without ever installing Nix, Haskell, or GHC by hand.
 This is the procedure for users who installed McMonad from a release
 `.dmg`/`.zip` (i.e. `MCMonad.app` lives in `~/Applications` or
 `/Applications`). If you installed via `home-manager`, manage
-`services.mcmonad.configFile` declaratively instead — these steps do
+`services.mcmonad.config` declaratively instead — these steps do
 not apply to you.
 
 ---

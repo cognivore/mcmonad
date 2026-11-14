@@ -20,7 +20,7 @@ i3-style binary-tree-of-window-splits is enabled with the confusingly-named `wit
 
 **Prerequisites:** grant Accessibility permissions (System Settings > Privacy & Security > Accessibility), and unmap Option+Space (System Settings > Keyboard > Keyboard Shortcuts > Input Sources — disable input source switching). McMonad uses Option as mod.
 
-**Install via Nix** (recommended): `nix build github:cognivore/mcmonad`. **With home-manager** (the proper way for daily driving): add `mcmonad.url = "github:cognivore/mcmonad"` to your flake inputs, include `mcmonad.homeManagerModules.default` in your modules, then set `services.mcmonad.enable = true` and optionally `services.mcmonad.configFile` with your Haskell config. This gives you a launchd agent that manages both processes, auto-restarts on crash, and sets `MCMONAD_GHC` for recompilation.
+**Install via Nix** (recommended): `nix build github:cognivore/mcmonad`. **With home-manager** (the proper way for daily driving): add `mcmonad.url = "github:cognivore/mcmonad"` to your flake inputs, include `mcmonad.homeManagerModules.default` in your modules, then set `services.mcmonad.enable = true` and optionally `services.mcmonad.config` with your Haskell config. This gives you a launchd agent that manages both processes, auto-restarts on crash, and sets `MCMONAD_GHC` for recompilation.
 
 **From the .app bundle:** grab a release from [GitHub Releases](https://github.com/cognivore/mcmonad/releases). This is very under-tested, so please fix it if it doesn't work and write _human-described_ pull requests to this repo should you undertake this undertaking.
 
@@ -45,7 +45,7 @@ kill $(pgrep -f mcmonad)
 
 **"Nothing happens when I press hotkeys."** Accessibility permission was not granted, or you need to restart `MCMonadCore` and `mcmonad` after granting it. Add whichever binary is running — `MCMonadCore` + `mcmonad` if from Nix. On  `McMonad.app` if from the bundle.
 
-**"I edited `mcmonad.hs` but nothing changed."** If `services.mcmonad.configFile` is set in home-manager, it manages `~/.config/mcmonad/mcmonad.hs` declaratively — your local edits get overwritten on `home-manager switch`. Manage it in `home-manager`!
+**"I edited `mcmonad.hs` but nothing changed."** If `services.mcmonad.config` is set in home-manager, it manages `~/.config/mcmonad/mcmonad.hs` declaratively — your local edits get overwritten on `home-manager switch`. Manage it in `home-manager`!
 
 **"Two instances are running."** `kill $(pgrep -f mcmonad)` then start one. If launchd keeps respawning: `launchctl bootout gui/$(id -u)/com.mcmonad.agent` first.
 

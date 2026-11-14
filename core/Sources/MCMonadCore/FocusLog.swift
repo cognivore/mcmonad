@@ -62,6 +62,6 @@ enum FocusLog {
         if let tHash = tHash { line += " tHash=\(tHash)" }
         if let result = result { line += " result=\(result)" }
         if let extra = extra { line += " " + extra }
-        fputs(line + "\n", stderr)
+        fputs(logTS() + line + "\n", stderr)
     }
 }

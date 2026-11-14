@@ -124,8 +124,7 @@ splitHorizontallyBy frac (Rectangle x y w h) =
 -- ---------------------------------------------------------------------------
 -- Full layout
 
--- | Every window gets the full screen rectangle. Only the focused window
--- is laid out.
+-- | The focused window gets the full screen rectangle.
 data Full a = Full
     deriving (Show, Read)
 

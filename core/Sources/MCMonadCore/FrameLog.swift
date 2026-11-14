@@ -95,7 +95,7 @@ enum FrameLog {
         if let tHash = tHash { line += " tHash=\(tHash)" }
         if let result = result { line += " result=\(result)" }
         if let extra = extra { line += " " + extra }
-        fputs(line + "\n", stderr)
+        fputs(logTS() + line + "\n", stderr)
     }
 
     private static func fmt(_ d: CGFloat) -> String {

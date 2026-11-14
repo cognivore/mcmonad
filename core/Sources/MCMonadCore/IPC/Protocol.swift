@@ -227,15 +227,16 @@ struct OverlayScreenEntry: Codable, Sendable {
     let screenId: Int
     let frame: CGRect
     let workspaceTag: String
+    let isActive: Bool
     let windows: [OverlayWindowEntry]
 
     private enum CodingKeys: String, CodingKey {
-        case screenId, frame, workspaceTag, windows
+        case screenId, frame, workspaceTag, isActive, windows
     }
 
-    init(screenId: Int, frame: CGRect, workspaceTag: String, windows: [OverlayWindowEntry]) {
+    init(screenId: Int, frame: CGRect, workspaceTag: String, isActive: Bool, windows: [OverlayWindowEntry]) {
         self.screenId = screenId; self.frame = frame
-        self.workspaceTag = workspaceTag; self.windows = windows
+        self.workspaceTag = workspaceTag; self.isActive = isActive; self.windows = windows
     }
 
     init(from decoder: Decoder) throws {
@@ -243,6 +244,7 @@ struct OverlayScreenEntry: Codable, Sendable {
         screenId = try c.decode(Int.self, forKey: .screenId)
         frame = try c.decode(FlatRect.self, forKey: .frame).cgRect
         workspaceTag = try c.decode(String.self, forKey: .workspaceTag)
+        isActive = try c.decode(Bool.self, forKey: .isActive)
         windows = try c.decode([OverlayWindowEntry].self, forKey: .windows)
     }
 
@@ -251,6 +253,7 @@ struct OverlayScreenEntry: Codable, Sendable {
         try c.encode(screenId, forKey: .screenId)
         try c.encode(FlatRect(frame), forKey: .frame)
         try c.encode(workspaceTag, forKey: .workspaceTag)
+        try c.encode(isActive, forKey: .isActive)
         try c.encode(windows, forKey: .windows)
     }
 }
@@ -261,12 +264,52 @@ struct OverlayHiddenWorkspace: Codable, Sendable {
     let windows: [OverlayWindowEntry]
 }
 
+/// A window the manage hook explicitly ignored (doIgnore). mcmonad never
+/// positions or hides these, so there's no frame or workspace tag here —
+/// just identity. See `QueryServer` for how a screen is attributed.
+struct OverlayIgnoredWindow: Codable, Sendable {
+    let windowId: UInt32
+    let pid: Int32
+}
+
 /// Snapshot of mcmonad's WindowSet, pushed from Haskell on every windows
 /// call. Drives both the menubar workspace tree and the debug overlay.
 struct OverlaySnapshot: Codable, Sendable {
     let debugOverlays: Bool
     let screens: [OverlayScreenEntry]
     let hiddenWorkspaces: [OverlayHiddenWorkspace]
+    let ignoredWindows: [OverlayIgnoredWindow]
+
+    private enum CodingKeys: String, CodingKey {
+        case debugOverlays, screens, hiddenWorkspaces, ignoredWindows
+    }
+
+    init(debugOverlays: Bool, screens: [OverlayScreenEntry],
+         hiddenWorkspaces: [OverlayHiddenWorkspace],
+         ignoredWindows: [OverlayIgnoredWindow]) {
+        self.debugOverlays = debugOverlays; self.screens = screens
+        self.hiddenWorkspaces = hiddenWorkspaces; self.ignoredWindows = ignoredWindows
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        debugOverlays = try c.decode(Bool.self, forKey: .debugOverlays)
+        screens = try c.decode([OverlayScreenEntry].self, forKey: .screens)
+        hiddenWorkspaces = try c.decode([OverlayHiddenWorkspace].self, forKey: .hiddenWorkspaces)
+        // Defensive default: a brain built just before this field existed
+        // shouldn't make every snapshot fail to decode.
+        ignoredWindows = try c.decodeIfPresent([OverlayIgnoredWindow].self, forKey: .ignoredWindows) ?? []
+    }
+}
+
+// MARK: - Ignored-window attribution (Swift -> Haskell -> Swift)
+
+/// One ignored window's identity and live AX frame, sent to the brain so it
+/// can attribute the window to a screen. Swift reports the frame as a fact.
+struct IgnoredAttributionFact: Encodable, Sendable {
+    let windowId: UInt32
+    let pid: Int32
+    let frame: FlatRect
 }
 
 // MARK: - Events (Swift -> Haskell)
@@ -275,6 +318,9 @@ enum IPCEvent: Encodable, Sendable {
     case windowCreated(WindowInfo)
     case windowDestroyed(windowId: UInt32)
     case windowFrameChanged(windowId: UInt32, frame: CGRect)
+    /// A SetFrames readback found the window off its wanted frame. Reported
+    /// as a fact; the brain decides whether to re-send.
+    case windowFrameDefied(windowId: UInt32, pid: Int32, want: CGRect, frame: CGRect)
     case frontAppChanged(pid: Int32)
     case focusedWindowChanged(windowId: UInt32, pid: Int32)
     case screensChanged(screens: [ScreenInfo])
@@ -286,6 +332,9 @@ enum IPCEvent: Encodable, Sendable {
     case menuFocusWindow(windowId: UInt32, pid: Int32)
     case menuViewWorkspace(tag: String)
     case focusedWindowQueryResponse(windowId: UInt32, pid: Int32)
+    /// Ask the brain which ignored windows belong to `screenFrame`. Answered
+    /// by an `IPCCommand.ignoredAttributionReply` echoing that frame.
+    case ignoredAttributionQuery(screenFrame: CGRect, windows: [IgnoredAttributionFact])
     case timerStart(seconds: Double, label: String)
     case timerSnooze(seconds: Double, label: String, workspace: String)
     case timerFired(id: Int)
@@ -317,6 +366,12 @@ enum IPCEvent: Encodable, Sendable {
         case .windowFrameChanged(let windowId, let frame):
             try container.encode("window-frame-changed", forKey: .event)
             try container.encode(windowId, forKey: .windowId)
+            try container.encode(FlatRect(frame), forKey: .frame)
+        case .windowFrameDefied(let windowId, let pid, let want, let frame):
+            try container.encode("window-frame-defied", forKey: .event)
+            try container.encode(windowId, forKey: .windowId)
+            try container.encode(pid, forKey: .pid)
+            try container.encode(FlatRect(want), forKey: .want)
             try container.encode(FlatRect(frame), forKey: .frame)
         case .frontAppChanged(let pid):
             try container.encode("front-app-changed", forKey: .event)
@@ -355,6 +410,10 @@ enum IPCEvent: Encodable, Sendable {
             try container.encode("focused-window-query-response", forKey: .event)
             try container.encode(windowId, forKey: .windowId)
             try container.encode(pid, forKey: .pid)
+        case .ignoredAttributionQuery(let screenFrame, let windows):
+            try container.encode("ignored-attribution-query", forKey: .event)
+            try container.encode(FlatRect(screenFrame), forKey: .screenFrame)
+            try container.encode(windows, forKey: .windows)
         case .timerStart(let seconds, let label):
             try container.encode("timer-start", forKey: .event)
             try container.encode(seconds, forKey: .seconds)
@@ -409,6 +468,9 @@ enum IPCCommand: Decodable, Sendable {
     /// (`MCMonad.Config.ocrIndex`). Recognised text never crosses this socket;
     /// separately authorised Claude features may send excerpts to the provider.
     case setOcrIndex(on: Bool)
+    /// The brain's answer to an `ignoredAttributionQuery`: the ignored windows
+    /// whose home screen is the one nearest `screenFrame`.
+    case ignoredAttributionReply(screenFrame: CGRect, windowIds: [UInt32])
 
     private enum CmdType: String, Decodable {
         case setFrames = "set-frames"
@@ -428,6 +490,7 @@ enum IPCCommand: Decodable, Sendable {
         case showSpotlight = "show-spotlight"
         case setTimers = "set-timers"
         case setOcrIndex = "set-ocr-index"
+        case ignoredAttributionReply = "ignored-attribution-reply"
     }
 
     init(from decoder: Decoder) throws {
@@ -484,6 +547,10 @@ enum IPCCommand: Decodable, Sendable {
         case .setOcrIndex:
             let on = try container.decode(Bool.self, forKey: .on)
             self = .setOcrIndex(on: on)
+        case .ignoredAttributionReply:
+            let frame = try container.decode(FlatRect.self, forKey: .screenFrame).cgRect
+            let windowIds = try container.decode([UInt32].self, forKey: .windowIds)
+            self = .ignoredAttributionReply(screenFrame: frame, windowIds: windowIds)
         }
     }
 }
@@ -514,6 +581,7 @@ private struct DynamicCodingKey: CodingKey {
     static let windowId = DynamicCodingKey(stringValue: "windowId")!
     static let windowIds = DynamicCodingKey(stringValue: "windowIds")!
     static let pid = DynamicCodingKey(stringValue: "pid")!
+    static let want = DynamicCodingKey(stringValue: "want")!
     static let title = DynamicCodingKey(stringValue: "title")!
     static let appName = DynamicCodingKey(stringValue: "appName")!
     static let bundleId = DynamicCodingKey(stringValue: "bundleId")!
@@ -538,4 +606,6 @@ private struct DynamicCodingKey: CodingKey {
     static let workspace = DynamicCodingKey(stringValue: "workspace")!
     static let id = DynamicCodingKey(stringValue: "id")!
     static let timers = DynamicCodingKey(stringValue: "timers")!
+    static let screenFrame = DynamicCodingKey(stringValue: "screenFrame")!
+    static let windows = DynamicCodingKey(stringValue: "windows")!
 }

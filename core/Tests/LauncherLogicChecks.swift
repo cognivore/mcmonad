@@ -18,6 +18,10 @@ enum LauncherLogicChecks {
         checkWhatsUpCache()
         await checkMonitoringPrivacy()
         checkRecency()
+        checkOverlayScreenWire()
+        checkWorkspaceWindowLookup()
+        checkParkGeometry()
+        checkParkedHome()
         print("Launcher logic checks passed")
     }
 
@@ -93,14 +97,15 @@ enum LauncherLogicChecks {
         let snap = OverlaySnapshot(
             debugOverlays: false,
             screens: [
-                OverlayScreenEntry(screenId: 0, frame: .zero, workspaceTag: "3",
+                OverlayScreenEntry(screenId: 0, frame: .zero, workspaceTag: "3", isActive: true,
                                    windows: [w(7, "Ghostty", "deploy notes", focused: true)]),
-                OverlayScreenEntry(screenId: 1, frame: .zero, workspaceTag: "2", windows: []),
+                OverlayScreenEntry(screenId: 1, frame: .zero, workspaceTag: "2", isActive: false, windows: []),
             ],
             hiddenWorkspaces: [
                 OverlayHiddenWorkspace(tag: "o5", windows: [w(9, "Chrome", "cats"), w(11, "?", "")]),
                 OverlayHiddenWorkspace(tag: "z", windows: []),
-            ]
+            ],
+            ignoredWindows: []
         )
         let m = Ask.manifold(question: "Where is: the deploy", snapshot: snap,
                              text: { $0 == 9 ? "a  b\nc" : nil }, budget: 30, perWindow: 100)
@@ -180,8 +185,9 @@ enum LauncherLogicChecks {
         }
         func snap(_ screens: [(String, [OverlayWindowEntry])], _ hidden: [(String, [OverlayWindowEntry])]) -> OverlaySnapshot {
             OverlaySnapshot(debugOverlays: false,
-                            screens: screens.enumerated().map { OverlayScreenEntry(screenId: $0.offset, frame: .zero, workspaceTag: $0.element.0, windows: $0.element.1) },
-                            hiddenWorkspaces: hidden.map { OverlayHiddenWorkspace(tag: $0.0, windows: $0.1) })
+                            screens: screens.enumerated().map { OverlayScreenEntry(screenId: $0.offset, frame: .zero, workspaceTag: $0.element.0, isActive: $0.offset == 0, windows: $0.element.1) },
+                            hiddenWorkspaces: hidden.map { OverlayHiddenWorkspace(tag: $0.0, windows: $0.1) },
+                            ignoredWindows: [])
         }
         var hashes: [UInt32: Int] = [7: 1]
         let suite = "mcmonad-checks-\(UUID())"
@@ -280,7 +286,8 @@ enum LauncherLogicChecks {
                                          bundleId: nil, workspaceTag: nil, frame: .zero,
                                          isFocused: true, isFloating: false)
         let snap = OverlaySnapshot(debugOverlays: false, screens: [],
-                                    hiddenWorkspaces: [.init(tag: "hidden", windows: [window])])
+                                    hiddenWorkspaces: [.init(tag: "hidden", windows: [window])],
+                                    ignoredWindows: [])
         precondition(!cache.isEnabled, "fresh installs must not send background screen data")
         cache.noteSnapshot(snap)
         cache.noteTextChanged()
@@ -335,7 +342,8 @@ enum LauncherLogicChecks {
 
         quiet = true
         cache.noteSnapshot(OverlaySnapshot(debugOverlays: false,
-            screens: [.init(screenId: 0, frame: .zero, workspaceTag: "new", windows: [window])], hiddenWorkspaces: []))
+            screens: [.init(screenId: 0, frame: .zero, workspaceTag: "new", isActive: true, windows: [window])],
+            hiddenWorkspaces: [], ignoredWindows: []))
         cache.refreshNow() // queues the minimum-gap retry
         await settle()
         precondition(!clock.sleepers.isEmpty)
@@ -367,5 +375,96 @@ enum LauncherLogicChecks {
         precondition(RecentUse.window(12) == "w:12")
         precondition(RecentUse.app(bundleId: "com.x", path: "/p") == "a:com.x")
         precondition(RecentUse.app(bundleId: nil, path: "/p") == "a:/p")
+    }
+
+    // MARK: OverlayScreenEntry wire
+
+    static func checkOverlayScreenWire() {
+        for active in [true, false] {
+            let entry = OverlayScreenEntry(screenId: 1, frame: .zero, workspaceTag: "2", isActive: active, windows: [])
+            let data = try! JSONEncoder().encode(entry)
+            let back = try! JSONDecoder().decode(OverlayScreenEntry.self, from: data)
+            precondition(back.isActive == active && back.screenId == 1 && back.workspaceTag == "2", "\(active)")
+        }
+    }
+
+    // MARK: Query socket lookup
+
+    static func checkWorkspaceWindowLookup() {
+        func w(_ id: UInt32) -> OverlayWindowEntry {
+            OverlayWindowEntry(windowId: id, pid: 1, appName: nil, title: nil, bundleId: nil,
+                               workspaceTag: nil, frame: .zero, isFocused: false, isFloating: false)
+        }
+        let left = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let right = CGRect(x: 100, y: 0, width: 100, height: 100)
+        let snap = OverlaySnapshot(debugOverlays: false, screens: [
+            OverlayScreenEntry(screenId: 0, frame: left, workspaceTag: "1", isActive: true, windows: [w(1), w(2)]),
+            OverlayScreenEntry(screenId: 1, frame: right, workspaceTag: "2", isActive: false, windows: [w(3)]),
+        ], hiddenWorkspaces: [], ignoredWindows: [])
+        precondition(WorkspaceWindowLookup.windowIds(forScreenFrame: left, in: snap, ignoredWindowIds: { _ in [] }) == [1, 2])
+        precondition(WorkspaceWindowLookup.windowIds(forScreenFrame: right, in: snap, ignoredWindowIds: { _ in [] }) == [3])
+        precondition(WorkspaceWindowLookup.windowIds(forScreenFrame: left, in: snap, ignoredWindowIds: { _ in [50] }) == [1, 2, 50], "ignored ids follow the screen windows")
+        // a frame a few pixels off still resolves to the nearest screen
+        precondition(WorkspaceWindowLookup.windowIds(forScreenFrame: CGRect(x: 102, y: 1, width: 100, height: 100), in: snap, ignoredWindowIds: { _ in [] }) == [3])
+        precondition(WorkspaceWindowLookup.windowIds(forScreenFrame: left, in: nil, ignoredWindowIds: { _ in [] }) == [])
+        let empty = OverlaySnapshot(debugOverlays: false, screens: [], hiddenWorkspaces: [], ignoredWindows: [])
+        precondition(WorkspaceWindowLookup.windowIds(forScreenFrame: left, in: empty, ignoredWindowIds: { _ in [] }) == [])
+    }
+
+    // MARK: Parking geometry
+
+    static func checkParkGeometry() {
+        func info(_ id: Int, _ frame: CGRect) -> ScreenInfo {
+            ScreenInfo(screenId: id, frame: frame, uuid: "u\(id)", name: "s\(id)", role: .primary)
+        }
+        let size = CGSize(width: 400, height: 300)
+        let left = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let right = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let pair = [info(0, left), info(1, right)]
+
+        // alone: the bottom-right corner is free
+        let solo = [info(0, left)]
+        precondition(freeCorner(for: left, among: solo, windowSize: size) == (CGPoint(x: 999, y: 799), size))
+
+        // beside another screen: the bottom-right corner would spill onto it,
+        // so the window parks off the left edge instead
+        precondition(freeCorner(for: left, among: pair, windowSize: size) == (CGPoint(x: -399, y: 799), size))
+        precondition(freeCorner(for: right, among: pair, windowSize: size) == (CGPoint(x: 1999, y: 799), size))
+
+        // whatever freeCorner picks reads as parked, and a flush tile does not
+        let (origin, parkSize) = freeCorner(for: left, among: pair, windowSize: size)
+        precondition(isAlreadyParked(CGRect(origin: origin, size: parkSize), screens: pair))
+        precondition(!isAlreadyParked(CGRect(x: 0, y: 0, width: 500, height: 800), screens: pair), "half tile is not parked")
+        precondition(!isAlreadyParked(left, screens: pair), "full screen is not parked")
+
+        // boxed in on all four sides: falls back to a 2x2 sliver
+        let center = CGRect(x: 1000, y: 800, width: 1000, height: 800)
+        let boxed = [
+            info(0, center),
+            info(1, CGRect(x: 0, y: 800, width: 1000, height: 800)),
+            info(2, CGRect(x: 2000, y: 800, width: 1000, height: 800)),
+            info(3, CGRect(x: 1000, y: 0, width: 1000, height: 800)),
+            info(4, CGRect(x: 1000, y: 1600, width: 1000, height: 800)),
+        ]
+        precondition(freeCorner(for: center, among: boxed, windowSize: size).1 == CGSize(width: 2, height: 2))
+    }
+
+    // MARK: Parked window home
+
+    static func checkParkedHome() {
+        func info(_ id: Int, _ frame: CGRect) -> ScreenInfo {
+            ScreenInfo(screenId: id, frame: frame, uuid: "u\(id)", name: "s\(id)", role: .primary)
+        }
+        let screens = [info(0, CGRect(x: 0, y: 0, width: 1000, height: 800)),
+                       info(1, CGRect(x: 1000, y: 0, width: 1000, height: 800))]
+        // the corner parks chosen by freeCorner resolve back to their own screen
+        precondition(homeScreen(for: CGRect(x: 1999, y: 799, width: 400, height: 300), among: screens)?.screenId == 1)
+        precondition(homeScreen(for: CGRect(x: -399, y: 799, width: 400, height: 300), among: screens)?.screenId == 0)
+        precondition(homeScreen(for: CGRect(x: 5000, y: 5000, width: 10, height: 10), among: screens) != nil, "no overlap still yields a screen")
+        precondition(homeScreen(for: .zero, among: []) == nil)
+        precondition(centeredFrame(of: CGSize(width: 400, height: 300), on: CGRect(x: 0, y: 0, width: 1000, height: 800))
+            == CGRect(x: 300, y: 250, width: 400, height: 300))
+        precondition(centeredFrame(of: CGSize(width: 400, height: 300), on: CGRect(x: 1000, y: 0, width: 1000, height: 800))
+            == CGRect(x: 1300, y: 250, width: 400, height: 300))
     }
 }

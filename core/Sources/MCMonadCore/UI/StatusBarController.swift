@@ -4,7 +4,12 @@ import os
 /// The mcmonad-core menubar item.
 ///
 /// Displays:
-///   - A template icon (or workspace tag, set via setWorkspaceIndicator)
+///   - One small tag per connected screen, ordered left-to-right by
+///     physical position, showing that screen's current workspace —
+///     inspired by AeroSpace's menu bar icon. The active screen's tag
+///     is rendered as a filled pill; the others are plain text. Redrawn
+///     on every overlay snapshot and every screen-count change, so it
+///     always matches however many displays are attached right now.
 ///   - A dropdown menu rebuilt on every open from the cached overlay
 ///     snapshot pushed from Haskell, showing each visible workspace
 ///     with its windows indented underneath, then hidden workspaces,
@@ -48,38 +53,114 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     func setup() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = item.button {
-            let bundle = Bundle.main
-            if let iconPath = bundle.path(forResource: "MenuBarIcon", ofType: "png"),
-               let icon = NSImage(contentsOfFile: iconPath) {
-                icon.isTemplate = true
-                icon.size = NSSize(width: 18, height: 18)
-                button.image = icon
-            } else {
-                let execDir = ProcessInfo.processInfo.arguments[0]
-                let resourceDir = (execDir as NSString)
-                    .deletingLastPathComponent + "/../Resources"
-                if let icon = NSImage(contentsOfFile: resourceDir + "/MenuBarIcon.png") {
-                    icon.isTemplate = true
-                    icon.size = NSSize(width: 18, height: 18)
-                    button.image = icon
-                } else {
-                    button.title = "MC"
-                }
-            }
-        }
         menu.delegate = self
         menu.autoenablesItems = false
         item.menu = menu
         self.statusItem = item
+        refreshIcon()
     }
 
-    /// Set the leading workspace indicator next to the icon.
-    /// Mirrors the prior contract used by Haskell's
-    /// `SetWorkspaceIndicator` command.
-    func updateWorkspace(_ tag: String) {
-        statusItem?.button?.title = tag
+    /// Redraws the per-screen tag icon from the latest cached snapshot.
+    /// Call after every overlay-snapshot push and every screen-count
+    /// change (see StatusBarController wiring in Main.swift).
+    func refreshIcon() {
+        guard let button = statusItem?.button else { return }
+        let screens = snapshotProvider?()?.screens ?? []
+        guard !screens.isEmpty else {
+            button.image = Self.fallbackIcon()
+            button.title = ""
+            return
+        }
+        button.image = Self.makeScreenTagsIcon(screens: screens)
+        button.title = ""
     }
+
+    /// The old static icon, used only before Haskell's first snapshot
+    /// arrives (no per-screen data to draw yet).
+    private static func fallbackIcon() -> NSImage {
+        let bundle = Bundle.main
+        if let iconPath = bundle.path(forResource: "MenuBarIcon", ofType: "png"),
+           let icon = NSImage(contentsOfFile: iconPath) {
+            icon.isTemplate = true
+            icon.size = NSSize(width: 18, height: 18)
+            return icon
+        }
+        let execDir = ProcessInfo.processInfo.arguments[0]
+        let resourceDir = (execDir as NSString)
+            .deletingLastPathComponent + "/../Resources"
+        if let icon = NSImage(contentsOfFile: resourceDir + "/MenuBarIcon.png") {
+            icon.isTemplate = true
+            icon.size = NSSize(width: 18, height: 18)
+            return icon
+        }
+        // Nothing to load — a blank 1x1 template so the status item still
+        // occupies a slot (its title carries "MC" as a last resort).
+        let blank = NSImage(size: NSSize(width: 1, height: 1))
+        blank.isTemplate = true
+        return blank
+    }
+
+    /// One pill/tag per screen, left-to-right by physical position
+    /// (`frame.origin.x`), sized to the menu bar's ~18-22pt height and
+    /// widened dynamically to fit however many screens are attached.
+    ///
+    /// Template images are alpha-only masks — AppKit tints them per the
+    /// current light/dark menu bar, ignoring any RGB we draw. So the
+    /// active screen's highlight can't be a color: instead its pill is
+    /// filled opaque and its tag text is cut out of that fill with
+    /// `.destinationOut` (erasing alpha where the glyphs are), which
+    /// reads as light-text-on-a-solid-pill once tinted either way.
+    /// Inactive screens are just plain opaque text, no pill.
+    private static func makeScreenTagsIcon(screens: [OverlayScreenEntry]) -> NSImage {
+        let height: CGFloat = 18
+        let vPad: CGFloat = 1.5
+        let hPad: CGFloat = 4
+        let gap: CGFloat = 4
+        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        let textAttrs: [NSAttributedString.Key: Any] = [
+            .font: font, .foregroundColor: NSColor.black
+        ]
+
+        let ordered = screens.sorted { $0.frame.origin.x < $1.frame.origin.x }
+        let tags: [(text: NSAttributedString, size: NSSize, isActive: Bool)] = ordered.map { s in
+            let str = NSAttributedString(string: s.workspaceTag, attributes: textAttrs)
+            return (str, str.size(), s.isActive)
+        }
+        let pillWidths = tags.map { $0.size.width + hPad * 2 }
+        let totalWidth = pillWidths.reduce(0, +) + gap * CGFloat(max(0, tags.count - 1))
+        let size = NSSize(width: max(totalWidth, 1), height: height)
+
+        let image = NSImage(size: size, flipped: false) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            var x: CGFloat = 0
+            for (tag, width) in zip(tags, pillWidths) {
+                let pillRect = NSRect(x: x, y: vPad, width: width, height: height - vPad * 2)
+                let textOrigin = NSPoint(
+                    x: pillRect.midX - tag.size.width / 2,
+                    y: pillRect.midY - tag.size.height / 2
+                )
+                if tag.isActive {
+                    NSBezierPath(roundedRect: pillRect, xRadius: 3, yRadius: 3).fill()
+                    ctx.saveGState()
+                    ctx.setBlendMode(.destinationOut)
+                    tag.text.draw(at: textOrigin)
+                    ctx.restoreGState()
+                } else {
+                    tag.text.draw(at: textOrigin)
+                }
+                x += width + gap
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    /// Legacy hook for Haskell's `SetWorkspaceIndicator` command — kept
+    /// so that IPC path doesn't error, but superseded by the per-screen
+    /// icon above (which already shows every screen's tag), so this is
+    /// now a no-op.
+    func updateWorkspace(_ tag: String) {}
 
     // MARK: - NSMenuDelegate
 

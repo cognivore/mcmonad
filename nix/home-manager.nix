@@ -3,7 +3,7 @@ flake: { config, lib, pkgs, ... }:
 let
   cfg = config.services.mcmonad;
   flakePkgs = flake.packages.${pkgs.stdenv.hostPlatform.system};
-  app = flakePkgs.mcmonad-app;
+  app = cfg.package;
   homeDir = config.home.homeDirectory;
   # macOS TCC keys Accessibility entries by binary path + cdhash. Launching
   # directly from /nix/store/<hash>/... accumulates orphan rows in System
@@ -17,6 +17,24 @@ let
   # render. Nested inside MCMonad.app it was attributed to com.mcmonad.app (the
   # bash launcher → kTCCErrorDomain Code=5, no prompt). The launcher `open`s it.
   coreBundlePath = "${homeDir}/Applications/MCMonadCore.app";
+  configIsDir = cfg.config != null && builtins.readFileType cfg.config == "directory";
+  # mcmonad.hs itself: inline text, a single file, or the root of a directory
+  # (the directory as a whole is handled separately, below).
+  mcmonadHsFile =
+    if cfg.configFile != null then {text = cfg.configFile;}
+    else if cfg.config != null && !configIsDir then {source = cfg.config;}
+    else null;
+  # GHC always implicitly searches "." in addition to -i dirs, and macOS's
+  # case-insensitive filesystem would then make GHC mistake mcmonad.hs
+  # itself for a source file satisfying `import MCMonad` (the library). A
+  # bare -i clears that implicit "." before -imodules re-adds just the
+  # modules/ subdirectory of extra Haskell modules, if any — decided here
+  # at eval time (from the same directory home.file deploys byte-for-byte)
+  # rather than with a runtime [ -d ... ] test.
+  hasConfigModules =
+    configIsDir && builtins.pathExists "${cfg.config}/modules";
+  recompileGhcModulesFlag =
+    lib.optionalString hasConfigModules "-i -i${homeDir}/.config/mcmonad/modules";
 in
 {
   options.services.mcmonad = {
@@ -26,9 +44,10 @@ in
       type = lib.types.nullOr lib.types.lines;
       default = null;
       description = ''
-        Contents of ~/.config/mcmonad/mcmonad.hs — the Haskell configuration
-        file compiled by Mod-q. When set, home-manager manages this file
-        declaratively. When null, the file is unmanaged (user edits directly).
+        Contents of ~/.config/mcmonad/mcmonad.hs, given inline as a string —
+        managed declaratively. Mutually exclusive with `config`; use that
+        instead for a config split across multiple files. When both are
+        null, ~/.config/mcmonad is unmanaged (user edits directly).
       '';
       example = lib.literalExpression ''
         '''
@@ -54,11 +73,57 @@ in
       '';
       example = "Apple Development: you@example.com (TEAMID)";
     };
+
+    config = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Either a single mcmonad.hs file, or a directory containing one —
+        managed declaratively at ~/.config/mcmonad/. A directory may also
+        hold a modules/ subdirectory of extra .hs files that mcmonad.hs
+        imports as ordinary Haskell modules (modules/ is on GHC's search
+        path), so the config can be split across files without this module
+        needing to know their names. (modules/ has to sit apart from
+        mcmonad.hs itself: macOS's case-insensitive filesystem would
+        otherwise make GHC mistake mcmonad.hs for a source file satisfying
+        `import MCMonad`, the library.) Mutually exclusive with
+        `configFile`. When both are null, ~/.config/mcmonad is unmanaged
+        (user edits directly).
+      '';
+      example = lib.literalExpression "./mcmonad-config";
+    };
+
+    package = lib.mkPackageOption flakePkgs "mcmonad-app" { };
+
+    onRecompileFailure = lib.mkOption {
+      type = lib.types.enum [ "fallback" "fail" ];
+      default = "fallback";
+      description = ''
+        What home-manager activation does when recompiling mcmonad.hs
+        fails.
+
+        - "fallback": log a warning, delete the stale custom binary so
+          the launcher falls back to the bundled default config, and
+          let the switch succeed anyway.
+        - "fail": abort the home-manager switch immediately, so a
+          non-compiling mcmonad.hs is caught loudly instead of silently
+          falling back to defaults.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
-    home.file.".config/mcmonad/mcmonad.hs" = lib.mkIf (cfg.configFile != null) {
-      text = cfg.configFile;
+    assertions = [
+      {
+        assertion = cfg.configFile == null || cfg.config == null;
+        message = "services.mcmonad.configFile and services.mcmonad.config are mutually exclusive.";
+      }
+    ];
+
+    home.file.".config/mcmonad/mcmonad.hs" = lib.mkIf (mcmonadHsFile != null) mcmonadHsFile;
+    home.file.".config/mcmonad" = lib.mkIf configIsDir {
+      source = cfg.config;
+      recursive = true;
     };
 
     home.activation.installMcmonadApp =
@@ -129,7 +194,7 @@ in
       '';
 
     # Recompiling the user's config has to happen AFTER linkGeneration, not
-    # merely after writeBoundary. `services.mcmonad.configFile` is written
+    # merely after writeBoundary. `services.mcmonad.config` is written
     # through home.file, so ~/.config/mcmonad/mcmonad.hs only becomes a
     # symlink to the *new* generation once linkGeneration runs. Both entries
     # sit after writeBoundary, and home-manager is free to order them either
@@ -148,9 +213,10 @@ in
         # has ever pressed Mod-q: the launcher prefers the custom binary,
         # the custom binary speaks the old protocol, and the Haskell
         # process crash-loops on every new event the bundled core sends.
-        # On compile failure we delete the stale binary + sidecar so the
-        # launcher falls back to the bundled binary; activation does not
-        # abort — the user will see the failure on next login.
+        # On compile failure, services.mcmonad.onRecompileFailure decides
+        # whether activation aborts here or falls back to the bundled
+        # binary (deleting the stale custom one + its sidecar) and lets
+        # the switch succeed anyway.
         #
         # -fforce-recomp is load-bearing: when only the mcmonad *library*
         # store path changes (mcmonad.hs itself byte-identical, as with a
@@ -183,12 +249,17 @@ in
             # for the bundled GHC anyway, since GHC was rewritten to use
             # /usr/bin tools at bundle time.
             if env -u DEVELOPER_DIR -u SDKROOT \
-                    "$mcmonad_ghc" --make "$mcmonad_hs" -o "$mcmonad_bin" -fforce-recomp -v0 \
+                    "$mcmonad_ghc" --make "$mcmonad_hs" ${recompileGhcModulesFlag} -o "$mcmonad_bin" -fforce-recomp -v0 \
                 && "$mcmonad_bin" --protocol-version > "$mcmonad_bin.proto"; then
                 :
             else
-                echo "mcmonad: recompile failed during home-manager activation; removing stale custom binary so the launcher falls back to bundled" >&2
+                echo "mcmonad: recompile failed during home-manager activation" >&2
+                ${if cfg.onRecompileFailure == "fail" then ''
+                exit 1
+                '' else ''
+                echo "mcmonad: removing stale custom binary so the launcher falls back to bundled" >&2
                 rm -f "$mcmonad_bin" "$mcmonad_bin.proto"
+                ''}
             fi
         fi
 

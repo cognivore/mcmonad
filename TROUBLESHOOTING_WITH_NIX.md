@@ -20,10 +20,7 @@ mcmonad.url = "github:cognivore/mcmonad";
 # In your host config:
 services.mcmonad = {
   enable = true;
-  configFile = ''
-    import MCMonad
-    main = mcmonad defaultConfig
-  '';
+  config = ./mcmonad.hs; # or a directory containing it
 };
 ```
 

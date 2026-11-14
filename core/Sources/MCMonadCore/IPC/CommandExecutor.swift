@@ -91,6 +91,8 @@ final class CommandExecutor {
             onSetTimers?(timers)
         case .setOcrIndex(let on):
             onSetOcrIndex?(on)
+        case .ignoredAttributionReply(let screenFrame, let windowIds):
+            IgnoredAttributionWaiters.shared.deliver(screenFrame: screenFrame, windowIds: windowIds)
         }
     }
 
@@ -100,7 +102,7 @@ final class CommandExecutor {
         // Keep the legacy "CMD: set-frames count=N" line so prior log
         // analysis tools still grep cleanly. Detailed per-assignment
         // events come through FrameLog below.
-        fputs("CMD: set-frames count=\(frames.count)\n", stderr)
+        logStderr("CMD: set-frames count=\(frames.count)\n")
         FrameLog.emit(source: .cmdSetFramesBegin, extra: "count=\(frames.count)")
         let skylight = SkyLight.shared
 
@@ -119,16 +121,15 @@ final class CommandExecutor {
         // position (5128, 0) before this set-frames touches it, we'll
         // see it here — disambiguating "this set-frames bumped it"
         // from "it was pinned before we started".
+        var preMoveBounds: [UInt32: CGRect] = [:]
         for (a, _) in resolved {
             let tHash = TitleHash.hash(windowId: a.windowId, pid: a.pid)
             if let preBounds = skylight.getWindowBounds(a.windowId) {
+                preMoveBounds[a.windowId] = preBounds
                 FrameLog.emit(source: .preMove,
                               windowId: a.windowId, pid: a.pid, rect: preBounds,
                               tHash: tHash,
-                              extra: "want=(\(fmtCoord(a.frame.origin.x)),"
-                                   + "\(fmtCoord(a.frame.origin.y)),"
-                                   + "\(fmtCoord(a.frame.width)),"
-                                   + "\(fmtCoord(a.frame.height)))")
+                              extra: "want=\(fmtRect(a.frame))")
             } else {
                 FrameLog.emit(source: .preMove,
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
@@ -151,23 +152,19 @@ final class CommandExecutor {
         )
         defer { AXWindowService.restoreEnhancedUserInterface(suppressedEUI) }
 
-        skylight.disableUpdate()
-
-        // Phase 1: Set all sizes (prevents overlaps that clamp sizes)
-        for (a, ax) in resolved {
-            var size = CGSize(width: a.frame.width, height: a.frame.height)
-            if let v = AXValueCreate(.cgSize, &size) {
-                let err = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
-                FrameLog.emit(source: .cmdAxSize,
-                              windowId: a.windowId, pid: a.pid, rect: a.frame,
-                              tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
-                              result: err == .success ? "ok" : "err",
-                              extra: "phase=1 axStatus=\(err.rawValue)")
+        // Growing windows move then size; others size then move. macOS clamps
+        // size against the display the window is on when written.
+        var growing: Set<UInt32> = []
+        for (a, _) in resolved {
+            if let cur = preMoveBounds[a.windowId],
+               a.frame.width > cur.width + 0.5 || a.frame.height > cur.height + 0.5 {
+                growing.insert(a.windowId)
             }
         }
 
-        // Phase 2: Set all positions
-        for (a, ax) in resolved {
+        skylight.disableUpdate()
+
+        func writePosition(_ a: FrameAssignment, _ ax: AXUIElement, phase: Int) {
             var pos = CGPoint(x: a.frame.origin.x, y: a.frame.origin.y)
             if let v = AXValueCreate(.cgPoint, &pos) {
                 let err = AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, v)
@@ -175,12 +172,11 @@ final class CommandExecutor {
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
                               tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
-                              extra: "phase=2 axStatus=\(err.rawValue)")
+                              extra: "phase=\(phase) axStatus=\(err.rawValue)")
             }
         }
 
-        // Phase 3: Set sizes again (fix any clamped during moves)
-        for (a, ax) in resolved {
+        func writeSize(_ a: FrameAssignment, _ ax: AXUIElement, phase: Int) {
             var size = CGSize(width: a.frame.width, height: a.frame.height)
             if let v = AXValueCreate(.cgSize, &size) {
                 let err = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, v)
@@ -188,18 +184,46 @@ final class CommandExecutor {
                               windowId: a.windowId, pid: a.pid, rect: a.frame,
                               tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
-                              extra: "phase=3 axStatus=\(err.rawValue)")
+                              extra: "phase=\(phase) axStatus=\(err.rawValue)")
             }
         }
 
-        skylight.reenableUpdate()
-
-        // Phase 4: Raise visible windows (AXRaise only, no app activation —
-        // NSRunningApplication.activate() would bring ALL windows of that app
-        // to front, including hidden ones on other workspaces)
-        for (_, ax) in resolved {
-            AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
+        // Phase 1: first write per window (move if growing, else size).
+        for (a, ax) in resolved {
+            if growing.contains(a.windowId) {
+                writePosition(a, ax, phase: 1)
+            } else {
+                writeSize(a, ax, phase: 1)
+            }
         }
+
+        // Phase 2: second write per window (size if growing, else move).
+        for (a, ax) in resolved {
+            if growing.contains(a.windowId) {
+                writeSize(a, ax, phase: 2)
+            } else {
+                writePosition(a, ax, phase: 2)
+            }
+        }
+
+        // Phase 3: Set sizes again (fix any clamped during moves)
+        for (a, ax) in resolved {
+            writeSize(a, ax, phase: 3)
+        }
+
+        // Phase 4: order windows to the front via SkyLight, not AXRaise —
+        // AXRaise also shifts OS keyboard focus, which would steal focus
+        // across screens for windows unrelated to the actual focus change.
+        // Kept inside the disableUpdate bracket along with the position/size
+        // writes above: raising after reenableUpdate would let the window
+        // server composite and show the moved-but-not-yet-raised state as
+        // its own separate repaint, on top of whatever phase 1-3 already
+        // produced -- two visible updates where there should be one.
+        for (a, _) in resolved {
+            skylight.orderWindow(a.windowId, relativeTo: 0, order: .above)
+        }
+
+        skylight.reenableUpdate()
 
         // Phase 5: deterministic readback. Independent of the SkyLight
         // observer (which is coalesced and silenced for moves inside the
@@ -212,23 +236,21 @@ final class CommandExecutor {
                 let dy = actual.origin.y - a.frame.origin.y
                 let dw = actual.width    - a.frame.width
                 let dh = actual.height   - a.frame.height
-                // 1.5px tolerance — round-trip through CGFloat / AXValue
-                // can introduce sub-pixel rounding noise.
-                let obeyed = abs(dx) < 1.5 && abs(dy) < 1.5
-                          && abs(dw) < 1.5 && abs(dh) < 1.5
+                let obeyed = framesMatch(actual, a.frame)
                 FrameLog.emit(
                     source: .verified,
                     windowId: a.windowId, pid: a.pid, rect: actual,
                     tHash: tHash,
                     result: obeyed ? "obeyed" : "DEFIED",
-                    extra: "want=(\(fmtCoord(a.frame.origin.x)),"
-                         + "\(fmtCoord(a.frame.origin.y)),"
-                         + "\(fmtCoord(a.frame.width)),"
-                         + "\(fmtCoord(a.frame.height))) "
+                    extra: "want=\(fmtRect(a.frame)) "
                          + "delta=(\(fmtCoord(dx)),\(fmtCoord(dy)),"
                          + "\(fmtCoord(dw)),\(fmtCoord(dh)))"
                 )
                 if !obeyed {
+                    // Report only; the brain decides whether to re-send.
+                    socketServer.send(.windowFrameDefied(
+                        windowId: a.windowId, pid: a.pid,
+                        want: a.frame, frame: actual))
                     scheduleReverify(windowId: a.windowId, pid: a.pid,
                                      want: a.frame)
                 }
@@ -246,39 +268,47 @@ final class CommandExecutor {
         return s.hasSuffix(".0") ? String(s.dropLast(2)) : s
     }
 
+    private func fmtRect(_ r: CGRect) -> String {
+        "(\(fmtCoord(r.origin.x)),\(fmtCoord(r.origin.y)),"
+            + "\(fmtCoord(r.width)),\(fmtCoord(r.height)))"
+    }
+
+    /// Whether two frames agree within 1.5px per component — round-trip
+    /// through CGFloat / AXValue can introduce sub-pixel rounding noise.
+    private func framesMatch(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.origin.x - b.origin.x) < 1.5 && abs(a.origin.y - b.origin.y) < 1.5
+            && abs(a.width - b.width) < 1.5 && abs(a.height - b.height) < 1.5
+    }
+
     /// A DEFIED verdict from the synchronous phase-5 readback is a false
     /// positive for apps that apply AX geometry writes asynchronously
     /// (Gecko once its a11y engine has engaged — even with
     /// AXEnhancedUserInterface suppressed around the write, the app
     /// processes the queued setter on its own time). Re-read once after a
-    /// grace period and log the ground truth so DEFIED lines can be told
-    /// apart from genuinely refused moves without hand-correlating later
-    /// `observed` events. Observability only — the brain's declarative
-    /// re-assertion is the corrective path.
+    /// grace period and report the result to the brain the same way the
+    /// original readback was, whether or not it settled, so a repair gets
+    /// a guaranteed check even when no frame-change event arrives for it
+    /// in the meantime, and its outcome is never left unrecorded.
     private func scheduleReverify(windowId: UInt32, pid: Int32, want: CGRect) {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
             let tHash = TitleHash.hash(windowId: windowId, pid: pid)
-            let wantStr = "want=(\(fmtCoord(want.origin.x)),"
-                        + "\(fmtCoord(want.origin.y)),"
-                        + "\(fmtCoord(want.width)),"
-                        + "\(fmtCoord(want.height))) graceMs=500"
+            let wantStr = "want=\(fmtRect(want)) graceMs=500"
             guard let actual = SkyLight.shared.getWindowBounds(windowId) else {
                 FrameLog.emit(source: .reverified, windowId: windowId,
                               pid: pid, tHash: tHash, result: "no-bounds",
                               extra: wantStr)
                 return
             }
-            let obeyed = abs(actual.origin.x - want.origin.x) < 1.5
-                      && abs(actual.origin.y - want.origin.y) < 1.5
-                      && abs(actual.width - want.width) < 1.5
-                      && abs(actual.height - want.height) < 1.5
+            let obeyed = framesMatch(actual, want)
             FrameLog.emit(
                 source: .reverified,
                 windowId: windowId, pid: pid, rect: actual, tHash: tHash,
                 result: obeyed ? "obeyed-late" : "still-defied",
                 extra: wantStr
             )
+            socketServer.send(.windowFrameDefied(
+                windowId: windowId, pid: pid, want: want, frame: actual))
         }
     }
 
@@ -334,9 +364,9 @@ final class CommandExecutor {
                 let retry = windowInfos.isEmpty
                     && attempt <= Self.emptyEnumerationRetries
                 let verdict = retry ? "retry" : (windowInfos.isEmpty ? "empty" : "ok")
-                fputs("ENUM: attempt=\(attempt) skylight=\(seen) "
+                logStderr("ENUM: attempt=\(attempt) skylight=\(seen) "
                       + "ax-ok=\(windowInfos.count) ax-fail=\(seen - windowInfos.count) "
-                      + "result=\(verdict)\n", stderr)
+                      + "result=\(verdict)\n")
                 if retry {
                     try? await Task.sleep(nanoseconds: Self.emptyEnumerationRetryInterval)
                     continue
@@ -402,20 +432,37 @@ final class CommandExecutor {
     }
 
     private func executeHideWindows(_ windowIds: [UInt32]) {
-        fputs("CMD: hide-windows ids=\(windowIds)\n", stderr)
+        logStderr("CMD: hide-windows ids=\(windowIds)\n")
         guard !windowIds.isEmpty else { return }
 
         let allScreens = displayManager.currentScreens()
 
-        // Park each window 1px inside the bottom-right corner of the screen it
-        // is on, leaving only a ~1px sliver visible. The origin MUST stay
-        // inside the display union: a window placed *fully* off-screen gets
-        // yanked back on-screen by AppKit (a titled NSWindow "automatically
-        // constrains itself to the screen") — that was the "Photoshop ghost on
-        // an empty workspace" bug, caused by the old `screenMaxX + 100` target.
-        // The surviving sliver doubles as a manual drag-handle if the daemon
-        // dies. Mirrors AeroSpace's hideInCorner. SkyLight can't move other
-        // apps' windows (permission); AX can, since we hold Accessibility.
+        // Park each window 1px inside a corner of the screen it is on,
+        // leaving only a ~1px sliver visible. The origin MUST stay inside
+        // the display union: a window placed *fully* off-screen gets yanked
+        // back on-screen by AppKit (a titled NSWindow "automatically
+        // constrains itself to the screen") — that was the "Photoshop ghost
+        // on an empty workspace" bug, caused by the old `screenMaxX + 100`
+        // target. The surviving sliver doubles as a manual drag-handle if
+        // the daemon dies. Mirrors AeroSpace's hideInCorner. SkyLight can't
+        // move other apps' windows (permission); AX can, since we hold
+        // Accessibility.
+        //
+        // Which corner is picked is computed fresh every call (screens can
+        // be connected/disconnected at any time): a window keeps its full
+        // size while parked, so hanging it off an edge that another screen
+        // sits against would spill the window's entire body onto that
+        // neighbour — still fully covering its real content, and not
+        // actually hidden. `freeCorner` picks an edge with nothing beyond
+        // it, independently per axis, falling back to shrinking the parked
+        // size (rather than picking an edge that spills) only when a
+        // screen's arrangement leaves no free edge at all (e.g. a 2x2 grid).
+        //
+        // Batched the same way executeSetFrames batches its writes: without
+        // this bracket, the window server composites and redraws after each
+        // individual park move, so parking several windows for one switch
+        // shows as that many separate repaints instead of one.
+        SkyLight.shared.disableUpdate()
         for wid in windowIds {
             guard let snap = SkyLightQuery.queryWindow(wid) else {
                 FrameLog.emit(source: .cmdHideMove, windowId: wid, result: "no-snap")
@@ -426,31 +473,22 @@ final class CommandExecutor {
                               result: "no-screen")
                 continue
             }
-            let corner = CGPoint(x: screen.frame.maxX - 1, y: screen.frame.maxY - 1)
-            // Already parked: x pinned at a corner (macOS' titlebar clamp
-            // only pulls y back, so x is the discriminator). Skip the AX
-            // write — this makes hide re-assertion idempotent-cheap, and the
-            // brain leans on that by re-sending the full park list on every
-            // front-app change / drift report to heal the silent bulk
-            // un-park macOS performs on hidden windows during fullscreen
-            // Space transitions. Checked against EVERY screen's right edge,
-            // not the resolved `screen`: a parked frame hangs almost
-            // entirely off its own display, so on multi-monitor setups
-            // `screen(forFrame:)` resolves the neighbour and a
-            // single-screen check would re-park (and slowly migrate) the
-            // window on every re-assert.
-            //
-            // The right-edge test alone is NOT sufficient: on a horizontal
-            // multi-monitor layout the right screen's minX equals the left
-            // screen's maxX, so every ordinary window tiled on the right
-            // display sits at x >= (left screen's maxX) - 2 and would be
-            // mistaken for parked — leaving the second monitor's windows
-            // permanently unhideable. Pair it with the sliver test: a truly
-            // parked window shows at most a ~1px column on any display.
+            let (corner, size) = freeCorner(for: screen.frame, among: allScreens,
+                                             windowSize: snap.frame.size)
+            // Already parked: skip the AX write — this makes hide
+            // re-assertion idempotent-cheap, and the brain leans on that by
+            // re-sending the full park list on every front-app change /
+            // drift report to heal the silent bulk un-park macOS performs
+            // on hidden windows during fullscreen Space transitions.
+            // Checked against every screen, not just the resolved `screen`:
+            // a parked frame hangs almost entirely off its own display, so
+            // on multi-monitor setups `screen(forFrame:)` resolves the
+            // neighbour and a single-screen check would re-park (and
+            // slowly migrate) the window on every re-assert.
             if isAlreadyParked(snap.frame, screens: allScreens) {
                 continue
             }
-            let target = CGRect(origin: corner, size: snap.frame.size)
+            let target = CGRect(origin: corner, size: size)
             FrameLog.emit(source: .cmdHideMove,
                           windowId: wid, pid: snap.pid, rect: target,
                           tHash: TitleHash.hash(windowId: wid, pid: snap.pid),
@@ -467,29 +505,11 @@ final class CommandExecutor {
                 currentHint: snap.frame
             )
         }
+        SkyLight.shared.reenableUpdate()
     }
 
     private func executeShowWindows(_ windowIds: [UInt32]) {
-        fputs("CMD: show-windows ids=\(windowIds)\n", stderr)
+        logStderr("CMD: show-windows ids=\(windowIds)\n")
         // SetFrames follows immediately and repositions windows correctly.
     }
-}
-
-/// Is this frame already parked in some screen's bottom-right corner?
-///
-/// Two conditions, both required. The origin must be pinned at a screen's
-/// right edge (parks set x = maxX - 1; macOS' titlebar clamp only pulls y
-/// back on-screen, so x survives), AND the frame must show no more than a
-/// sliver on any display. The second half is what keeps adjacent monitors
-/// apart: on a side-by-side layout the right display's minX *is* the left
-/// display's maxX, so an ordinary window tiled at the right screen's left
-/// edge passes the edge test while still being fully visible.
-func isAlreadyParked(_ frame: CGRect, screens: [ScreenInfo]) -> Bool {
-    let atRightEdge = screens.contains { frame.origin.x >= $0.frame.maxX - 2 }
-    guard atRightEdge else { return false }
-    let widestExposure = screens
-        .map { $0.frame.intersection(frame) }
-        .map { $0.isNull ? 0 : $0.width }
-        .max() ?? 0
-    return widestExposure <= 2
 }

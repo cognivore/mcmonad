@@ -12,6 +12,8 @@ module MCMonad.Core
     , io, withConnection, withWindowSet
       -- * Re-exports for convenience
     , gets, modify, asks, MonadIO(..)
+      -- * Logging
+    , logTS
       -- * Window and screen types
     , WindowRef(..), ScreenId(..), ScreenDetail(..)
       -- * Screen roles and affinity rules (see "MCMonad.Affinity")
@@ -35,10 +37,12 @@ module MCMonad.Core
     , ChangeLayout(..)
       -- * Geometry
     , Rectangle(..)
+    , FrameRepair(..)
       -- * IPC connection (opaque)
     , Connection(..)
       -- * Affinity
     , updateAffinities
+    , visibleAffinities
       -- * Focus resolution
     , resolveFocusedWindow
     , resolveFrontApp
@@ -47,6 +51,9 @@ module MCMonad.Core
     , FocusIntent(..)
     , armingIntent
     , isFocusIntentTarget
+    , armKillChurnSuppression
+    , armEmptyWorkspaceGuard
+    , shouldSuppressFrontApp
     , isIntentTargetPid
     , isSettlingEcho
     , isSettlingPidEcho
@@ -70,14 +77,29 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
+import Data.Time.Format (formatTime, defaultTimeLocale)
+import Data.Time.LocalTime (getZonedTime)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word8, Word32)
 import GHC.Generics (Generic)
-import System.IO (Handle)
+import System.IO (Handle, hPutStrLn, stderr)
 import Text.Read (Lexeme(..), Read(..), ReadPrec, lexP, parens, (+++))
 import qualified XMonad.Core as XMonad
 import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayout(..))
 import qualified XMonad.StackSet as W
+
+-- ---------------------------------------------------------------------------
+-- Logging
+
+-- | Write a line to stderr prefixed with a millisecond timestamp. A
+-- drop-in replacement for @hPutStrLn stderr@ so log lines can be
+-- correlated with how much time actually passed between them, not just
+-- their relative order. Uses local time (not UTC) so these timestamps
+-- line up with mcmonad-core's, which are local via Swift's DateFormatter.
+logTS :: String -> IO ()
+logTS msg = do
+    t <- getZonedTime
+    hPutStrLn stderr (formatTime defaultTimeLocale "%H:%M:%S%3Q " t ++ msg)
 
 -- ---------------------------------------------------------------------------
 -- Window identifier for macOS
@@ -308,6 +330,17 @@ data Rectangle = Rectangle
     , rect_h :: !Double
     } deriving (Eq, Show, Read, Generic)
 
+-- | A window whose SetFrames readback found it off the frame we asked for.
+-- 'frAttempts' counts how many times the size has been re-sent for that
+-- layout decision, capped at 'MCMonad.Operations.maxRepairAttempts' so a
+-- window that permanently refuses the size eventually stops being retried.
+-- See 'MCMonad.Operations.repairFrame'.
+data FrameRepair = FrameRepair
+    { frPid      :: !Int32
+    , frWant     :: !Rectangle
+    , frAttempts :: !Int
+    } deriving (Show)
+
 instance FromJSON Rectangle where
     parseJSON = Aeson.withObject "Rectangle" $ \v ->
         Rectangle <$> v .: "x" <*> v .: "y" <*> v .: "w" <*> v .: "h"
@@ -463,6 +496,44 @@ data MState = MState
       -- ^ Whether to draw debug frame overlays. Off by default. Toggled
       -- by 'MCMonad.Debug.toggleDebugOverlays' (either from xmonad.hs
       -- or the menubar's "Debug frame overlays" item).
+    , frameRepairs     :: !(Map.Map Word32 FrameRepair)
+      -- ^ Windows the brain is watching for a size repair, keyed by
+      -- window id. Filled by 'MCMonad.IPC.WindowFrameDefied' readbacks,
+      -- re-checked on later frame changes, cleared on the next layout
+      -- decision for the window and on destroy.
+    , ignoredWindows   :: !(Set WindowRef)
+      -- ^ Windows the manage hook explicitly 'MCMonad.ManageHook.doIgnore'd:
+      -- present in 'windowMetadata' but deliberately absent from
+      -- 'windowset', since mcmonad never positions or tracks them.
+      -- Tracked separately so a query for "what's on this screen" (e.g.
+      -- a window switcher's per-screen filter) can still attribute them
+      -- to whichever screen they physically sit on — mcmonad-core
+      -- resolves their live AX frame on demand, since this state only
+      -- ever carries identity. Added in 'MCMonad.Operations.manage' \/
+      -- 'manageSilent' when the post-hook 'windowset' doesn't contain the
+      -- window; removed in 'MCMonad.Operations.unmanage'.
+    , nativeFloats     :: !(Set WindowRef)
+      -- ^ Windows placed via 'MCMonad.ManageHook.doFloatNative': real
+      -- 'windowset' \/ @W.floating@ members (so they get a home workspace
+      -- and park \/ show with it like any other managed window), but
+      -- 'MCMonad.Operations.resolveFloating' skips them when building
+      -- frame assignments, so mcmonad never writes a position or size for
+      -- one — unlike plain 'MCMonad.ManageHook.doFloat', which does.
+      -- Added by 'doFloatNative' itself; removed in
+      -- 'MCMonad.Operations.unmanage' alongside the normal
+      -- membership-gated cleanup, since these are ordinary members.
+    , nativeFloatRects :: !(Map.Map WindowRef Rectangle)
+      -- ^ Last known on-screen frame of each 'nativeFloats' window. Seeded
+      -- from 'MCMonad.IPC.wiFrame' when 'MCMonad.ManageHook.doFloatNative'
+      -- first manages it, then kept current from live
+      -- 'MCMonad.IPC.WindowFrameChanged' events while the window is mapped.
+      -- 'MCMonad.Operations.windows' never writes a frame for a native
+      -- float, so when one parks and later un-parks, the daemon's
+      -- \"ShowWindows\" is a no-op by design (it relies on the SetFrames
+      -- that normally follows) -- this cache is what that one-time restore
+      -- is sent from, instead of leaving the window stuck at the park
+      -- corner. Removed in 'MCMonad.Operations.unmanage' alongside
+      -- 'nativeFloats'.
     , lastSaveAt       :: !(Maybe UTCTime)
       -- ^ Wall clock of the most recent 'MCMonad.Operations.saveStateIO'
       -- call. The 'windows' transition skips its post-mutation save when
@@ -492,6 +563,40 @@ data MState = MState
       -- looping forever in a pathological case and lets user-initiated
       -- focus changes from outside mcmonad eventually take effect.
       -- See the 'FocusIntent' note at the end of this module.
+    , frontmostPid     :: !(Maybe Int32)
+      -- ^ The pid NSWorkspace\/SkyLight last reported as frontmost. Used
+      -- to tell a genuine app switch from AX re-announcing an app's
+      -- window that isn't actually in front (see 'FocusedWindowChanged'
+      -- in "MCMonad.Main").
+    , pendingFocusQuery :: !(Maybe (WindowRef -> M ()))
+      -- ^ Continuation for the next 'MCMonad.IPC.FocusedWindowQueryResponse'.
+      -- Set right before sending 'MCMonad.IPC.QueryFocusedWindow', run and
+      -- cleared by the response handler in "MCMonad.Main". Needed by
+      -- callers that want the window macOS actually has focused rather
+      -- than 'windowset', which omits 'MCMonad.ManageHook.doIgnore'd
+      -- windows entirely.
+    , suppressFrontAppUntil :: !(Maybe UTCTime)
+      -- ^ Set by 'MCMonad.Operations.kill' when closing a window leaves
+      -- its workspace empty: there is nothing left to explicitly focus
+      -- (see 'MCMonad.Operations.kill'), so macOS's own choice of what to
+      -- activate next (typically whatever app was active before the
+      -- closed window) must not be read as a deliberate app switch.
+      -- Consumed by the first 'FrontAppChanged' that arrives, whether or
+      -- not it is still within the deadline.
+    , emptyWorkspaceGuardUntil :: !(Maybe UTCTime)
+      -- ^ Set by 'MCMonad.Operations.windows' whenever a pass leaves the
+      -- current workspace empty (switching to one, or closing its last
+      -- window): spawning something there next can bounce
+      -- 'FrontAppChanged' through the previously frontmost app for a
+      -- stretch (observed anywhere from ~150ms to ~700ms) while the new
+      -- app's process hands off to its real one, and that bounce passes
+      -- 'MCMonad.Main.confirmFrontAppChange's AX check just as readily
+      -- as a genuine switch. Unlike 'suppressFrontAppUntil', not
+      -- consumed by the first 'FrontAppChanged' — a bounce can repeat —
+      -- cleared instead by whichever comes first: a 'WindowCreated' (the
+      -- thing being waited for has shown up) or a 'UserMouseDown' (an
+      -- actual physical click always wins), with the deadline itself
+      -- only a fallback cap.
     , unmanagedOrigin  :: !(Map.Map Int32 (String, UTCTime))
       -- ^ pid → (workspace tag, time) of the pid's most recently
       -- destroyed *last* window. Some apps (Gecko\/LibreWolf) destroy
@@ -600,12 +705,14 @@ withWindowSet f = gets windowset >>= f
 -- get their screen recorded; hidden workspaces retain their previous affinity.
 updateAffinities :: Ord i => W.StackSet i l a sid sd -> Map.Map i sid -> Map.Map i sid
 updateAffinities ws existing =
-    Map.union current existing
-  where
-    current = Map.fromList
-        [ (W.tag (W.workspace scr), W.screen scr)
-        | scr <- W.current ws : W.visible ws
-        ]
+    Map.union (visibleAffinities ws) existing
+
+-- | The screen each currently visible workspace is shown on.
+visibleAffinities :: Ord i => W.StackSet i l a sid sd -> Map.Map i sid
+visibleAffinities ws = Map.fromList
+    [ (W.tag (W.workspace scr), W.screen scr)
+    | scr <- W.current ws : W.visible ws
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Focus resolution
@@ -851,7 +958,41 @@ defaultFocusBudget = 4
 -- re-verify uses 500ms) while staying short enough that a deliberate
 -- keyboard app-switch a beat later is treated as genuine intent.
 settleGrace :: NominalDiffTime
-settleGrace = 1.0
+settleGrace = 0.6
+
+-- | How long a 'suppressFrontAppUntil' guard lasts. Comfortably covers
+-- the observed ~100ms gap between closing a window and macOS reporting
+-- its own choice of what to activate next, while staying short enough
+-- that a deliberate app switch shortly after closing the last window on
+-- a workspace is still treated as genuine intent.
+killChurnGrace :: NominalDiffTime
+killChurnGrace = 0.5
+
+-- | Fallback cap on an 'emptyWorkspaceGuardUntil' guard, for the rare
+-- case neither of its usual disarm triggers fires. Generous: a slow
+-- app launch's handoff bounce has been observed taking ~700ms on its
+-- own, well short of this.
+emptyWorkspaceSpawnGrace :: NominalDiffTime
+emptyWorkspaceSpawnGrace = 5
+
+-- | Deadline for a guard armed @grace@ seconds from now.
+armGuardUntil :: NominalDiffTime -> UTCTime -> UTCTime
+armGuardUntil grace now = addUTCTime grace now
+
+-- | Deadline for a fresh 'suppressFrontAppUntil' guard, armed now.
+armKillChurnSuppression :: UTCTime -> UTCTime
+armKillChurnSuppression = armGuardUntil killChurnGrace
+
+-- | Deadline for a fresh 'emptyWorkspaceGuardUntil' guard, armed now.
+armEmptyWorkspaceGuard :: UTCTime -> UTCTime
+armEmptyWorkspaceGuard = armGuardUntil emptyWorkspaceSpawnGrace
+
+-- | Should an incoming 'MCMonad.IPC.FrontAppChanged' be read as noise
+-- rather than genuine intent, per either 'suppressFrontAppUntil' or
+-- 'emptyWorkspaceGuardUntil'?
+shouldSuppressFrontApp :: UTCTime -> Maybe UTCTime -> Bool
+shouldSuppressFrontApp _   Nothing         = False
+shouldSuppressFrontApp now (Just deadline) = now <= deadline
 
 -- | Build a fresh intent from the focus 'MCMonad.Operations.windows'
 -- just committed, plus the set of windows it wrote frames for (for

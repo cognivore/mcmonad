@@ -6,7 +6,7 @@ mcmonad is configured the way xmonad is: you write Haskell in
 (it lives in `~/Applications` or `/Applications`). You do **not** need Nix,
 cabal, or a separately-installed GHC.
 
-> Using **home-manager**? Manage `services.mcmonad.configFile` declaratively
+> Using **home-manager**? Manage `services.mcmonad.config` declaratively
 > instead — these manual steps don't apply to you.
 
 ## Requirements

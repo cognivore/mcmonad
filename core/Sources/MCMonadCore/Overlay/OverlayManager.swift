@@ -27,6 +27,12 @@ final class OverlayManager {
     /// including when overlay is disabled.
     private(set) var cachedSnapshot: OverlaySnapshot?
 
+    /// Thread-safe mirror of `cachedSnapshot`, for readers that aren't
+    /// MainActor-isolated (e.g. `QueryServer`, which answers requests from
+    /// its own background thread and can't hop onto the main actor without
+    /// blocking on it).
+    let snapshotBox = SnapshotBox()
+
     /// Called when overlay enable state changes (toggled by the
     /// menubar's debug switch).
     var onUserToggledDebug: (() -> Void)?
@@ -66,9 +72,10 @@ final class OverlayManager {
         // this cache, so an empty list here explains an empty picker.
         let wc = snapshot.screens.reduce(0) { $0 + $1.windows.count }
             + snapshot.hiddenWorkspaces.reduce(0) { $0 + $1.windows.count }
-        fputs("OVERLAY: apply screens=\(snapshot.screens.count) "
-            + "hidden=\(snapshot.hiddenWorkspaces.count) windows=\(wc)\n", stderr)
+        logStderr("OVERLAY: apply screens=\(snapshot.screens.count) "
+            + "hidden=\(snapshot.hiddenWorkspaces.count) windows=\(wc)\n")
         onSnapshotApplied?(snapshot)
+        snapshotBox.set(snapshot)
         guard enabled else { return }
         redraw(snapshot)
     }
@@ -160,5 +167,24 @@ final class OverlayManager {
             win.orderOut(nil)
         }
         windows.removeAll()
+    }
+}
+
+/// Lock-protected holder for the latest `OverlaySnapshot`, readable from any
+/// thread without going through the `@MainActor`-isolated `OverlayManager`.
+final class SnapshotBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshot: OverlaySnapshot?
+
+    func set(_ snapshot: OverlaySnapshot) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.snapshot = snapshot
+    }
+
+    func get() -> OverlaySnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return snapshot
     }
 }

@@ -27,7 +27,7 @@ final class HotkeyManager {
         // Store self for the C callback
         HotkeyManager.shared = self
 
-        fputs("HotkeyManager: registering \(hotkeys.count) hotkeys\n", stderr)
+        logStderr("HotkeyManager: registering \(hotkeys.count) hotkeys\n")
 
         for spec in hotkeys {
             var hotkeyId = EventHotKeyID()
@@ -46,9 +46,9 @@ final class HotkeyManager {
 
             if status == noErr, let ref {
                 registeredRefs.append(ref)
-                fputs("  OK hotkey id=\(spec.id) keyCode=\(spec.keyCode) modifiers=\(spec.modifiers)\n", stderr)
+                logStderr("  OK hotkey id=\(spec.id) keyCode=\(spec.keyCode) modifiers=\(spec.modifiers)\n")
             } else {
-                fputs("  FAIL hotkey id=\(spec.id) keyCode=\(spec.keyCode) modifiers=\(spec.modifiers) status=\(status)\n", stderr)
+                logStderr("  FAIL hotkey id=\(spec.id) keyCode=\(spec.keyCode) modifiers=\(spec.modifiers) status=\(status)\n")
             }
         }
     }
@@ -112,7 +112,7 @@ private func hotkeyEventHandler(
     }
 
     let hotkeyIdValue = Int(hotkeyId.id)
-    fputs("HotkeyManager: pressed id=\(hotkeyIdValue)\n", stderr)
+    logStderr("HotkeyManager: pressed id=\(hotkeyIdValue)\n")
     DispatchQueue.main.async { @MainActor in
         HotkeyManager.shared?.onHotkeyPressed?(hotkeyIdValue)
     }

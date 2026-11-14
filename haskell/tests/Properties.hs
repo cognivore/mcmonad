@@ -5,15 +5,18 @@ import Test.QuickCheck
 import qualified XMonad.StackSet as W
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
-    , updateAffinities, resolveFocusedWindow, resolveFrontApp
+    , updateAffinities, visibleAffinities, resolveFocusedWindow, resolveFrontApp
     , FocusIntent(..), armingIntent, isFocusIntentTarget
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
     , withinSettleWindow, consumeIntent
-    , PendingWindow(..), Timer(..)
+    , armKillChurnSuppression, armEmptyWorkspaceGuard, shouldSuppressFrontApp
+    , PendingWindow(..), Timer(..), LayoutClass(..)
     )
-import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent)
+import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent, OverlayScreenEntry(..), OverlayIgnoredWindow(..), parseIgnoredFact)
+import MCMonad.Main (onHiddenWorkspace, shouldFollowIntoHidden, pairBurst)
 import MCMonad.Affinity
 import qualified Data.Aeson as Aeson
+import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Text as Text
 import MCMonad.Persistence
@@ -24,8 +27,14 @@ import MCMonad.Persistence
 import MCMonad.Operations
     ( frameAtParkCorner, reassignScreens
     , chooseOriginTag, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
+    , placeManaged, windowsToPark
+    , screenAt, rectOverlapArea, crossedScreenTag
+    , RepairStep(..), repairStep, maxRepairAttempts
+    , attributeIgnoredWindows
+    , replaceWindowIdentity
     )
 import MCMonad.Sway (viewOnScreen)
+import MCMonad.Layout (Full(..))
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -723,7 +732,7 @@ prop_isSettlingPidEcho_matches_and_rejects w otherPid =
 -- The settle window is what makes echo-suppression safe: a set member is
 -- suppressible at arming time, but NOT once the grace has elapsed — past
 -- the deadline the same window's event is a genuine later user switch and
--- must be free to move the current screen. (settleGrace is 1s.)
+-- must be free to move the current screen. (settleGrace is 0.6s.)
 prop_settle_window_bounds_suppression :: WindowRef -> Property
 prop_settle_window_bounds_suppression w =
     case armingIntent originBase (Set.singleton w) (Just w) of
@@ -731,6 +740,18 @@ prop_settle_window_bounds_suppression w =
         Just i  -> property $
             withinSettleWindow originBase i
             && not (withinSettleWindow (addUTCTime 2 originBase) i)
+
+-- settleGrace exists to cover the real macOS AX-settle burst (per
+-- CommandExecutor.swift's own DEFIED re-verify, ~500ms), not just an
+-- instant. An echo arriving comfortably inside that burst (0.4s in) must
+-- still read as suppressible, or a multi-screen layout pass — whose
+-- settling echoes take longer to all arrive — starts leaking late echoes
+-- through as spurious "genuine" focus switches.
+prop_settle_window_covers_real_burst :: WindowRef -> Property
+prop_settle_window_covers_real_burst w =
+    case armingIntent originBase (Set.singleton w) (Just w) of
+        Nothing -> property False
+        Just i  -> property $ withinSettleWindow (addUTCTime 0.4 originBase) i
 
 
 -- === PERSISTENCE ROUND-TRIP (MCMonad.Persistence) ===
@@ -1298,6 +1319,71 @@ prop_pruneReclaims_keeps_fresh ws =
   where
     m = mkReclaims [ (w, 0) | w <- ws ]
 
+-- === Destroy/create burst coalescing: in-place identity replace ===
+--
+-- replaceWindowIdentity rewrites one WindowRef to another everywhere it
+-- appears, in place, so a window that's inheriting another's position
+-- doesn't get reinserted at the top of the stack the way delete+insert
+-- would. These properties pin exactly that: identical shape, substituted
+-- identity, nothing else moved.
+
+prop_replaceWindowIdentity_noop_when_equal :: WindowRef -> TestStackSet -> Bool
+prop_replaceWindowIdentity_noop_when_equal w x =
+    replaceWindowIdentity w w x == x
+
+prop_replaceWindowIdentity_noop_when_absent :: WindowRef -> WindowRef -> TestStackSet -> Property
+prop_replaceWindowIdentity_noop_when_absent old new x =
+    not (W.member old x) ==> replaceWindowIdentity old new x == x
+
+-- | 'old' is drawn from the stack's own windows, not generated
+-- independently — 'WindowRef's Arbitrary range is wide enough that an
+-- independently-drawn 'old' almost never lands among a given
+-- 'TestStackSet's (narrower-range) windows, so a '==>' guard on
+-- membership would discard nearly every case instead of exercising it.
+withMember :: (WindowRef -> WindowRef -> TestStackSet -> Property) -> WindowRef -> TestStackSet -> Property
+withMember k new x =
+    not (null (W.allWindows x)) ==>
+        forAll (elements (W.allWindows x)) $ \old ->
+            old /= new && not (W.member new x) ==> k old new x
+
+prop_replaceWindowIdentity_invariant :: WindowRef -> TestStackSet -> Property
+prop_replaceWindowIdentity_invariant = withMember $ \old new x ->
+    property $ invariant (replaceWindowIdentity old new x)
+
+prop_replaceWindowIdentity_swaps_membership :: WindowRef -> TestStackSet -> Property
+prop_replaceWindowIdentity_swaps_membership = withMember $ \old new x ->
+    let x' = replaceWindowIdentity old new x
+    in property $ W.member new x' && not (W.member old x')
+
+prop_replaceWindowIdentity_preserves_count :: WindowRef -> TestStackSet -> Property
+prop_replaceWindowIdentity_preserves_count = withMember $ \old new x ->
+    property $ length (W.allWindows (replaceWindowIdentity old new x)) == length (W.allWindows x)
+
+-- | The real point of this function: every workspace's stack is
+-- substituted in place, not rebuilt — same positions, same up/down
+-- order, same focus, just with the old ref swapped for the new one.
+prop_replaceWindowIdentity_preserves_position :: WindowRef -> TestStackSet -> Property
+prop_replaceWindowIdentity_preserves_position = withMember $ \old new x ->
+    let x' = replaceWindowIdentity old new x
+    in stacksByTag x' === map (substStack old new) (stacksByTag x)
+  where
+    stacksByTag ss = [ (W.tag w, W.stack w) | w <- W.workspaces ss ]
+    substStack o n (tag, stk) = (tag, fmap (substWindows o n) stk)
+    substWindows o n stk = stk
+        { W.focus = sub o n (W.focus stk)
+        , W.up    = map (sub o n) (W.up stk)
+        , W.down  = map (sub o n) (W.down stk)
+        }
+    sub o n w = if w == o then n else w
+
+prop_replaceWindowIdentity_rekeys_floating :: WindowRef -> TestStackSet -> Property
+prop_replaceWindowIdentity_rekeys_floating = withMember $ \old new x ->
+    let rect = W.RationalRect 0.2 0.3 0.5 0.4
+        xFloat = x { W.floating = Map.insert old rect (W.floating x) }
+        x' = replaceWindowIdentity old new xFloat
+    in property $ Map.lookup new (W.floating x') == Just rect
+        && not (Map.member old (W.floating x'))
+
 -- Collect all properties
 
 -- === LAZY RESTORE: pending windows ===
@@ -1406,6 +1492,12 @@ prop_ocr_index_wire on =
         [ counterexample json (property ("\"cmd\":\"set-ocr-index\"" `L.isInfixOf` json))
         , counterexample json (property (("\"on\":" ++ (if on then "true" else "false")) `L.isInfixOf` json))
         ]
+
+-- The overlay screen entry carries its isActive flag on the wire
+prop_overlayScreen_wire_is_active :: Bool -> Property
+prop_overlayScreen_wire_is_active active =
+    let json = BL.unpack (Aeson.encode (OverlayScreenEntry 0 (Rectangle 0 0 1 1) "1" active []))
+    in counterexample json (property (("\"isActive\":" ++ (if active then "true" else "false")) `L.isInfixOf` json))
 
 -- ---------------------------------------------------------------------------
 -- Workspace → screen affinity
@@ -1581,6 +1673,254 @@ prop_decode_error_redacts_content content =
                          && "withheld for privacy" `L.isInfixOf` message
          Right _ -> False
 
+-- Full layout: only the focused window gets a rect
+prop_fullLayout_places_only_focused :: WindowRef -> [WindowRef] -> [WindowRef] -> ScreenDetail -> Bool
+prop_fullLayout_places_only_focused f up down (SD r) =
+    pureLayout Full r (W.Stack f up down) == [(f, r)]
+
+-- Destroy/recreate route wins over a pinning manage-hook transform
+prop_placeManaged_origin_beats_hook :: TestStackSet -> WindowRef -> Property
+prop_placeManaged_origin_beats_hook ss w =
+    not (W.member w ss) ==>
+    forAll (elements tags) $ \origin -> forAll (elements tags) $ \pin ->
+        W.findTag w (placeManaged w (Just origin) (W.shiftWin pin w) ss) == Just origin
+  where tags = map W.tag (W.workspaces ss)
+
+-- With no origin, the manage hook alone places a new window
+prop_placeManaged_no_origin_is_hook :: TestStackSet -> WindowRef -> Property
+prop_placeManaged_no_origin_is_hook ss w =
+    not (W.member w ss) ==>
+    forAll (elements tags) $ \pin ->
+        placeManaged w Nothing (W.shiftWin pin w) ss
+            == W.shiftWin pin w (W.insertUp w ss)
+  where tags = map W.tag (W.workspaces ss)
+
+-- An ignored window's identity is on the wire for the per-screen query
+prop_overlayIgnored_wire :: Word32 -> Int32 -> Property
+prop_overlayIgnored_wire wid pid =
+    let json = BL.unpack (Aeson.encode (OverlayIgnoredWindow wid pid))
+    in counterexample json $ property $
+        ("\"windowId\":" ++ show wid) `L.isInfixOf` json && ("\"pid\":" ++ show pid) `L.isInfixOf` json
+
+-- Parking after a pass: orphans always, leavers only when the visible set changed
+prop_windowsToPark_unchanged_parks_orphans :: [WindowRef] -> [WindowRef] -> Bool
+prop_windowsToPark_unchanged_parks_orphans leaving orphaned =
+    windowsToPark False leaving orphaned == orphaned
+
+prop_windowsToPark_changed_parks_both :: [WindowRef] -> [WindowRef] -> Bool
+prop_windowsToPark_changed_parks_both leaving orphaned =
+    windowsToPark True leaving orphaned == leaving ++ orphaned
+
+-- Same-pid destroy/create bursts: one of each pairs, in either arrival order
+prop_pairBurst_pairs_either_order :: TestStackSet -> Property
+prop_pairBurst_pairs_either_order ss =
+    not (null (W.allWindows ss)) ==>
+    forAll (elements (W.allWindows ss)) $ \old ->
+        let pid = wrPid old
+            newId = wrWindowId old + 100000
+            created = WindowCreated (mkWindowInfo newId pid)
+            destroyed = WindowDestroyed (wrWindowId old)
+            summary = fmap (\(o, wi, rest) -> (o, wiWindowId wi, null rest))
+        in conjoin
+            [ summary (pairBurst ss pid [created, destroyed]) === Just (old, newId, True)
+            , summary (pairBurst ss pid [destroyed, created]) === Just (old, newId, True)
+            ]
+
+-- A pairing needs exactly one create and one destroy for the pid
+prop_pairBurst_needs_both_halves :: TestStackSet -> Property
+prop_pairBurst_needs_both_halves ss =
+    not (null (W.allWindows ss)) ==>
+    forAll (elements (W.allWindows ss)) $ \old ->
+        let pid = wrPid old
+            newId = wrWindowId old + 100000
+            created = WindowCreated (mkWindowInfo newId pid)
+            destroyed = WindowDestroyed (wrWindowId old)
+            other = WindowCreated (mkWindowInfo (newId + 1) pid)
+        in conjoin
+            [ isNothing (pairBurst ss pid [created])
+            , isNothing (pairBurst ss pid [destroyed])
+            , isNothing (pairBurst ss pid [created, other, destroyed])
+            ]
+
+-- Events not belonging to the pairing are handed back, untouched
+prop_pairBurst_keeps_unrelated_events :: TestStackSet -> Property
+prop_pairBurst_keeps_unrelated_events ss =
+    not (null (W.allWindows ss)) ==>
+    forAll (elements (W.allWindows ss)) $ \old ->
+        let pid = wrPid old
+            newId = wrWindowId old + 100000
+            created = WindowCreated (mkWindowInfo newId pid)
+            destroyed = WindowDestroyed (wrWindowId old)
+            unrelated = WindowCreated (mkWindowInfo (newId + 1) (pid + 1))
+        in case pairBurst ss pid [created, unrelated, destroyed] of
+            Just (_, _, [WindowCreated wi]) -> wiPid wi == pid + 1
+            _ -> False
+
+-- A focused window is routed to a hidden workspace exactly when it lives on one
+prop_onHiddenWorkspace_matches_hidden_stacks :: TestStackSet -> WindowRef -> Bool
+prop_onHiddenWorkspace_matches_hidden_stacks ss w =
+    onHiddenWorkspace ss w == (w `elem` concatMap (W.integrate' . W.stack) (W.hidden ss))
+
+-- A hidden-workspace focus event is followed only when its app is also frontmost
+prop_shouldFollowIntoHidden_requires_both :: Bool -> Bool -> Bool
+prop_shouldFollowIntoHidden_requires_both onHidden isFrontmostApp =
+    shouldFollowIntoHidden onHidden isFrontmostApp == (onHidden && isFrontmostApp)
+
+-- No guard armed: never suppress
+prop_shouldSuppressFrontApp_unarmed :: Bool
+prop_shouldSuppressFrontApp_unarmed =
+    not (shouldSuppressFrontApp originBase Nothing)
+
+-- Still within the deadline (including exactly at it): suppress
+prop_shouldSuppressFrontApp_within_deadline :: NonNegative Int -> Property
+prop_shouldSuppressFrontApp_within_deadline (NonNegative ms) =
+    let deadline = armKillChurnSuppression originBase
+        graceMs = round (1000 * diffUTCTime deadline originBase) :: Int
+    in ms <= graceMs ==>
+        shouldSuppressFrontApp (addUTCTime (fromIntegral ms / 1000) originBase) (Just deadline)
+
+-- Past the deadline: never suppress, however long ago it was armed
+prop_shouldSuppressFrontApp_after_deadline :: Positive Int -> Bool
+prop_shouldSuppressFrontApp_after_deadline (Positive extraMs) =
+    let deadline = armKillChurnSuppression originBase
+        graceSpan = diffUTCTime deadline originBase
+        extra = fromIntegral extraMs / 1000
+    in not (shouldSuppressFrontApp (addUTCTime (graceSpan + extra) originBase) (Just deadline))
+
+-- Same deadline logic, armed for the empty-workspace guard instead: still
+-- within deadline suppresses, past it doesn't
+prop_armEmptyWorkspaceGuard_within_deadline :: NonNegative Int -> Property
+prop_armEmptyWorkspaceGuard_within_deadline (NonNegative ms) =
+    let deadline = armEmptyWorkspaceGuard originBase
+        graceMs = round (1000 * diffUTCTime deadline originBase) :: Int
+    in ms <= graceMs ==>
+        shouldSuppressFrontApp (addUTCTime (fromIntegral ms / 1000) originBase) (Just deadline)
+
+prop_armEmptyWorkspaceGuard_after_deadline :: Positive Int -> Bool
+prop_armEmptyWorkspaceGuard_after_deadline (Positive extraMs) =
+    let deadline = armEmptyWorkspaceGuard originBase
+        graceSpan = diffUTCTime deadline originBase
+        extra = fromIntegral extraMs / 1000
+    in not (shouldSuppressFrontApp (addUTCTime (graceSpan + extra) originBase) (Just deadline))
+
+-- Brain-side attribution of ignored windows to the queried screen
+prop_attributeIgnored_home_screen :: Bool
+prop_attributeIgnored_home_screen =
+    attributeIgnoredWindows ignored twoScreenSet rectA facts == [50]
+        && attributeIgnoredWindows ignored twoScreenSet rectB facts == [51]
+  where
+    rectA = screenRect (W.screenDetail (W.current twoScreenSet))
+    rectB = screenRect (W.screenDetail (head (W.visible twoScreenSet)))
+    ignored = Set.fromList [WindowRef 50 1, WindowRef 51 1, WindowRef 52 1]
+    facts =
+        [ (50, 1, Rectangle 100 100 200 200)          -- on the first screen
+        , (51, 1, Rectangle 3500 200 300 300)         -- on the second screen
+        , (52, 1, Rectangle 9000 9000 400 300)        -- parked: overlaps no screen
+        , (53, 1, Rectangle 100 100 200 200)          -- not ignored
+        ]
+
+-- The ignored-window fact survives its JSON form
+prop_ignoredFact_parses_back :: Word32 -> Int32 -> ScreenDetail -> Bool
+prop_ignoredFact_parses_back wid pid (SD r) =
+    let json = "{\"windowId\":" ++ show wid ++ ",\"pid\":" ++ show pid
+            ++ ",\"frame\":" ++ BL.unpack (Aeson.encode r) ++ "}"
+    in (Aeson.decode (BL.pack json) >>= parseMaybe parseIgnoredFact) == Just (wid, pid, r)
+
+-- The reply names the attributed ids under the echoed frame
+prop_ignoredAttributionReply_wire :: [Word32] -> ScreenDetail -> Property
+prop_ignoredAttributionReply_wire wids (SD r) =
+    let json = BL.unpack (Aeson.encode (IgnoredAttributionReply r wids))
+    in counterexample json $ property $
+        "\"cmd\":\"ignored-attribution-reply\"" `L.isInfixOf` json
+        && ("\"windowIds\":[" ++ L.intercalate "," (map show wids) ++ "]") `L.isInfixOf` json
+
+-- Overlap area of two rectangles
+prop_rectOverlapArea_symmetric :: ScreenDetail -> ScreenDetail -> Bool
+prop_rectOverlapArea_symmetric (SD a) (SD b) = rectOverlapArea a b == rectOverlapArea b a
+
+prop_rectOverlapArea_nonnegative :: ScreenDetail -> ScreenDetail -> Bool
+prop_rectOverlapArea_nonnegative (SD a) (SD b) = rectOverlapArea a b >= 0
+
+prop_rectOverlapArea_adjacent_is_zero :: ScreenDetail -> Bool
+prop_rectOverlapArea_adjacent_is_zero (SD a) =
+    rectOverlapArea a a { rect_x = rect_x a + rect_w a + 1 } == 0
+
+-- The landing screen is the one with the greatest overlap with the frame
+prop_screenAt_picks_max_overlap :: TestStackSet -> ScreenDetail -> Bool
+prop_screenAt_picks_max_overlap ss (SD r) =
+    let overlapWith scr = rectOverlapArea r (screenRect (W.screenDetail scr))
+        best = overlapWith (screenAt r ss)
+    in all (\scr -> overlapWith scr <= best) (W.current ss : W.visible ss)
+
+-- A window already on the screen a frame lands on is not reassigned. Only
+-- screens that overlap no other screen are used, since physical displays
+-- do not overlap.
+prop_crossedScreenTag_same_screen_is_nothing :: TestStackSet -> Property
+prop_crossedScreenTag_same_screen_is_nothing ss =
+    not (null onVisible) ==>
+    forAll (elements onVisible) $ \(w, scr) ->
+        crossedScreenTag w (screenRect (W.screenDetail scr)) ss == Nothing
+  where
+    allScreens = W.current ss : W.visible ss
+    onVisible =
+        [ (w, scr) | scr <- allScreens
+                   , let r = screenRect (W.screenDetail scr)
+                   , rect_w r > 0, rect_h r > 0
+                   , all (\o -> W.screen o == W.screen scr
+                              || rectOverlapArea r (screenRect (W.screenDetail o)) == 0)
+                         allScreens
+                   , w <- W.integrate' (W.stack (W.workspace scr)) ]
+
+-- A window that is not managed is never reassigned
+prop_crossedScreenTag_nonmember_is_nothing :: TestStackSet -> WindowRef -> Property
+prop_crossedScreenTag_nonmember_is_nothing ss w =
+    not (W.member w ss) ==>
+    forAll arbitrary $ \(SD r) -> crossedScreenTag w r ss == Nothing
+
+-- Dropping a managed window onto the other screen reassigns it to that screen's tag
+prop_crossedScreenTag_moves_to_other_screen :: Bool
+prop_crossedScreenTag_moves_to_other_screen =
+    let w = WindowRef 1 1
+        ss = W.insertUp w twoScreenSet
+        otherRect = screenRect (W.screenDetail (head (W.visible ss)))
+        ownRect = screenRect (W.screenDetail (W.current ss))
+    in crossedScreenTag w otherRect ss == Just "b"
+       && crossedScreenTag w ownRect ss == Nothing
+
+-- The saved affinity records only the workspaces currently on a screen
+prop_visibleAffinities_visible_only :: TestStackSet -> Bool
+prop_visibleAffinities_visible_only ss =
+    Map.keysSet aff == Set.fromList visibleTags
+  where
+    aff = visibleAffinities ss
+    visibleTags = map (W.tag . W.workspace) (W.current ss : W.visible ss)
+
+prop_visibleAffinities_fixture :: Bool
+prop_visibleAffinities_fixture =
+    visibleAffinities twoScreenSet == Map.fromList [("a", S 0), ("b", S 1)]
+
+-- Frame repair after a SetFrames readback
+-- An exact match settles the window, however many attempts preceded it
+prop_repairStep_exact_match_forgets :: ScreenDetail -> NonNegative Int -> Bool
+prop_repairStep_exact_match_forgets (SD w) (NonNegative attempts) =
+    repairStep w w attempts == RepairForget
+
+-- A position mismatch is actively re-sent, the same as a size mismatch --
+-- some apps refuse a cross-display position write outright, with no later
+-- event ever correcting it on their own, so it can't be left to settle by
+-- itself the way a size-only mismatch used to be
+prop_repairStep_position_mismatch_resends :: ScreenDetail -> Bool
+prop_repairStep_position_mismatch_resends (SD w) =
+    repairStep w w { rect_x = rect_x w + 10 } 0 == RepairResend
+
+-- A mismatch in either position or size is re-sent up to the attempt cap
+-- per layout decision, then left alone
+prop_repairStep_resends_until_cap :: ScreenDetail -> Bool
+prop_repairStep_resends_until_cap (SD w) =
+    let off = w { rect_w = rect_w w + 10 }
+    in all (\n -> repairStep w off n == RepairResend) [0 .. maxRepairAttempts - 1]
+        && repairStep w off maxRepairAttempts == RepairDone
+
 allProperties :: [(String, Property)]
 allProperties =
     [ ("affinity: pin falls back to primary", property prop_affinity_pin_falls_back_to_primary)
@@ -1600,6 +1940,8 @@ allProperties =
     , ("ocr-index wire format", property prop_ocr_index_wire)
     , ("event logs redact window and peer content", property prop_event_logs_redact_content)
     , ("decode errors redact payload and parser content", property prop_decode_error_redacts_content)
+    , ("overlay screen wire carries isActive", property prop_overlayScreen_wire_is_active)
+    , ("overlay ignored window wire carries identity", property prop_overlayIgnored_wire)
     , ("timer persistence + legacy snapshot", property prop_timer_persistence)
     , ("invariant",               property prop_invariant)
     , ("focusUp/focusDown",       property prop_focusUp_focusDown)
@@ -1678,6 +2020,7 @@ allProperties =
     , ("settling echo rejects an outsider window",     property prop_isSettlingEcho_rejects_outsider)
     , ("settling pid-echo matches and rejects",        property prop_isSettlingPidEcho_matches_and_rejects)
     , ("settle window bounds echo suppression",        property prop_settle_window_bounds_suppression)
+    , ("settle window covers the real macOS burst",    property prop_settle_window_covers_real_burst)
     -- Cross-restart identity matcher
     -- Persistence round-trip (WindowRef identity)
     , ("persistence: kept saved survives, stale dropped", property prop_persistence_round_trip)
@@ -1720,4 +2063,51 @@ allProperties =
     , ("reclaim: prune respects cap",                 property prop_pruneReclaims_respects_cap)
     , ("reclaim: prune drops expired",                property prop_pruneReclaims_drops_expired)
     , ("reclaim: prune keeps fresh entries",          property prop_pruneReclaims_keeps_fresh)
+
+    , ("Full layout places only the focused window",  property prop_fullLayout_places_only_focused)
+
+    , ("placeManaged: origin route beats pinning hook", property prop_placeManaged_origin_beats_hook)
+    , ("placeManaged: no origin defers to hook",        property prop_placeManaged_no_origin_is_hook)
+
+    , ("parking: unchanged set parks only orphans",     property prop_windowsToPark_unchanged_parks_orphans)
+    , ("parking: changed set parks leavers and orphans", property prop_windowsToPark_changed_parks_both)
+    -- Destroy/create burst coalescing: in-place identity replace
+    , ("replace identity: no-op when equal",          property prop_replaceWindowIdentity_noop_when_equal)
+    , ("replace identity: no-op when absent",         property prop_replaceWindowIdentity_noop_when_absent)
+    , ("replace identity: invariant",                 property prop_replaceWindowIdentity_invariant)
+    , ("replace identity: swaps membership",          property prop_replaceWindowIdentity_swaps_membership)
+    , ("replace identity: preserves window count",    property prop_replaceWindowIdentity_preserves_count)
+    , ("replace identity: preserves stack position",  property prop_replaceWindowIdentity_preserves_position)
+    , ("replace identity: rekeys floating entry",     property prop_replaceWindowIdentity_rekeys_floating)
+
+    , ("burst: destroy/create pair in either order",  property prop_pairBurst_pairs_either_order)
+    , ("burst: pairing needs both halves",            property prop_pairBurst_needs_both_halves)
+    , ("burst: unrelated events are kept",            property prop_pairBurst_keeps_unrelated_events)
+
+    , ("overlap area is symmetric",                   property prop_rectOverlapArea_symmetric)
+    , ("overlap area is non-negative",                property prop_rectOverlapArea_nonnegative)
+    , ("overlap area of adjacent rects is zero",      property prop_rectOverlapArea_adjacent_is_zero)
+    , ("screenAt picks the greatest overlap",         property prop_screenAt_picks_max_overlap)
+    , ("crossed: same screen is no reassignment",     property prop_crossedScreenTag_same_screen_is_nothing)
+    , ("crossed: unmanaged window is no reassignment", property prop_crossedScreenTag_nonmember_is_nothing)
+    , ("crossed: drop on other screen reassigns",     property prop_crossedScreenTag_moves_to_other_screen)
+
+    , ("saved affinity: visible workspaces only",     property prop_visibleAffinities_visible_only)
+    , ("saved affinity: two-screen fixture",          property prop_visibleAffinities_fixture)
+
+    , ("focus: hidden-workspace window is routed",    property prop_onHiddenWorkspace_matches_hidden_stacks)
+    , ("focus: hidden-workspace follow requires frontmost app", property prop_shouldFollowIntoHidden_requires_both)
+    , ("focus: kill-churn suppression unarmed never suppresses", property prop_shouldSuppressFrontApp_unarmed)
+    , ("focus: kill-churn suppression holds within deadline",    property prop_shouldSuppressFrontApp_within_deadline)
+    , ("focus: kill-churn suppression lapses after deadline",    property prop_shouldSuppressFrontApp_after_deadline)
+    , ("focus: empty-workspace guard holds within deadline",     property prop_armEmptyWorkspaceGuard_within_deadline)
+    , ("focus: empty-workspace guard lapses after deadline",     property prop_armEmptyWorkspaceGuard_after_deadline)
+
+    , ("ignored: attributed to nearest screen, parked excluded", property prop_attributeIgnored_home_screen)
+    , ("ignored: fact JSON parses back",              property prop_ignoredFact_parses_back)
+    , ("ignored: attribution reply wire format",      property prop_ignoredAttributionReply_wire)
+
+    , ("repair: exact match settles",                 property prop_repairStep_exact_match_forgets)
+    , ("repair: position mismatch is re-sent",        property prop_repairStep_position_mismatch_resends)
+    , ("repair: frame re-sent until the attempt cap",   property prop_repairStep_resends_until_cap)
     ]

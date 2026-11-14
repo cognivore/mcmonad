@@ -9,6 +9,7 @@ private let logger = Logger(subsystem: "com.mcmonad.core", category: "Main")
 final class EventBridge: SkyLightEventDelegate {
     let socketServer: SocketServer
     let focusTracker: AXFocusTracker
+    let displayManager: DisplayManager
     /// Window IDs we have reported as created but not yet destroyed.
     private var managedWindowIds: Set<UInt32> = []
     /// Reverse map for destroy/close events (which only carry wid).
@@ -65,9 +66,10 @@ final class EventBridge: SkyLightEventDelegate {
         "com.apple.notificationcenterui",
     ]
 
-    init(socketServer: SocketServer, focusTracker: AXFocusTracker) {
+    init(socketServer: SocketServer, focusTracker: AXFocusTracker, displayManager: DisplayManager) {
         self.socketServer = socketServer
         self.focusTracker = focusTracker
+        self.displayManager = displayManager
     }
 
     /// Bootstrap entry for windows that already existed when mcmonad-core
@@ -84,6 +86,7 @@ final class EventBridge: SkyLightEventDelegate {
     /// Register a managed window. Starts AX focus tracking for the PID on
     /// the first window of that PID.
     private func addManagedWindow(windowId: UInt32, pid: pid_t) {
+        logStderr("DEBUG: addManagedWindow wid=\(windowId) pid=\(pid) alreadyIn=\(managedWindowIds.contains(windowId)) setSizeBefore=\(managedWindowIds.count)\n")
         managedWindowIds.insert(windowId)
         windowIdToPid[windowId] = pid
         let wasEmpty = (pidWindowIds[pid]?.isEmpty ?? true)
@@ -96,6 +99,7 @@ final class EventBridge: SkyLightEventDelegate {
     /// Unregister a managed window. Stops AX focus tracking for the PID
     /// once the last window of that PID is gone.
     private func removeManagedWindow(windowId: UInt32) {
+        logStderr("DEBUG: removeManagedWindow wid=\(windowId) wasIn=\(managedWindowIds.contains(windowId)) setSizeBefore=\(managedWindowIds.count)\n")
         managedWindowIds.remove(windowId)
         guard let pid = windowIdToPid.removeValue(forKey: windowId) else { return }
         if var wids = pidWindowIds[pid] {
@@ -149,6 +153,7 @@ final class EventBridge: SkyLightEventDelegate {
     ///     window always crosses the threshold. `windowExists` was too
     ///     permissive on its own; this is the missing upper bound.
     func validateWindows() {
+        let screens = displayManager.currentScreens()
         // Snapshot: `retire` mutates `managedWindowIds`.
         for wid in Array(managedWindowIds) {
             if !SkyLightQuery.windowExists(wid) {
@@ -157,6 +162,21 @@ final class EventBridge: SkyLightEventDelegate {
             }
             // Present in the server. Is it still a manageable window?
             if SkyLightQuery.queryWindow(wid) != nil {
+                ineligibleStreak.removeValue(forKey: wid)
+                continue
+            }
+            // queryWindow's eligibility filter (visible attribute / tag
+            // bits) can transiently fail for a window mcmonad has parked
+            // off-screen to simulate a hidden workspace — an unrelated
+            // app's own hide/show or Space churn can knock SkyLight's
+            // bookkeeping around enough to do this for several seconds.
+            // A parked window is never a mystery (mcmonad put it exactly
+            // there), so confirm via the live AX frame — same ground
+            // truth parking itself writes to, per restoreAllParkedWindows
+            // — before trusting queryWindow's verdict.
+            if let pid = windowIdToPid[wid],
+               let frame = AXWindowService.readFrame(windowId: wid, pid: pid),
+               isAlreadyParked(frame, screens: screens) {
                 ineligibleStreak.removeValue(forKey: wid)
                 continue
             }
@@ -169,6 +189,16 @@ final class EventBridge: SkyLightEventDelegate {
         }
     }
 
+    /// A destroy/close is only spurious if the window still exists AND its
+    /// owning app still lists it via AX — `windowExists` alone can stay
+    /// true for a window an app has already swapped out internally,
+    /// leaving a dead id as a phantom layout slot for seconds otherwise.
+    private func isSpuriousDestroy(_ windowId: UInt32, stillExists: Bool) -> Bool {
+        guard stillExists else { return false }
+        guard let pid = windowIdToPid[windowId] else { return false }
+        return AXWindowService.findAXWindow(windowId: windowId, pid: pid) != nil
+    }
+
     /// Retract a managed window from the brain and clear its bookkeeping.
     private func retire(_ wid: UInt32, reason: String) {
         let pid = windowIdToPid[wid].map { String($0) } ?? "-"
@@ -176,7 +206,7 @@ final class EventBridge: SkyLightEventDelegate {
         rejectedWindowIds.removeValue(forKey: wid)
         ineligibleStreak.removeValue(forKey: wid)
         socketServer.send(.windowDestroyed(windowId: wid))
-        fputs("RECONCILE: retire wid=\(wid) pid=\(pid) reason=\(reason)\n", stderr)
+        logStderr("RECONCILE: retire wid=\(wid) pid=\(pid) reason=\(reason)\n")
     }
 
     /// Report any manageable window the brain has never heard about.
@@ -237,10 +267,9 @@ final class EventBridge: SkyLightEventDelegate {
         if viaSweep {
             // Should be rare. A run of these means windows are being lost
             // somewhere upstream and the sweep is papering over it.
-            fputs(
+            logStderr(
                 "RECONCILE: adopt wid=\(snap.windowId) pid=\(snap.pid) "
-                    + "tHash=\(TitleHash.hash(windowId: snap.windowId, pid: snap.pid))\n",
-                stderr
+                    + "tHash=\(TitleHash.hash(windowId: snap.windowId, pid: snap.pid))\n"
             )
         }
     }
@@ -263,12 +292,36 @@ final class EventBridge: SkyLightEventDelegate {
     ) {
         switch event {
         case .created(let windowId, _):
-            // Query SkyLight for the snapshot, then enrich with AX
+            // A created notification can be spurious — SkyLight fires one
+            // for a window that's already managed, most commonly around a
+            // cross-screen AX move. Re-adopting it would re-run the manage
+            // hook and a full layout pass for a window the brain already
+            // knows about, so a window already in `managedWindowIds` is
+            // left alone.
+            guard !managedWindowIds.contains(windowId) else {
+                logStderr("DEBUG: skyLightEvent .created wid=\(windowId) ignored (already managed)\n")
+                break
+            }
             if let snap = SkyLightQuery.queryWindow(windowId) {
                 adoptWindow(snap)
             }
 
-        case .destroyed(let windowId, _):
+        case .destroyed(let windowId, let spaceId):
+            let stillExists = SkyLightQuery.windowExists(windowId)
+            logStderr("DEBUG: skyLightEvent .destroyed wid=\(windowId) spaceId=\(spaceId) wasManaged=\(managedWindowIds.contains(windowId)) stillExists=\(stillExists)\n")
+            // A destroy notification can be spurious — SkyLight fires one
+            // for a window that's still alive, most commonly around a
+            // cross-screen AX move. Trusting it blindly means unmanaging a
+            // live window and telling the brain it's gone, which the
+            // reconcile sweep then "fixes" a couple seconds later by
+            // re-adopting it as brand new — sending it through the manage
+            // hook and a full layout pass again, which is what actually
+            // causes focus to jump. Verify liveness first, the same way
+            // `validateWindows` already does for its own check.
+            guard !isSpuriousDestroy(windowId, stillExists: stillExists) else {
+                logStderr("DEBUG: skyLightEvent .destroyed wid=\(windowId) ignored (spurious, still exists)\n")
+                break
+            }
             removeManagedWindow(windowId: windowId)
             rejectedWindowIds.removeValue(forKey: windowId)
             ineligibleStreak.removeValue(forKey: windowId)
@@ -276,6 +329,12 @@ final class EventBridge: SkyLightEventDelegate {
             socketServer.send(.windowDestroyed(windowId: windowId))
 
         case .closed(let windowId):
+            let stillExists = SkyLightQuery.windowExists(windowId)
+            logStderr("DEBUG: skyLightEvent .closed wid=\(windowId) wasManaged=\(managedWindowIds.contains(windowId)) stillExists=\(stillExists)\n")
+            guard !isSpuriousDestroy(windowId, stillExists: stillExists) else {
+                logStderr("DEBUG: skyLightEvent .closed wid=\(windowId) ignored (spurious, still exists)\n")
+                break
+            }
             removeManagedWindow(windowId: windowId)
             rejectedWindowIds.removeValue(forKey: windowId)
             ineligibleStreak.removeValue(forKey: windowId)
@@ -315,12 +374,74 @@ final class EventBridge: SkyLightEventDelegate {
             TitleHash.invalidate(windowId: windowId)
         }
     }
+
+    /// Centers every managed window on its screen. mcmonad has no macOS
+    /// Space to fall back on for hidden workspaces — they're simulated by
+    /// parking windows almost entirely off-screen (see
+    /// 'executeHideWindows') — so unlike AeroSpace, which parks the same
+    /// way but restores on quit, killing mcmonad with no equivalent
+    /// cleanup leaves every hidden window stuck off-screen forever.
+    ///
+    /// Deliberately unconditional, rather than only restoring windows
+    /// detected as parked: a parked frame drifts away from its exact
+    /// corner between re-asserts (AppKit nudges a mostly-off-screen
+    /// window back on-screen on its own; see the comment on
+    /// 'executeHideWindows'), so a tight "is this parked" geometry check
+    /// misses drifted windows. Recentering an already-visible window too
+    /// is harmless here: the process is exiting either way, so mcmonad
+    /// is giving up layout control of every window at once, same as
+    /// AeroSpace's own termination handler does.
+    ///
+    /// Exception to Rule 1 (no window-placement decisions in core): this is
+    /// an exit-time mitigation. It runs after mcmonad has stopped taking
+    /// layout actions, so the brain is not involved and no frames are sent
+    /// to it for this purpose.
+    func restoreAllParkedWindows(displayManager: DisplayManager) {
+        let screens = displayManager.currentScreens()
+        guard !screens.isEmpty else { return }
+        for wid in managedWindowIds {
+            // SkyLightQuery's cached frame can lag behind an AX-only move
+            // (parking is done via AX, which SkyLight doesn't resync on) —
+            // read the live AX frame instead, same ground truth parking
+            // itself writes to.
+            guard let pid = windowIdToPid[wid],
+                  let frame = AXWindowService.readFrame(windowId: wid, pid: pid),
+                  let home = homeScreen(for: frame, among: screens)
+            else { continue }
+            AXWindowService.setFrame(
+                centeredFrame(of: frame.size, on: home.frame),
+                windowId: wid,
+                pid: pid,
+                currentHint: frame
+            )
+        }
+    }
+}
+
+/// Set right before the process exits — see 'installTerminationHandler'.
+@MainActor private var terminationCleanup: (() -> Void)?
+
+/// Installs a SIGTERM/SIGINT handler that restores parked windows before
+/// the process actually exits (mirrors AeroSpace's own termination
+/// handler). SIGKILL can't be caught, so a hard kill still loses the
+/// cleanup — only a cooperative stop (e.g. `launchctl stop`, plain `kill`)
+/// is covered.
+private func installTerminationHandler() {
+    let handle: sig_t = { sig in
+        Task { @MainActor in
+            terminationCleanup?()
+            exit(sig)
+        }
+    }
+    signal(SIGTERM, handle)
+    signal(SIGINT, handle)
 }
 
 @main
 struct MCMonadCoreApp {
     static func main() {
         logger.info("mcmonad-core starting")
+        installTerminationHandler()
 
         // 1. Check / prompt accessibility permission.
         // Remember what the executable looked like at launch, so a later
@@ -390,6 +511,8 @@ struct MCMonadCoreApp {
 
         // Create SocketServer + CommandExecutor
         let socketServer = SocketServer()
+        let queryServer = QueryServer(snapshotBox: overlayManager.snapshotBox, socketServer: socketServer)
+        queryServer.start()
         let executor = CommandExecutor(
             hotkeyManager: hotkeyManager,
             displayManager: displayManager,
@@ -418,9 +541,10 @@ struct MCMonadCoreApp {
         spotlight.whatsUpCache = whatsUpCache
         statusBar.whatsUpMonitoringEnabled = { [weak whatsUpCache] in whatsUpCache?.isEnabled ?? false }
         statusBar.onSetWhatsUpMonitoring = { [weak whatsUpCache] in whatsUpCache?.setEnabled($0) }
-        overlayManager.onSnapshotApplied = { [weak screenIndex, weak whatsUpCache] snapshot in
+        overlayManager.onSnapshotApplied = { [weak screenIndex, weak whatsUpCache, weak statusBar] snapshot in
             screenIndex?.noteSnapshot(snapshot)
             whatsUpCache?.noteSnapshot(snapshot)
+            statusBar?.refreshIcon()
         }
         screenIndex.onUpdated = { [weak spotlight, weak whatsUpCache] in
             spotlight?.screenIndexUpdated()
@@ -551,6 +675,10 @@ struct MCMonadCoreApp {
             executor.execute(command)
         }
 
+        // Public socket for external apps (e.g. alt-tab) to request window focus.
+        // Accepts {"cmd":"focus-window","windowId":N,"pid":P} and injects it as a
+        // menu-focus-window event so the Haskell brain handles it through its normal
+        // focus path (workspace switch + unpark + focusIntent armed).
         // Wire AXFocusTracker — gives us per-window focus events from AX,
         // which carry the actual focused windowId (unlike SkyLight 1508 and
         // NSWorkspace activation, which only know the app PID). Without
@@ -562,15 +690,22 @@ struct MCMonadCoreApp {
             FocusLog.emit(source: .emitFocusedWindowChanged,
                           windowId: windowId, pid: pid,
                           extra: "via=axFocusedWindowChanged")
+            // The brain decides whether the window lives on a hidden workspace
+            // and switches to it; Swift only reports the AX focus event.
             socketServer?.send(.focusedWindowChanged(windowId: windowId, pid: pid))
             // Recency for the launcher's lists.
             spotlight?.recentUse.touch(RecentUse.window(windowId))
         }
 
         // Wire SkyLightEventObserver (singleton, delegate-based) to socket
-        let eventBridge = EventBridge(socketServer: socketServer, focusTracker: focusTracker)
+        let eventBridge = EventBridge(socketServer: socketServer, focusTracker: focusTracker, displayManager: displayManager)
         let eventObserver = SkyLightEventObserver.shared
         eventObserver.delegate = eventBridge
+
+        terminationCleanup = { [weak eventBridge, weak displayManager] in
+            guard let eventBridge, let displayManager else { return }
+            eventBridge.restoreAllParkedWindows(displayManager: displayManager)
+        }
 
         // Bootstrap existing-at-startup windows into the event bridge so
         // their pids enrol AXFocusTracker. SkyLight 'created' only fires
@@ -589,8 +724,12 @@ struct MCMonadCoreApp {
         }
 
         // Wire display change callbacks to socket events
-        displayManager.onScreensChanged = { screens in
+        displayManager.onScreensChanged = { [weak statusBar] screens in
             socketServer.send(.screensChanged(screens: screens))
+            // The connected-screen count just changed; redraw with
+            // whatever snapshot is cached now (Haskell's own screens-
+            // changed-triggered snapshot will correct it moments later).
+            statusBar?.refreshIcon()
         }
         displayManager.startObserving()
 
@@ -663,12 +802,12 @@ struct MCMonadCoreApp {
 
         logger.info("mcmonad-core fully initialized")
         for line in PermissionAudit.take() {
-            fputs("PERMS: \(line.label)=\(line.value)\n", stderr)
+            logStderr("PERMS: \(line.label)=\(line.value)\n")
         }
 
         // Keep references alive for the lifetime of the process
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
-                      socketServer, executor, eventBridge, dragHandler,
+                      socketServer, queryServer, executor, eventBridge, dragHandler,
                       mouseDownMonitor, spotlight, timerController, screenIndex,
                       whatsUpCache)
     }
@@ -774,7 +913,7 @@ struct MCMonadCoreApp {
     private static func showNonFatalAlert(title: String, body: String) {
         let msg = "\(title)\n\(body)"
         logger.fault("\(msg, privacy: .public)")
-        fputs("mcmonad-core: \(msg)\n", stderr)
+        logStderr("mcmonad-core: \(msg)\n")
 
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -803,7 +942,7 @@ struct MCMonadCoreApp {
     ) -> Never {
         let stderrMsg = "\(title)\n\(body)"
         logger.fault("\(stderrMsg, privacy: .public)")
-        fputs("mcmonad-core: \(stderrMsg)\n", stderr)
+        logStderr("mcmonad-core: \(stderrMsg)\n")
 
         // NSApp/NSAlert are MainActor-isolated. main() is the program
         // entry point, so we are on the main thread, but the compiler

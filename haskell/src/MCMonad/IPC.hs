@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module MCMonad.IPC
     ( -- * Connection
@@ -11,6 +12,7 @@ module MCMonad.IPC
     , readEvent
     , decodeEvent
     , eventLogSummary
+    , drainReadyEvents
       -- * Command types (Haskell -> Swift)
     , Command(..)
     , FrameAssignment(..)
@@ -19,9 +21,11 @@ module MCMonad.IPC
     , OverlaySnapshot(..)
     , OverlayScreenEntry(..)
     , OverlayHiddenWorkspace(..)
+    , OverlayIgnoredWindow(..)
     , OverlayWindowEntry(..)
       -- * Event types (Swift -> Haskell)
     , Event(..)
+    , parseIgnoredFact
     , WindowInfo(..)
     , ScreenInfo(..)
       -- * Metadata helpers
@@ -46,9 +50,9 @@ import GHC.Generics (Generic)
 import Network.Socket
 import System.Directory (getHomeDirectory)
 import System.FilePath ((</>))
-import System.IO (hSetBuffering, BufferMode(..), hFlush, hPutStrLn, IOMode(..), stderr)
+import System.IO (hSetBuffering, BufferMode(..), hFlush, hReady, IOMode(..))
 
-import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..), ScreenRole, parseRole)
+import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..), ScreenRole, parseRole, logTS)
 
 -- ---------------------------------------------------------------------------
 -- Protocol version
@@ -63,7 +67,7 @@ import MCMonad.Core (Connection(..), Rectangle(..), WindowMetadata(..), Timer(..
 -- guard prevents the crash-loop that happens when a Mod-q-compiled
 -- binary lingers across an mcmonad upgrade and speaks the old protocol.
 protocolVersion :: Int
-protocolVersion = 12
+protocolVersion = 14
 
 -- ---------------------------------------------------------------------------
 -- Commands (Haskell -> Swift)
@@ -85,12 +89,13 @@ data Command
     | QueryFocusedWindow
       -- ^ Ask the daemon which window macOS currently considers focused
       -- (the frontmost app's AX focused window). Answered asynchronously
-      -- with a 'FocusedWindowQueryResponse' event. Used by the
-      -- "jump to the active window's workspace" hotkey: after a Dock
-      -- click activates an app whose window lives on an off-screen
-      -- workspace, mcmonad's StackSet focus has not followed (the
-      -- resolve* helpers only act on the current workspace), so we have
-      -- to ask macOS where focus actually is.
+      -- with a 'FocusedWindowQueryResponse' event. Used whenever a caller
+      -- needs the real focused window rather than mcmonad's own
+      -- 'MCMonad.Core.MState.windowset' -- e.g. the "jump to the active
+      -- window's workspace" hotkey (StackSet focus does not follow a Dock
+      -- click into an off-screen workspace) and closing the focused
+      -- window (a 'MCMonad.ManageHook.doIgnore'd window is never a
+      -- 'windowset' member at all).
     | ShowWindowPicker
       -- ^ Ask the daemon to open the fuzzy window-search dropdown. The
       -- daemon owns the UI; selection comes back as a 'MenuFocusWindow'
@@ -106,6 +111,10 @@ data Command
       -- ^ Turn the daemon's in-memory OCR index of displayed windows on or
       -- off ('MCMonad.Config.ocrIndex'). Sent once at startup; the text
       -- it gathers never comes back over this socket.
+    | IgnoredAttributionReply !Rectangle [Word32]
+      -- ^ Answer to 'IgnoredAttributionQuery': the ignored windows whose
+      -- home screen is the screen nearest the echoed frame. Matched on
+      -- the Swift side by that frame.
     | SetTimers [Timer]
       -- ^ Authoritative list of running countdown timers. The brain owns
       -- timer state and resends the whole list whenever it changes (and
@@ -134,6 +143,7 @@ data OverlayScreenEntry = OverlayScreenEntry
     { oseScreenId     :: !Int
     , oseFrame        :: !Rectangle
     , oseWorkspaceTag :: !String
+    , oseIsActive     :: !Bool
     , oseWindows      :: ![OverlayWindowEntry]
     } deriving (Show, Generic)
 
@@ -143,12 +153,23 @@ data OverlayHiddenWorkspace = OverlayHiddenWorkspace
     , ohwWindows :: ![OverlayWindowEntry]
     } deriving (Show, Generic)
 
+-- | A window the manage hook explicitly ignored (see
+-- 'MCMonad.ManageHook.doIgnore'). mcmonad never positions or hides these,
+-- so there's no frame or workspace tag to report — just identity.
+-- mcmonad-core resolves the live AX frame itself and attributes the
+-- window to whichever screen it's actually sitting on.
+data OverlayIgnoredWindow = OverlayIgnoredWindow
+    { oiwWindowId :: !Word32
+    , oiwPid      :: !Int32
+    } deriving (Show, Generic)
+
 -- | Snapshot of the WindowSet, sent on every 'windows' call. Drives
 -- both the menubar workspace tree and the debug overlay.
 data OverlaySnapshot = OverlaySnapshot
     { osDebugOverlays    :: !Bool
     , osScreens          :: ![OverlayScreenEntry]
     , osHiddenWorkspaces :: ![OverlayHiddenWorkspace]
+    , osIgnoredWindows   :: ![OverlayIgnoredWindow]
     } deriving (Show, Generic)
 
 instance Aeson.ToJSON OverlayWindowEntry where
@@ -169,6 +190,7 @@ instance Aeson.ToJSON OverlayScreenEntry where
         [ "screenId"     .= oseScreenId
         , "frame"        .= oseFrame
         , "workspaceTag" .= oseWorkspaceTag
+        , "isActive"     .= oseIsActive
         , "windows"      .= oseWindows
         ]
 
@@ -178,11 +200,18 @@ instance Aeson.ToJSON OverlayHiddenWorkspace where
         , "windows" .= ohwWindows
         ]
 
+instance Aeson.ToJSON OverlayIgnoredWindow where
+    toJSON OverlayIgnoredWindow{..} = Aeson.object
+        [ "windowId" .= oiwWindowId
+        , "pid"      .= oiwPid
+        ]
+
 instance Aeson.ToJSON OverlaySnapshot where
     toJSON OverlaySnapshot{..} = Aeson.object
         [ "debugOverlays"    .= osDebugOverlays
         , "screens"          .= osScreens
         , "hiddenWorkspaces" .= osHiddenWorkspaces
+        , "ignoredWindows"   .= osIgnoredWindows
         ]
 
 -- | A frame assignment: position a specific window at a specific rectangle.
@@ -281,6 +310,11 @@ instance Aeson.ToJSON Command where
         [ "cmd" .= ("set-ocr-index" :: Text)
         , "on"  .= on
         ]
+    toJSON (IgnoredAttributionReply frame wids) = Aeson.object
+        [ "cmd"         .= ("ignored-attribution-reply" :: Text)
+        , "screenFrame" .= frame
+        , "windowIds"   .= wids
+        ]
 
 -- | Wire encoding of one 'Timer'. 'tmFireAt' is absolute POSIX epoch
 -- seconds so the daemon's countdown matches @Date().timeIntervalSince1970@.
@@ -301,6 +335,10 @@ data Event
     = WindowCreated WindowInfo
     | WindowDestroyed !Word32
     | WindowFrameChanged !Word32 !Rectangle
+    | WindowFrameDefied !Word32 !Int32 !Rectangle !Rectangle
+      -- ^ A SetFrames readback found the window off its wanted frame:
+      -- window id, pid, wanted frame, actual frame. A fact from Swift;
+      -- whether to re-send is decided by the brain.
     | FrontAppChanged !Int32
     | FocusedWindowChanged !Word32 !Int32
     | FocusedWindowQueryResponse !Word32 !Int32
@@ -349,6 +387,11 @@ data Event
       -- origin @workspace@. The brain switches to that workspace and journals
       -- @jumped@. (Distinct from 'MenuViewWorkspace' so the journal can
       -- attribute the switch to a timer.)
+    | IgnoredAttributionQuery !Rectangle [(Word32, Int32, Rectangle)]
+      -- ^ Swift asks where the ignored windows belong: the screen frame
+      -- being queried, and each ignored window's window id, pid and live
+      -- AX frame (windows without a readable frame are left out). A fact
+      -- from Swift; the attribution is computed by the brain.
     | Ready
     | QueryWindowsResponse [WindowInfo]
     | QueryScreensResponse [ScreenInfo]
@@ -366,6 +409,7 @@ eventLogSummary event = case event of
     WindowCreated info           -> "WindowCreated " ++ show (wiWindowId info, wiPid info)
     WindowDestroyed wid          -> "WindowDestroyed " ++ show wid
     WindowFrameChanged wid rect  -> "WindowFrameChanged " ++ show (wid, rect)
+    WindowFrameDefied wid pid want actual -> "WindowFrameDefied " ++ show (wid, pid, want, actual)
     FrontAppChanged pid          -> "FrontAppChanged " ++ show pid
     FocusedWindowChanged wid pid -> "FocusedWindowChanged " ++ show (wid, pid)
     FocusedWindowQueryResponse wid pid -> "FocusedWindowQueryResponse " ++ show (wid, pid)
@@ -384,6 +428,7 @@ eventLogSummary event = case event of
     TimerCancelAll               -> "TimerCancelAll"
     TimerDismiss _ _             -> "TimerDismiss [label/workspace withheld]"
     TimerJump _ _                -> "TimerJump [label/workspace withheld]"
+    IgnoredAttributionQuery frame facts -> "IgnoredAttributionQuery " ++ show frame ++ " count=" ++ show (length facts)
     Ready                        -> "Ready"
     QueryWindowsResponse windows -> "QueryWindowsResponse count=" ++ show (length windows)
     QueryScreensResponse screens -> "QueryScreensResponse count=" ++ show (length screens)
@@ -442,6 +487,11 @@ instance Aeson.FromJSON ScreenInfo where
         <*> v .: "frame"
         <*> (v .: "role" >>= \s -> maybe (fail ("unknown screen role: " ++ s)) pure (parseRole s))
 
+-- | One ignored window in an 'IgnoredAttributionQuery'.
+parseIgnoredFact :: Aeson.Value -> Aeson.Parser (Word32, Int32, Rectangle)
+parseIgnoredFact = Aeson.withObject "IgnoredFact" $ \v ->
+    (,,) <$> v .: "windowId" <*> v .: "pid" <*> v .: "frame"
+
 instance Aeson.FromJSON Event where
     parseJSON = Aeson.withObject "Event" $ \v -> do
         -- Swift sends events with "event" key and query responses with "response" key
@@ -454,10 +504,12 @@ instance Aeson.FromJSON Event where
                 "window-created"       -> WindowCreated      <$> Aeson.parseJSON (Aeson.Object v)
                 "window-destroyed"     -> WindowDestroyed    <$> v .: "windowId"
                 "window-frame-changed" -> WindowFrameChanged <$> v .: "windowId" <*> v .: "frame"
+                "window-frame-defied"  -> WindowFrameDefied <$> v .: "windowId" <*> v .: "pid" <*> v .: "want" <*> v .: "frame"
                 "front-app-changed"    -> FrontAppChanged    <$> v .: "pid"
                 "focused-window-changed" -> FocusedWindowChanged <$> v .: "windowId" <*> v .: "pid"
                 "focused-window-query-response" -> FocusedWindowQueryResponse <$> v .: "windowId" <*> v .: "pid"
                 "screens-changed"      -> ScreensChanged     <$> v .: "screens"
+                "ignored-attribution-query" -> IgnoredAttributionQuery <$> v .: "screenFrame" <*> (v .: "windows" >>= traverse parseIgnoredFact)
                 "hotkey-pressed"       -> HotkeyPressed      <$> v .: "hotkeyId"
                 "mouse-entered-window" -> MouseEnteredWindow <$> v .: "windowId" <*> v .: "pid"
                 "window-drag-completed" -> WindowDragCompleted <$> v .: "windowId" <*> v .: "pid" <*> v .: "frame"
@@ -500,7 +552,7 @@ connectToCore = do
         case result of
             Right conn -> return conn
             Left err   -> do
-                hPutStrLn stderr $
+                logTS $
                     "mcmonad: waiting for core socket (" ++ show err ++ "), retrying in "
                     ++ show (delay `div` 1000000) ++ "s"
                 threadDelay delay
@@ -544,4 +596,25 @@ decodeEvent line =
         Left _ -> Left $ "Failed to decode core event (" ++ show (BS.length line)
                       ++ " bytes; payload and parser details withheld for privacy)"
         Right evt -> Right evt
+
+-- | 'readEvent', but non-blocking: returns 'Nothing' instead of waiting
+-- when no complete line is buffered yet. 'hReady' can throw on a closed
+-- handle; treated the same as "nothing ready" since the caller's normal
+-- blocking read will surface the real connection error next.
+tryReadEvent :: Connection -> IO (Maybe Event)
+tryReadEvent conn = do
+    ready <- hReady (connHandle conn) `catch` \(_ :: IOException) -> return False
+    if ready then Just <$> readEvent conn else return Nothing
+
+-- | Drain every event already buffered on the socket, without blocking.
+-- Used to see what, if anything, arrived right behind an event worth
+-- pairing with its neighbours before acting on either.
+drainReadyEvents :: Connection -> IO [Event]
+drainReadyEvents conn = go []
+  where
+    go acc = do
+        mEvt <- tryReadEvent conn
+        case mEvt of
+            Just evt -> go (evt : acc)
+            Nothing  -> return (reverse acc)
 

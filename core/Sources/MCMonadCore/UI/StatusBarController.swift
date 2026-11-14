@@ -68,10 +68,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let screens = snapshotProvider?()?.screens ?? []
         guard !screens.isEmpty else {
             button.image = Self.fallbackIcon()
-            button.title = ""
+            button.title = modeMarker ?? ""
             return
         }
-        button.image = Self.makeScreenTagsIcon(screens: screens)
+        button.image = Self.makeScreenTagsIcon(screens: screens, modeMarker: modeMarker)
         button.title = ""
     }
 
@@ -111,7 +111,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     /// `.destinationOut` (erasing alpha where the glyphs are), which
     /// reads as light-text-on-a-solid-pill once tinted either way.
     /// Inactive screens are just plain opaque text, no pill.
-    private static func makeScreenTagsIcon(screens: [OverlayScreenEntry]) -> NSImage {
+    private static func makeScreenTagsIcon(screens: [OverlayScreenEntry], modeMarker: String?) -> NSImage {
         let height: CGFloat = 18
         let vPad: CGFloat = 1.5
         let hPad: CGFloat = 4
@@ -122,9 +122,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         ]
 
         let ordered = screens.sorted { $0.frame.origin.x < $1.frame.origin.x }
-        let tags: [(text: NSAttributedString, size: NSSize, isActive: Bool)] = ordered.map { s in
+        var tags: [(text: NSAttributedString, size: NSSize, isActive: Bool)] = ordered.map { s in
             let str = NSAttributedString(string: s.workspaceTag, attributes: textAttrs)
             return (str, str.size(), s.isActive)
+        }
+        if let modeMarker {
+            let str = NSAttributedString(string: modeMarker, attributes: textAttrs)
+            tags.append((str, str.size(), false))
         }
         let pillWidths = tags.map { $0.size.width + hPad * 2 }
         let totalWidth = pillWidths.reduce(0, +) + gap * CGFloat(max(0, tags.count - 1))
@@ -156,11 +160,26 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         return image
     }
 
-    /// Legacy hook for Haskell's `SetWorkspaceIndicator` command — kept
-    /// so that IPC path doesn't error, but superseded by the per-screen
-    /// icon above (which already shows every screen's tag), so this is
-    /// now a no-op.
-    func updateWorkspace(_ tag: String) {}
+    /// The marker the brain appends to its workspace indicator while a
+    /// non-default input mode (resize mode and the like) is active, drawn
+    /// after the per-screen tags. Nil in the default mode.
+    private var modeMarker: String?
+
+    /// Haskell's `SetWorkspaceIndicator`: the current workspace's tag,
+    /// followed by a space and a marker while a non-default input mode is
+    /// active. The tags themselves are drawn per screen from the overlay
+    /// snapshot, so only the marker is taken from here; without it there
+    /// is no sign anywhere that keys are in another mode.
+    func updateWorkspace(_ indicator: String) {
+        let marker = indicator.split(separator: " ").count > 1 && indicator.hasSuffix(Self.modeMarkerSymbol)
+            ? Self.modeMarkerSymbol : nil
+        guard marker != modeMarker else { return }
+        modeMarker = marker
+        refreshIcon()
+    }
+
+    /// U+2020 DAGGER, as sent by `MCMonad.Operations.windows`.
+    private static let modeMarkerSymbol = "\u{2020}"
 
     // MARK: - NSMenuDelegate
 

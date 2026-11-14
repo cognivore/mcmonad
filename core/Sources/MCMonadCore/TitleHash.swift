@@ -61,6 +61,9 @@ enum TitleHash {
         }
 
         let result = compute(windowId: windowId, pid: resolvedPid)
+        // A failed read is not the window's hash. Caching it would label
+        // the window with the failure for the rest of its life.
+        guard result != axerr else { return result }
         lock.lock()
         cache[windowId] = result
         lock.unlock()

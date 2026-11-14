@@ -296,9 +296,11 @@ struct OverlaySnapshot: Codable, Sendable {
         debugOverlays = try c.decode(Bool.self, forKey: .debugOverlays)
         screens = try c.decode([OverlayScreenEntry].self, forKey: .screens)
         hiddenWorkspaces = try c.decode([OverlayHiddenWorkspace].self, forKey: .hiddenWorkspaces)
-        // Defensive default: a brain built just before this field existed
-        // shouldn't make every snapshot fail to decode.
-        ignoredWindows = try c.decodeIfPresent([OverlayIgnoredWindow].self, forKey: .ignoredWindows) ?? []
+        // Required, like every other field: the protocol version already
+        // guarantees the brain sends it, and inventing an empty list for
+        // one that does not would hide ignored windows from the query
+        // socket without a trace.
+        ignoredWindows = try c.decode([OverlayIgnoredWindow].self, forKey: .ignoredWindows)
     }
 }
 

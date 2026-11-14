@@ -86,7 +86,6 @@ final class EventBridge: SkyLightEventDelegate {
     /// Register a managed window. Starts AX focus tracking for the PID on
     /// the first window of that PID.
     private func addManagedWindow(windowId: UInt32, pid: pid_t) {
-        logStderr("DEBUG: addManagedWindow wid=\(windowId) pid=\(pid) alreadyIn=\(managedWindowIds.contains(windowId)) setSizeBefore=\(managedWindowIds.count)\n")
         managedWindowIds.insert(windowId)
         windowIdToPid[windowId] = pid
         let wasEmpty = (pidWindowIds[pid]?.isEmpty ?? true)
@@ -99,7 +98,6 @@ final class EventBridge: SkyLightEventDelegate {
     /// Unregister a managed window. Stops AX focus tracking for the PID
     /// once the last window of that PID is gone.
     private func removeManagedWindow(windowId: UInt32) {
-        logStderr("DEBUG: removeManagedWindow wid=\(windowId) wasIn=\(managedWindowIds.contains(windowId)) setSizeBefore=\(managedWindowIds.count)\n")
         managedWindowIds.remove(windowId)
         guard let pid = windowIdToPid.removeValue(forKey: windowId) else { return }
         if var wids = pidWindowIds[pid] {
@@ -299,16 +297,15 @@ final class EventBridge: SkyLightEventDelegate {
             // knows about, so a window already in `managedWindowIds` is
             // left alone.
             guard !managedWindowIds.contains(windowId) else {
-                logStderr("DEBUG: skyLightEvent .created wid=\(windowId) ignored (already managed)\n")
+                logStderr("RECONCILE: ignore created wid=\(windowId) reason=already-managed\n")
                 break
             }
             if let snap = SkyLightQuery.queryWindow(windowId) {
                 adoptWindow(snap)
             }
 
-        case .destroyed(let windowId, let spaceId):
+        case .destroyed(let windowId, _):
             let stillExists = SkyLightQuery.windowExists(windowId)
-            logStderr("DEBUG: skyLightEvent .destroyed wid=\(windowId) spaceId=\(spaceId) wasManaged=\(managedWindowIds.contains(windowId)) stillExists=\(stillExists)\n")
             // A destroy notification can be spurious — SkyLight fires one
             // for a window that's still alive, most commonly around a
             // cross-screen AX move. Trusting it blindly means unmanaging a
@@ -319,7 +316,7 @@ final class EventBridge: SkyLightEventDelegate {
             // causes focus to jump. Verify liveness first, the same way
             // `validateWindows` already does for its own check.
             guard !isSpuriousDestroy(windowId, stillExists: stillExists) else {
-                logStderr("DEBUG: skyLightEvent .destroyed wid=\(windowId) ignored (spurious, still exists)\n")
+                logStderr("RECONCILE: ignore destroyed wid=\(windowId) reason=still-exists\n")
                 break
             }
             removeManagedWindow(windowId: windowId)
@@ -330,9 +327,8 @@ final class EventBridge: SkyLightEventDelegate {
 
         case .closed(let windowId):
             let stillExists = SkyLightQuery.windowExists(windowId)
-            logStderr("DEBUG: skyLightEvent .closed wid=\(windowId) wasManaged=\(managedWindowIds.contains(windowId)) stillExists=\(stillExists)\n")
             guard !isSpuriousDestroy(windowId, stillExists: stillExists) else {
-                logStderr("DEBUG: skyLightEvent .closed wid=\(windowId) ignored (spurious, still exists)\n")
+                logStderr("RECONCILE: ignore closed wid=\(windowId) reason=still-exists\n")
                 break
             }
             removeManagedWindow(windowId: windowId)

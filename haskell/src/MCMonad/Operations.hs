@@ -1519,7 +1519,7 @@ loadExtrasIO = do
     if not exists then return noExtras else
         (do bytes <- LBS.readFile ef
             case decodeExtras bytes of
-                Right extras -> LBS.length bytes `seq` return extras
+                Right extras -> return extras
                 Left err -> do
                     logTS $ "mcmonad: " ++ ef ++ " not understood (" ++ err ++ "); moving to .bak"
                     Posix.rename ef (ef ++ ".bak")

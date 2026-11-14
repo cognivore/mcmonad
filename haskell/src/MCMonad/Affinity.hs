@@ -28,8 +28,11 @@ module MCMonad.Affinity
       -- * StackSet operations
     , viewOn
     , placeForRoles
+    , viewByRole
+    , focusByRole
     ) where
 
+import Control.Applicative ((<|>))
 import Data.List (findIndex)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, listToMaybe, mapMaybe, maybeToList)
@@ -140,3 +143,43 @@ placeForRoles rules roles lastOn order ws0 =
                               , W.screen s /= sid, W.screen s /= currentSid
                               , let t = W.tag (W.workspace s), resolved t == role ]
         in listToMaybe (hiddenMates ++ strayMates)
+
+-- | Show @tag@ on the screen its role owns (the primary screen when that
+-- role is not attached, the current screen when no screen has a role), move
+-- focus there, then tidy the other screens with 'placeForRoles'. This is the
+-- one way a workspace comes on screen in 'Affine' mode, whether a hotkey
+-- asked for the workspace or a focus change asked for a window on it.
+viewByRole
+    :: [AffinityRule]
+    -> Map.Map ScreenId ScreenRole
+    -> Map.Map ScreenRole String
+    -> [String]
+    -> String
+    -> W.StackSet String l a ScreenId sd
+    -> W.StackSet String l a ScreenId sd
+viewByRole rules roles lastOn order tag ws =
+    placeForRoles rules roles lastOn order (viewOn target tag ws)
+  where
+    role   = resolveAffinity rules (Set.fromList (Map.elems roles)) tag
+    target = fromMaybe (W.screen (W.current ws))
+                       (screenForRole roles role <|> screenForRole roles Primary)
+
+-- | Focus a managed window wherever it lives. A window already on a screen
+-- is focused in place. A window on a hidden workspace brings that workspace
+-- up with 'viewByRole', so it appears on its role's screen and never on
+-- whichever screen happened to be current ('W.focusWindow' alone would
+-- do the latter). An unmanaged window changes nothing.
+focusByRole
+    :: Eq a
+    => [AffinityRule]
+    -> Map.Map ScreenId ScreenRole
+    -> Map.Map ScreenRole String
+    -> [String]
+    -> a
+    -> W.StackSet String l a ScreenId sd
+    -> W.StackSet String l a ScreenId sd
+focusByRole rules roles lastOn order w ws = case W.findTag w ws of
+    Nothing -> ws
+    Just tag
+        | tag `elem` map (W.tag . W.workspace) (W.screens ws) -> W.focusWindow w ws
+        | otherwise -> W.focusWindow w (viewByRole rules roles lastOn order tag ws)

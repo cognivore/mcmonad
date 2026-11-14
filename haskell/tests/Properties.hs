@@ -1652,6 +1652,42 @@ prop_place_pulls_back_stranded_role_mate =
        && W.screen (W.current ws) == S 0
        && invariant ws
 
+-- Focusing a window on a hidden workspace shows that workspace on its
+-- role's screen, wherever focus was, and leaves every screen on a
+-- workspace of its own role.
+prop_focusByRole_hidden_lands_on_role_screen :: Property
+prop_focusByRole_hidden_lands_on_role_screen =
+    forAll (elements [S 0, S 1, S 2]) $ \from ->
+    forAll (elements [("3", S 0), ("p", S 1), ("b", S 2)]) $ \(tag, home) ->
+        let rules = [Pin Secondary ["o", "p"], Pin Tertiary ["a", "b"]]
+            tags  = ["1", "o", "a", "3", "p", "b"]     -- S0 "1", S1 "o", S2 "a"; rest hidden
+            w     = WindowRef 77 7
+            base  = W.new 0 tags (map snd threeScreens) :: TestStackSet
+            ws1   = W.shiftWin tag w (W.insertUp w base)
+            ws0   = W.view (fromMaybe "1" (W.lookupWorkspace from ws1)) ws1
+            ws    = focusByRole rules rolesPST Map.empty tags w ws0
+            resolved = resolveAffinity rules (Set.fromList (Map.elems rolesPST))
+            shown x = map (\s -> (W.screen s, W.tag (W.workspace s))) (W.screens x)
+        in counterexample (show (from, tag, shown ws)) $ conjoin
+            [ W.peek ws === Just w
+            , W.lookupWorkspace home ws === Just tag
+            , W.screen (W.current ws) === home
+            , property (all (\(sid, t) -> Just (resolved t) == Map.lookup sid rolesPST) (shown ws))
+            , property (invariant ws)
+            ]
+
+-- Focusing a window that is already on a screen moves no workspace.
+prop_focusByRole_visible_moves_nothing :: Bool
+prop_focusByRole_visible_moves_nothing =
+    let rules = [Pin Secondary ["o"], Pin Tertiary ["a"]]
+        tags  = ["1", "o", "a", "3"]
+        w     = WindowRef 77 7
+        base  = W.new 0 tags (map snd threeScreens) :: TestStackSet
+        ws0   = W.view "1" (W.insertUp w (W.view "a" base))
+        ws    = focusByRole rules rolesPST Map.empty tags w ws0
+        shown x = L.sort (map (\s -> (W.screen s, W.tag (W.workspace s))) (W.screens x))
+    in W.peek ws == Just w && W.screen (W.current ws) == S 2 && shown ws == shown ws0
+
 prop_role_names_round_trip :: Bool
 prop_role_names_round_trip =
     all (\r -> parseRole (roleName r) == Just r) [minBound .. maxBound]
@@ -1943,6 +1979,8 @@ allProperties =
     , ("affinity: unplug/replug round trip", property prop_affinity_unplug_replug_round_trip)
     , ("affinity: view then place refills the displaced screen", property prop_view_then_place_refills_displaced_screen)
     , ("affinity: place pulls back a stranded role-mate", property prop_place_pulls_back_stranded_role_mate)
+    , ("affinity: focusing a hidden window lands on its role screen", property prop_focusByRole_hidden_lands_on_role_screen)
+    , ("affinity: focusing a visible window moves no workspace", property prop_focusByRole_visible_moves_nothing)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("ocr-index wire format", property prop_ocr_index_wire)
     , ("event logs redact window and peer content", property prop_event_logs_redact_content)

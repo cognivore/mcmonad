@@ -5,6 +5,7 @@ module MCMonad.Operations
       windows
       -- * Viewing workspaces by learnedAffinity
     , viewWorkspace
+    , focusWindowAnywhere
     , warpToFocus
     , reassertHiddenWindows
     , repairFrame
@@ -110,7 +111,7 @@ import qualified System.Posix.Files as Posix
 import System.Posix.Process (executeFile)
 import System.Posix.Signals (nullSignal, signalProcess)
 
-import MCMonad.Affinity (placeForRoles, resolveAffinity, screenForRole, viewOn)
+import MCMonad.Affinity (focusByRole, placeForRoles, viewByRole)
 import System.Process (createProcess, shell, readProcessWithExitCode, CreateProcess(..))
 import qualified XMonad.StackSet as W
 
@@ -1265,7 +1266,7 @@ setFocus w = do
 jumpToActiveWindow :: M ()
 jumpToActiveWindow = queryFocusedWindow $ \wr -> do
     ws <- gets windowset
-    when (W.member wr ws) $ windows (W.focusWindow wr)
+    when (W.member wr ws) $ focusWindowAnywhere wr
 
 -- | Open the fuzzy window-search dropdown. The daemon owns the picker
 -- UI; a selection returns as a 'MCMonad.IPC.MenuFocusWindow' event,
@@ -1761,22 +1762,53 @@ viewWorkspace tag = do
     case mode of
         Classic -> windows (W.greedyView tag)
         Affine  -> do
-            ws    <- gets windowset
-            roles <- gets screenRoles
-            rules <- gets affinityRules
+            cur <- gets (W.screen . W.current . windowset)
+            view <- affineView
+            windows (view tag)
+            now <- gets (W.screen . W.current . windowset)
+            when (now /= cur) warpIfConfigured
+
+-- | 'MCMonad.Affinity.viewByRole' with the brain's current rules, roles,
+-- per-role history and workspace order filled in.
+affineView :: M (String -> WindowSet -> WindowSet)
+affineView = do
+    roles  <- gets screenRoles
+    rules  <- gets affinityRules
+    lastOn <- gets lastOnRole
+    order  <- gets workspaceOrder
+    return (viewByRole rules roles lastOn order)
+
+-- | Warp the pointer after focus moved to another screen, when the config
+-- asks for it (pointer warping, or focus-follows-mouse, which would
+-- otherwise hand focus straight back).
+warpIfConfigured :: M ()
+warpIfConfigured = do
+    warp <- gets warpOnSwitch
+    ffm  <- gets focusFollows
+    when (warp || ffm) warpToFocus
+
+-- | Focus a managed window on any workspace, shown or hidden. Every focus
+-- change that can bring a hidden workspace on screen goes through here
+-- (launcher and menu picks, the jump hotkey, following an app switch), so
+-- in 'Affine' mode the workspace always lands on its role's screen.
+-- 'Classic' keeps xmonad's behaviour: the workspace comes to the current
+-- screen.
+focusWindowAnywhere :: WindowRef -> M ()
+focusWindowAnywhere w = do
+    mode <- gets workspaceViewMode
+    case mode of
+        Classic -> windows (W.focusWindow w)
+        Affine  -> do
+            roles  <- gets screenRoles
+            rules  <- gets affinityRules
             lastOn <- gets lastOnRole
             order  <- gets workspaceOrder
-            let present = S.fromList (M.elems roles)
-                role    = resolveAffinity rules present tag
-                cur     = W.screen (W.current ws)
-                target  = fromMaybe cur (screenForRole roles role <|> screenForRole roles Primary)
-            -- Show it, then tidy the other screens: a workspace this view
-            -- displaced onto a screen it does not belong to gives way to a
-            -- hidden or stranded workspace that does.
-            windows (placeForRoles rules roles lastOn order . viewOn target tag)
-            warp <- gets warpOnSwitch
-            ffm  <- gets focusFollows
-            when (target /= cur && (warp || ffm)) warpToFocus
+            cur <- gets (W.screen . W.current . windowset)
+            hidden <- gets (\s -> maybe False (`elem` map W.tag (W.hidden (windowset s)))
+                                         (W.findTag w (windowset s)))
+            windows (focusByRole rules roles lastOn order w)
+            now <- gets (W.screen . W.current . windowset)
+            when (hidden && now /= cur) warpIfConfigured
 
 -- | Put the pointer on the focused window, or in the middle of the
 -- current screen when its workspace is empty.

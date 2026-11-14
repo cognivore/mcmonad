@@ -640,7 +640,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
             front <- gets frontmostPid
             let wr0 = WindowRef wid pid
             if shouldFollowIntoHidden (onHiddenWorkspace ws0 wr0) (front == Just pid)
-                then windows (W.focusWindow wr0)
+                then focusWindowAnywhere wr0
                 else handleFocusedWindowChanged wid pid
             -- A should-be-hidden window receiving AX focus means the
             -- user reached it on screen — it drifted (fullscreen-
@@ -719,7 +719,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
         MenuFocusWindow wid pid -> do
             ws <- gets windowset
             let wr = WindowRef wid pid
-            when (W.member wr ws) $ windows (W.focusWindow wr)
+            when (W.member wr ws) $ focusWindowAnywhere wr
 
         MenuViewWorkspace tag -> do
             ws <- gets windowset
@@ -887,7 +887,7 @@ handleFocusedWindowChanged wid pid = do
             Just ws' -> windows (const ws')
             Nothing -> do
                 let wr = WindowRef wid pid
-                when (W.member wr ws) $ windows (W.focusWindow wr)
+                when (W.member wr ws) $ focusWindowAnywhere wr
     applyAndClearIntent = do
         modify $ \s -> s { focusIntent = Nothing }
         applyClean
@@ -987,7 +987,7 @@ applyFrontAppChange pid = do
             -- don't fire reliably). 'windows' brings that
             -- workspace on screen if so.
             whenJust (find (\w -> wrPid w == pid) (W.allWindows ws)) $
-                windows . W.focusWindow
+                focusWindowAnywhere
     -- The first front-app change after a native-fullscreen Space
     -- transition is the earliest reliable moment to heal the silent
     -- un-park sweep (see the WindowFrameChanged handler) — the sweep

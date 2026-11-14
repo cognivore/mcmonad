@@ -25,7 +25,7 @@ import MCMonad.Persistence
     , partitionPending, placePending, mergePending
     )
 import MCMonad.Operations
-    ( frameAtParkCorner, reassignScreens
+    ( frameIsParked, reassignScreens
     , chooseOriginTag, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
     , placeManaged, windowsToPark
     , screenAt, rectOverlapArea, crossedScreenTag
@@ -1072,7 +1072,7 @@ prop_serialToWindowSet_keeps_workspace_from_absent_screen =
 
 -- === PARK-CORNER DETECTION (multi-monitor) ===
 --
--- 'frameAtParkCorner' answers "is this should-be-hidden window still
+-- 'frameIsParked' answers "is this should-be-hidden window still
 -- parked, or has it drifted back on-screen?" A false "yes" means the
 -- window never gets re-parked and stays visible.
 --
@@ -1093,34 +1093,58 @@ twoScreenSet = W.StackSet
     }
   where wsp t = W.Workspace t (0 :: TestLayout) Nothing
 
+parkedOnTwoScreens :: Rectangle -> Bool
+parkedOnTwoScreens = frameIsParked (map (screenRect . W.screenDetail) (W.screens twoScreenSet))
+
+-- A window hung off the first screen's free left edge is parked too. The
+-- core picks that corner whenever a display sits to the right; a rule that
+-- only knew the right edge re-parked such a window on every frame event.
+prop_parkCorner_parked_off_left_edge :: Property
+prop_parkCorner_parked_off_left_edge =
+    parkedOnTwoScreens (Rectangle (-3439) 1439 3440 1410) === True
+
+-- Three screens in a row with aligned bottoms: the middle screen's park
+-- leaves a one-point row on its right neighbour and is still a park; a
+-- window tiled on any of the three is not.
+prop_parkCorner_three_in_a_row :: Property
+prop_parkCorner_three_in_a_row =
+    let rects = map (screenRect . snd) threeScreens
+    in conjoin
+        [ frameIsParked rects (Rectangle 1999 799 400 300) === True
+        , frameIsParked rects (Rectangle (-399) 799 400 300) === True
+        , frameIsParked rects (Rectangle 2999 799 400 300) === True
+        , conjoin [ frameIsParked rects r === False | r <- rects ]
+        , frameIsParked rects (Rectangle 1000 0 500 800) === False
+        ]
+
 -- A window filling the second monitor is NOT parked, even though its
 -- origin sits exactly on the first monitor's right edge.
 prop_parkCorner_tiled_on_second_screen :: Property
 prop_parkCorner_tiled_on_second_screen =
-    frameAtParkCorner (Rectangle 3440 147 1728 1085) twoScreenSet === False
+    parkedOnTwoScreens (Rectangle 3440 147 1728 1085) === False
 
 -- Neither is a half-width tile on the second monitor.
 prop_parkCorner_half_tile_on_second_screen :: Property
 prop_parkCorner_half_tile_on_second_screen =
-    frameAtParkCorner (Rectangle 4304 147 864 1085) twoScreenSet === False
+    parkedOnTwoScreens (Rectangle 4304 147 864 1085) === False
 
 -- A window parked in the first screen's corner IS parked: only a 1px
 -- column overlaps, and the frame hangs below the second display.
 prop_parkCorner_parked_on_first_screen :: Property
 prop_parkCorner_parked_on_first_screen =
-    frameAtParkCorner (Rectangle 3439 1439 3440 1410) twoScreenSet === True
+    parkedOnTwoScreens (Rectangle 3439 1439 3440 1410) === True
 
 -- So is one parked in the second screen's corner.
 prop_parkCorner_parked_on_second_screen :: Property
 prop_parkCorner_parked_on_second_screen =
-    frameAtParkCorner (Rectangle 5167 1231 1728 1085) twoScreenSet === True
+    parkedOnTwoScreens (Rectangle 5167 1231 1728 1085) === True
 
 -- The fullscreen-transition sweep re-fits a window flush against a
 -- screen's right edge (x = screenRight - width). That is drift, not a
 -- park, and must trigger a re-assert.
 prop_parkCorner_rejects_unpark_sweep :: Property
 prop_parkCorner_rejects_unpark_sweep =
-    frameAtParkCorner (Rectangle 0 33 3440 1410) twoScreenSet === False
+    parkedOnTwoScreens (Rectangle 0 33 3440 1410) === False
 
 -- === RESCREEN (display reconfiguration) ===
 --
@@ -2094,6 +2118,8 @@ allProperties =
     , ("park: first-screen corner is parked",         property prop_parkCorner_parked_on_first_screen)
     , ("park: second-screen corner is parked",        property prop_parkCorner_parked_on_second_screen)
     , ("park: un-park sweep is drift",                property prop_parkCorner_rejects_unpark_sweep)
+    , ("park: off the left edge is parked",           property prop_parkCorner_parked_off_left_edge)
+    , ("park: three screens in a row",                property prop_parkCorner_three_in_a_row)
     -- Display reconfiguration
     , ("rescreen: unchanged is identity",             property prop_reassignScreens_unchanged_is_identity)
     , ("rescreen: preserves screen assignment",       property prop_reassignScreens_preserves_assignment)

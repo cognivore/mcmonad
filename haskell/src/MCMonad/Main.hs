@@ -585,7 +585,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
             natives <- gets nativeFloats
             case findByWindowId wid (W.allWindows ws) of
                 Just wref | not (Set.member wref mappedSet)
-                          , not (frameAtParkCorner rect ws)
+                          , not (frameIsParked (map (screenRect . W.screenDetail) (W.screens ws)) rect)
                     -> reassertHiddenWindows
                 Just wref | Set.member wref mappedSet
                           , Set.member wref natives

@@ -1,15 +1,18 @@
 import CoreGraphics
 
-/// Which screen a parked window belongs to. A corner park exposes a tiny
-/// sliver on exactly its home screen and nothing on any other (see
-/// 'freeCorner'), so the screen with the largest (even if small)
-/// intersection with the frame is the one to restore onto.
+/// Which screen a parked window belongs to: the one it shows a corner on
+/// (a non-empty exposure that is a sliver in both dimensions). A park can
+/// also leave a one-point row on a neighbour, which is larger in area, so
+/// the corner is looked for first and the largest overlap is only the
+/// answer for a frame that is not parked.
 func homeScreen(for frame: CGRect, among screens: [ScreenInfo]) -> ScreenInfo? {
-    func overlapArea(_ s: ScreenInfo) -> CGFloat {
-        let r = s.frame.intersection(frame)
-        return r.width * r.height
-    }
-    return screens.max { overlapArea($0) < overlapArea($1) }
+    func shown(_ s: ScreenInfo) -> CGRect { s.frame.intersection(frame) }
+    if let corner = screens.first(where: {
+        let r = shown($0)
+        return !r.isNull && r.width > 0 && r.height > 0 && r.width <= parkSliver && r.height <= parkSliver
+    }) { return corner }
+    func area(_ s: ScreenInfo) -> CGFloat { let r = shown(s); return r.isNull ? 0 : r.width * r.height }
+    return screens.max { area($0) < area($1) }
 }
 
 /// A frame of `size` centered on `screen`.

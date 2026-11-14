@@ -12,7 +12,7 @@ module MCMonad.Operations
     , RepairStep(..)
     , repairStep
     , maxRepairAttempts
-    , frameAtParkCorner
+    , frameIsParked
     , attributeIgnoredWindows
       -- * Window lifecycle
     , manage
@@ -487,35 +487,21 @@ reassertHiddenWindows = do
         conn <- asks connection
         io $ sendCommand conn (HideWindows (map wrWindowId toHide))
 
--- | Is this frame at (or clamped near) some screen's park corner? Parks
--- pin the origin's x to screenRight - 1, and macOS' ordinary titlebar
--- clamp only pulls y back on-screen — x is the discriminator. The
--- fullscreen-transition sweep instead re-fits windows fully on-screen
--- (x = screenRight - width), which this rejects.
---
--- The right-edge test alone is not enough on multi-monitor: side-by-side
--- displays share a boundary, so the right screen's left edge *is* the left
--- screen's @screenRight@, and every ordinary window tiled there would read
--- as parked. Require in addition that the frame expose no more than a
--- sliver on any display — a real park leaves ~1px. Mirrors
--- @isAlreadyParked@ in mcmonad-core; the two must agree or a window is
--- either re-parked forever or never re-parked at all.
---
--- Generic in everything but 'ScreenDetail': only the screen rectangles are
--- read, and keeping it that way lets the properties exercise it directly.
-frameAtParkCorner :: Rectangle -> W.StackSet i l a sid ScreenDetail -> Bool
-frameAtParkCorner r ws = any nearRightEdge screenRects && widestExposure <= 2
+-- | Is this frame parked: on every screen, what shows of it is at most a
+-- two-point sliver in one dimension (or nothing)? This is the same rule
+-- mcmonad-core applies (@isAlreadyParked@ in
+-- @core\/Sources\/MCMonadCore\/IPC\/ParkGeometry.swift@), and the two have
+-- to agree: the brain uses it to decide whether a hidden window has drifted
+-- back on screen and needs re-parking, the core to decide whether a re-sent
+-- park still needs a write. It says nothing about /which/ corner, because
+-- the core picks whichever bottom corner hides the window best for the
+-- current arrangement (left edge of a leftmost screen, right edge of a
+-- rightmost one, and a one-point row on a neighbour for a screen with a
+-- neighbour on each side).
+frameIsParked :: [Rectangle] -> Rectangle -> Bool
+frameIsParked screenRects r = all sliver screenRects
   where
-    screenRects = map (screenRect . W.screenDetail) (screensOf ws)
-    nearRightEdge sr = rect_x r >= rect_x sr + rect_w sr - 2
-    widestExposure = maximum (0 : map overlapWidth screenRects)
-    -- Width of the 2D intersection: a park sits *below* a neighbouring
-    -- display as well as to its right, so the vertical span has to be
-    -- taken into account or the neighbour reads as fully exposed.
-    overlapWidth sr
-        | span_ (rect_y r) (rect_h r) (rect_y sr) (rect_h sr) <= 0 = 0
-        | otherwise = span_ (rect_x r) (rect_w r) (rect_x sr) (rect_w sr)
-    span_ a la b lb = max 0 (min (a + la) (b + lb) - max a b)
+    sliver sr = let (w, h) = overlapSides r sr in w <= 2 || h <= 2
 
 -- | Decide what to do about a window whose frame is off the one we last
 -- asked for. Called from a SetFrames readback ('WindowFrameDefied'), from
@@ -696,7 +682,7 @@ workspaceWindows ws meta rects focused wsp =
 -- | The ignored windows (see 'MCMonad.ManageHook.doIgnore') that belong to
 -- the screen nearest a queried screen frame. mcmonad-core supplies each
 -- ignored window's live frame; the brain alone knows the screens. A window
--- is parked (see 'isIgnoredParked') and parked windows belong to no screen.
+-- is parked (see 'frameIsParked') and parked windows belong to no screen.
 -- Otherwise its home is the screen it overlaps most. Only windows in
 -- 'ignoredWindows' are considered.
 attributeIgnoredWindows
@@ -705,7 +691,7 @@ attributeIgnoredWindows
 attributeIgnoredWindows ignored ws target facts =
     [ wid | (wid, pid, fr) <- facts
           , S.member (WindowRef wid pid) ignored
-          , not (isIgnoredParked (map snd screens) fr)
+          , not (frameIsParked (map snd screens) fr)
           , homeOf fr == nearest ]
   where
     screens = [ (W.screen s, screenRect (W.screenDetail s)) | s <- screensOf ws ]
@@ -713,14 +699,6 @@ attributeIgnoredWindows ignored ws target facts =
     homeOf fr = fst (maximumBy (comparing (\(_, r) -> rectOverlapArea fr r)) screens)
     originDist2 a b =
         (rect_x a - rect_x b) ^ (2 :: Int) + (rect_y a - rect_y b) ^ (2 :: Int)
-
--- | The park test for ignored windows: the frame's best overlap with any
--- screen is at most a 2x2 sliver. Matches the Swift isAlreadyParked
--- (core/Sources/MCMonadCore/IPC/ParkGeometry.swift).
-isIgnoredParked :: [Rectangle] -> Rectangle -> Bool
-isIgnoredParked screenRects fr =
-    let (w, h) = overlapSides fr (maximumBy (comparing (rectOverlapArea fr)) screenRects)
-    in w <= 2 && h <= 2
 
 -- | Per-axis extent of the overlap of two rects (0 where they don't meet).
 overlapSides :: Rectangle -> Rectangle -> (Double, Double)

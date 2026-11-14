@@ -437,26 +437,17 @@ final class CommandExecutor {
 
         let allScreens = displayManager.currentScreens()
 
-        // Park each window 1px inside a corner of the screen it is on,
-        // leaving only a ~1px sliver visible. The origin MUST stay inside
-        // the display union: a window placed *fully* off-screen gets yanked
+        // Park each window with one point of a bottom corner on screen and
+        // the rest hanging off the side. The origin MUST stay inside the
+        // display union: a window placed *fully* off-screen gets yanked
         // back on-screen by AppKit (a titled NSWindow "automatically
         // constrains itself to the screen") — that was the "Photoshop ghost
         // on an empty workspace" bug, caused by the old `screenMaxX + 100`
         // target. The surviving sliver doubles as a manual drag-handle if
         // the daemon dies. Mirrors AeroSpace's hideInCorner. SkyLight can't
         // move other apps' windows (permission); AX can, since we hold
-        // Accessibility.
-        //
-        // Which corner is picked is computed fresh every call (screens can
-        // be connected/disconnected at any time): a window keeps its full
-        // size while parked, so hanging it off an edge that another screen
-        // sits against would spill the window's entire body onto that
-        // neighbour — still fully covering its real content, and not
-        // actually hidden. `freeCorner` picks an edge with nothing beyond
-        // it, independently per axis, falling back to shrinking the parked
-        // size (rather than picking an edge that spills) only when a
-        // screen's arrangement leaves no free edge at all (e.g. a 2x2 grid).
+        // Accessibility. Which corner, and why the window keeps its size,
+        // is `parkOrigin`'s business.
         //
         // Batched the same way executeSetFrames batches its writes: without
         // this bracket, the window server composites and redraws after each
@@ -473,22 +464,20 @@ final class CommandExecutor {
                               result: "no-screen")
                 continue
             }
-            let (corner, size) = freeCorner(for: screen.frame, among: allScreens,
-                                             windowSize: snap.frame.size)
+            let corner = parkOrigin(for: screen.frame, among: allScreens,
+                                    windowSize: snap.frame.size)
             // Already parked: skip the AX write — this makes hide
             // re-assertion idempotent-cheap, and the brain leans on that by
             // re-sending the full park list on every front-app change /
             // drift report to heal the silent bulk un-park macOS performs
             // on hidden windows during fullscreen Space transitions.
-            // Checked against every screen, not just the resolved `screen`:
-            // a parked frame hangs almost entirely off its own display, so
-            // on multi-monitor setups `screen(forFrame:)` resolves the
-            // neighbour and a single-screen check would re-park (and
-            // slowly migrate) the window on every re-assert.
+            // `isAlreadyParked` is a statement about every display, so it
+            // holds whichever screen `screen(forFrame:)` resolved for a
+            // frame that hangs almost entirely off its own.
             if isAlreadyParked(snap.frame, screens: allScreens) {
                 continue
             }
-            let target = CGRect(origin: corner, size: size)
+            let target = CGRect(origin: corner, size: snap.frame.size)
             FrameLog.emit(source: .cmdHideMove,
                           windowId: wid, pid: snap.pid, rect: target,
                           tHash: TitleHash.hash(windowId: wid, pid: snap.pid),

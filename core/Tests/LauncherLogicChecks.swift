@@ -437,31 +437,59 @@ enum LauncherLogicChecks {
         let right = CGRect(x: 1000, y: 0, width: 1000, height: 800)
         let pair = [info(0, left), info(1, right)]
 
-        // alone: the bottom-right corner is free
+        func parked(_ origin: CGPoint, _ screens: [ScreenInfo]) -> Bool {
+            isAlreadyParked(CGRect(origin: origin, size: size), screens: screens)
+        }
+
+        // alone: the bottom-right corner
         let solo = [info(0, left)]
-        precondition(freeCorner(for: left, among: solo, windowSize: size) == (CGPoint(x: 999, y: 799), size))
+        precondition(parkOrigin(for: left, among: solo, windowSize: size) == CGPoint(x: 999, y: 799))
 
-        // beside another screen: the bottom-right corner would spill onto it,
-        // so the window parks off the left edge instead
-        precondition(freeCorner(for: left, among: pair, windowSize: size) == (CGPoint(x: -399, y: 799), size))
-        precondition(freeCorner(for: right, among: pair, windowSize: size) == (CGPoint(x: 1999, y: 799), size))
+        // beside another screen: the bottom-right corner would leave a row
+        // on the neighbour, so the window hangs off the free left edge
+        precondition(parkOrigin(for: left, among: pair, windowSize: size) == CGPoint(x: -399, y: 799))
+        precondition(parkOrigin(for: right, among: pair, windowSize: size) == CGPoint(x: 1999, y: 799))
 
-        // whatever freeCorner picks reads as parked, and a flush tile does not
-        let (origin, parkSize) = freeCorner(for: left, among: pair, windowSize: size)
-        precondition(isAlreadyParked(CGRect(origin: origin, size: parkSize), screens: pair))
+        // whatever is picked reads as parked, and a flush tile does not
+        precondition(parked(parkOrigin(for: left, among: pair, windowSize: size), pair))
         precondition(!isAlreadyParked(CGRect(x: 0, y: 0, width: 500, height: 800), screens: pair), "half tile is not parked")
         precondition(!isAlreadyParked(left, screens: pair), "full screen is not parked")
+        precondition(!isAlreadyParked(CGRect(x: 1000, y: 0, width: 500, height: 800), screens: pair),
+                     "a tile at the right screen's left edge is not parked")
 
-        // boxed in on all four sides: falls back to a 2x2 sliver
-        let center = CGRect(x: 1000, y: 800, width: 1000, height: 800)
-        let boxed = [
-            info(0, center),
-            info(1, CGRect(x: 0, y: 800, width: 1000, height: 800)),
-            info(2, CGRect(x: 2000, y: 800, width: 1000, height: 800)),
-            info(3, CGRect(x: 1000, y: 0, width: 1000, height: 800)),
-            info(4, CGRect(x: 1000, y: 1600, width: 1000, height: 800)),
-        ]
-        precondition(freeCorner(for: center, among: boxed, windowSize: size).1 == CGSize(width: 2, height: 2))
+        // three in a row, bottoms aligned: the outer screens use their free
+        // edges; the middle one has none, keeps the window's size, and
+        // parks at its own bottom-right corner (a one-point row on the
+        // right neighbour, nothing more)
+        let third = CGRect(x: 2000, y: 0, width: 1000, height: 800)
+        let row = [info(0, left), info(1, right), info(2, third)]
+        precondition(parkOrigin(for: left, among: row, windowSize: size) == CGPoint(x: -399, y: 799))
+        precondition(parkOrigin(for: third, among: row, windowSize: size) == CGPoint(x: 2999, y: 799))
+        let mid = parkOrigin(for: right, among: row, windowSize: size)
+        precondition(mid == CGPoint(x: 1999, y: 799), "\(mid)")
+        precondition(parked(mid, row))
+        precondition(homeScreen(for: CGRect(origin: mid, size: size), among: row)?.screenId == 1,
+                     "the middle screen's park still belongs to the middle screen")
+
+        // three in a row, the middle one shorter than both neighbours: its
+        // own corners would put the window in full view on a neighbour, so
+        // it parks at the nearest display corner that shows nothing
+        let tallL = CGRect(x: 0, y: 0, width: 1000, height: 1200)
+        let short = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let tallR = CGRect(x: 2000, y: 0, width: 1000, height: 1200)
+        let valley = [info(0, tallL), info(1, short), info(2, tallR)]
+        let out = parkOrigin(for: short, among: valley, windowSize: size)
+        precondition(parked(out, valley), "\(out)")
+        precondition(!valley.contains { $0.screenId == 1 && $0.frame.intersects(CGRect(origin: out, size: size)) },
+                     "parked on a neighbour's corner, off its own screen: \(out)")
+
+        // a laptop below a row of three: every screen still gets a park
+        // that keeps the window's size
+        let below = CGRect(x: 1000, y: 800, width: 1000, height: 700)
+        let stacked = row + [info(3, below)]
+        for s in stacked {
+            precondition(parked(parkOrigin(for: s.frame, among: stacked, windowSize: size), stacked), "\(s.screenId)")
+        }
     }
 
     // MARK: Parked window home

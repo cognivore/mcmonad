@@ -347,7 +347,9 @@ final class VoiceInput {
             let isFinal = result?.isFinal ?? false
             let failed = (error != nil)
             if let text {
-                recogLogger.info("recog \(isFinal ? "final" : "partial", privacy: .public): \(text, privacy: .public)")
+                // Never the words: what was said is as private as what is on
+                // screen, and the unified log is readable by other tools.
+                recogLogger.info("recog \(isFinal ? "final" : "partial", privacy: .public): \(text.count, privacy: .public) chars")
             }
             if let error {
                 // Surface domain+code: kLSRErrorDomain 102 / kAFAssistantErrorDomain
@@ -393,6 +395,10 @@ final class VoiceInput {
     func stop() {
         guard active else { return }
         active = false
+        // A recognition result already on its way to the main actor
+        // belongs to the session being stopped; it must not run a command
+        // after the user took over the keyboard or closed the launcher.
+        sessionGeneration &+= 1
         holder.set(nil)
         task?.cancel()
         task = nil

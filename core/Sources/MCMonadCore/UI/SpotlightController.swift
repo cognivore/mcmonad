@@ -1606,6 +1606,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         if keepOpenForVoice || confirmingCloudSearch { return }
         voice.stop()
         removeKeyMonitor()
+        // A question still in flight has nobody left to answer to, and its
+        // deadline ticker stops with the panel. End the call now and do
+        // not leave the CLI running with what it was sent.
+        leaveWhereIs()
         // Click-away dismissal: don't yank focus back (user moved it).
         panel?.orderOut(nil)
     }

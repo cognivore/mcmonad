@@ -72,11 +72,18 @@ final class AskRunner: AskRunning {
 
         // Line-buffer stdout on the reader's thread; hand whole lines to the
         // main actor, in order, over the main queue.
+        // Both pipes must reach end-of-file before the exit status is
+        // read as "no answer": the last line can still be in the pipe
+        // when the process exits, and deciding then would report failure
+        // for a call that succeeded (and re-send the same content later).
+        let drained = DispatchGroup()
+        drained.enter()
+        drained.enter()
         let buffer = Bytes()
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
             // Empty read = EOF; unhook, or this handler spins until exit.
-            guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
+            guard !chunk.isEmpty else { handle.readabilityHandler = nil; drained.leave(); return }
             buffer.data.append(chunk)
             while let nl = buffer.data.firstIndex(of: 0x0A) {
                 let lineData = buffer.data.subdata(in: buffer.data.startIndex..<nl)
@@ -99,18 +106,20 @@ final class AskRunner: AskRunning {
         let errData = Bytes()
         stderr.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
-            guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
+            guard !chunk.isEmpty else { handle.readabilityHandler = nil; drained.leave(); return }
             errData.data.append(chunk)
         }
         p.terminationHandler = { [weak self] proc in
             let status = proc.terminationStatus
             let pid = proc.processIdentifier
-            let errText = String(data: errData.data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            DispatchQueue.main.async { [weak self] in
+            // Runs on the main queue after every stdout line already
+            // posted there, and after stderr has stopped being written.
+            drained.notify(queue: .main) { [weak self] in
                 MainActor.assumeIsolated {
                     guard let self, self.runID == runID, self.process?.processIdentifier == pid else { return }
                     self.process = nil
+                    let errText = String(data: errData.data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     // A result line normally arrives before exit; if it did
                     // not, the exit status is the only evidence we have.
                     if !self.finished {
@@ -132,6 +141,17 @@ final class AskRunner: AskRunning {
         process = p
         Self.logger.info("ask: \(Ask.model, privacy: .public) via \(cli, privacy: .public)")
 
+        // No call may run for ever. A CLI stuck on the network or on a
+        // prompt of its own would otherwise hold what it was sent, and
+        // block every later refresh, until the daemon exits.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.deadline) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.runID == runID, !self.finished else { return }
+                self.stopProcess()
+                self.finish(.failed("claude gave no answer within \(Int(Self.deadline)) seconds"))
+            }
+        }
+
         // Feed the prompt and close stdin so the CLI knows it has everything.
         let data = Data(prompt.utf8)
         let writer = stdin.fileHandleForWriting
@@ -143,10 +163,18 @@ final class AskRunner: AskRunning {
         }
     }
 
+    /// The longest any call may take, whoever started it.
+    static let deadline: TimeInterval = 180
+
     /// Stop a running call. No outcome is reported for a cancelled call.
     func cancel() {
         runID = nil
         finished = true
+        stopProcess()
+    }
+
+    /// Detach from the child process and terminate it.
+    private func stopProcess() {
         guard let p = process else { return }
         process = nil
         p.terminationHandler = nil

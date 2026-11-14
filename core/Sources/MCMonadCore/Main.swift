@@ -443,10 +443,23 @@ final class TerminationWatch {
     }
 }
 
+/// How long one Accessibility call may wait for an application to answer.
+/// Long enough for a busy but live application, short enough that a hung
+/// one costs a layout pass a second or two and not a minute.
+private let axMessagingTimeout: Float = 1.0
+
 @main
 struct MCMonadCoreApp {
     static func main() {
         logger.info("mcmonad-core starting")
+
+        // One application that has stopped answering Accessibility calls
+        // must not stop the daemon. Every AX read and write here runs on
+        // the main thread, and the default wait is about six seconds per
+        // call; a layout pass makes several calls per window. Setting the
+        // timeout on the system-wide element applies it to every element
+        // this process creates.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), axMessagingTimeout)
 
         // 1. Check / prompt accessibility permission.
         // Remember what the executable looked like at launch, so a later

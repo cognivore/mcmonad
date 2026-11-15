@@ -80,7 +80,8 @@ final class AskRunner: AskRunning {
             }
         }
         task = Task { @MainActor [weak self] in
-            guard let self else { return }
+            // Cancelled (or started again) before this body ran: nothing.
+            guard let self, self.runID == runID else { return }
             let settings: ClaudeAccess.Settings
             switch self.loadSettings() {
             case .failure(let problem): self.finish(.unavailable(problem.why), runID: runID); return
@@ -146,6 +147,7 @@ final class AskRunner: AskRunning {
             }
             guard self.runID == runID else { return nil }
         }
+        guard self.runID == runID else { return nil }
         let env = ProcessInfo.processInfo.environment
         let environment = ClaudeAccess.cliEnvironment(inherited: env, home: NSHomeDirectory(),
                                                       user: env["USER"] ?? NSUserName(), token: token)

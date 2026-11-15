@@ -63,11 +63,22 @@ final class AskRunner: AskRunning {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    /// The longest a whole question may take, both routes and fetching
+    /// their credentials. "What's up" has no clock of its own.
+    static let deadline: TimeInterval = 180
+
     func start(_ request: Ask.Request) {
         cancel()
         let runID = UUID()
         self.runID = runID
         finished = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.deadline) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.runID == runID, !self.finished else { return }
+                self.finish(.failed("no answer within \(Int(Self.deadline)) seconds"), runID: runID)
+                self.cancel()
+            }
+        }
         task = Task { @MainActor [weak self] in
             guard let self else { return }
             let settings: ClaudeAccess.Settings

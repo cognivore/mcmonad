@@ -22,7 +22,7 @@ enum ClaudeRoutes {
     static let commandDeadline: TimeInterval = 60
 
     /// The secret, or why it could not be had (never the secret's text).
-    static func fetch(_ secret: ClaudeAccess.Secret) async -> Result<String, ClaudeAccess.Problem> {
+    static func fetch(_ secret: ClaudeAccess.Secret, deadline: TimeInterval = commandDeadline) async -> Result<String, ClaudeAccess.Problem> {
         switch secret {
         case .file(let raw):
             let path = raw.hasPrefix("~/") ? NSHomeDirectory() + String(raw.dropFirst(1)) : raw
@@ -38,13 +38,13 @@ enum ClaudeRoutes {
             }
             return ClaudeAccess.credential(text).mapError { ClaudeAccess.Problem("\(path) \($0.why)") }
         case .command(let argv):
-            return await run(argv).flatMap { ClaudeAccess.credential($0).mapError { ClaudeAccess.Problem("\(argv[0]) printed a value that \($0.why)") } }
+            return await run(argv, deadline: deadline).flatMap { ClaudeAccess.credential($0).mapError { ClaudeAccess.Problem("\(argv[0]) printed a value that \($0.why)") } }
         }
     }
 
     /// Runs `argv` with no input and its errors discarded; its output, if
     /// it exits 0 within `commandDeadline`.
-    private static func run(_ argv: [String]) async -> Result<String, ClaudeAccess.Problem> {
+    private static func run(_ argv: [String], deadline: TimeInterval) async -> Result<String, ClaudeAccess.Problem> {
         let env = ProcessInfo.processInfo.environment
         let user = env["USER"] ?? NSUserName()
         let path = ClaudeAccess.searchPath(home: NSHomeDirectory(), user: user, inherited: env["PATH"])
@@ -69,26 +69,43 @@ enum ClaudeRoutes {
         p.standardOutput = out
         return await withCheckedContinuation { (done: CheckedContinuation<Result<String, ClaudeAccess.Problem>, Never>) in
             let once = Once()
-            p.terminationHandler = { proc in
-                let data = out.fileHandleForReading.readDataToEndOfFile()
-                guard proc.terminationReason == .exit, proc.terminationStatus == 0 else {
-                    once.run { done.resume(returning: .failure(ClaudeAccess.Problem("\(argv[0]) exited with status \(proc.terminationStatus)"))) }
-                    return
-                }
-                once.run { done.resume(returning: .success(String(decoding: data, as: UTF8.self))) }
+            // The output is read to its end on its own thread; the answer
+            // needs both that end and the exit. A child the command left
+            // behind can hold the pipe open for ever: the deadline answers
+            // then, whatever else has or has not happened.
+            let output = Output()
+            let finished = DispatchGroup()
+            finished.enter()
+            finished.enter()
+            DispatchQueue.global().async {
+                output.data = out.fileHandleForReading.readDataToEndOfFile()
+                finished.leave()
             }
+            p.terminationHandler = { _ in finished.leave() }
             do {
                 try p.run()
             } catch {
+                try? out.fileHandleForWriting.close()   // lets the reader thread end
                 once.run { done.resume(returning: .failure(ClaudeAccess.Problem("\(argv[0]) could not start: \(error.localizedDescription)"))) }
                 return
             }
-            DispatchQueue.global().asyncAfter(deadline: .now() + commandDeadline) {
-                guard p.isRunning else { return }
-                p.terminate()
-                once.run { done.resume(returning: .failure(ClaudeAccess.Problem("\(argv[0]) gave nothing within \(Int(commandDeadline)) s"))) }
+            finished.notify(queue: .global()) {
+                guard p.terminationReason == .exit, p.terminationStatus == 0 else {
+                    once.run { done.resume(returning: .failure(ClaudeAccess.Problem("\(argv[0]) exited with status \(p.terminationStatus)"))) }
+                    return
+                }
+                once.run { done.resume(returning: .success(String(decoding: output.data, as: UTF8.self))) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + deadline) {
+                if p.isRunning { p.terminate() }
+                once.run { done.resume(returning: .failure(ClaudeAccess.Problem("\(argv[0]) gave nothing within \(Int(deadline)) s"))) }
             }
         }
+    }
+
+    /// What the reader thread read, handed to whoever answers.
+    private final class Output: @unchecked Sendable {
+        var data = Data()
     }
 
     /// Resumes a continuation once, whichever of several paths gets there.

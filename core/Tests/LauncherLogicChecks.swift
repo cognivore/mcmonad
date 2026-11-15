@@ -554,6 +554,17 @@ enum LauncherLogicChecks {
         precondition(reported == 0, "a cancelled run reported an outcome")
         guard case .unavailable(let both) = await run(ClaudeAccess.Settings(cli: broken, apiKey: .command(["/usr/bin/false"]))),
               both.contains("SDK:"), both.contains("API key:") else { preconditionFailure("both reasons") }
+        // A key command that exits but leaves a child holding its output
+        // open does not hang the question: the deadline answers.
+        let started = Date()
+        guard case .failure = await ClaudeRoutes.fetch(.command(["/bin/sh", "-c", "sleep 5 & echo \(token)"]), deadline: 1) else {
+            preconditionFailure("a held-open pipe was believed")
+        }
+        precondition(Date().timeIntervalSince(started) < 3, "the deadline did not answer")
+        guard case .success(token) = await ClaudeRoutes.fetch(.command(["/bin/echo", token])),
+              case .failure = await ClaudeRoutes.fetch(.command(["/nonexistent/key-command"])) else {
+            preconditionFailure("key commands")
+        }
     }
 
     static func checkRecency() {

@@ -227,7 +227,6 @@ final class WhatsUpCache {
         let manifold = Ask.manifold(question: WhatsUp.question, snapshot: snap, text: text, only: tags,
                                     budget: Self.textBudget, perWindow: Self.textPerWindow)
         for tag in tags { inFlight[tag] = entries[tag]?.fingerprint }
-        let known = manifold.tags
         let call = UUID()
         activeCall = call
         runner.onFinished = { [weak self] outcome in
@@ -235,9 +234,7 @@ final class WhatsUpCache {
             self.activeCall = nil
             self.finished(outcome)
         }
-        runner.start(prompt: Ask.prompt(for: manifold), arguments: WhatsUp.arguments) {
-            WhatsUp.parseLine($0, knownTags: known)
-        }
+        runner.start(WhatsUp.request(for: manifold))
         onUpdated?()
     }
 

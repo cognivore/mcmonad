@@ -1,5 +1,8 @@
 import Foundation
 
+// AI-assisted update (one request for either route): model claude-opus-5-5;
+// reasoning effort unavailable (not exposed by the harness).
+
 /// The pure half of "where is …": recognising the question and sorting the
 /// model's answer into windows we have. The shared machinery is in `Ask`.
 
@@ -46,7 +49,7 @@ enum WhereIs {
 
     /// The structured-output contract. `id` is the window id from the manifold.
     static let schemaJSON = #"""
-    {"type":"object","properties":{"matches":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"reason":{"type":"string"}},"required":["id","reason"]}}},"required":["matches"]}
+    {"type":"object","properties":{"matches":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"reason":{"type":"string"}},"required":["id","reason"],"additionalProperties":false}}},"required":["matches"],"additionalProperties":false}
     """#
 
     static let arguments = Ask.arguments(schema: schemaJSON, systemPrompt: systemPrompt)
@@ -81,5 +84,13 @@ enum WhereIs {
 
     static func parseLine(_ line: String, known: Set<UInt32>) -> Ask.StreamItem {
         Ask.parseLine(line) { answer(from: $0, known: known) }
+    }
+
+    /// The question about `manifold`: its windows are the ids an answer
+    /// may name.
+    static func request(for manifold: Ask.Manifold) -> Ask.Request {
+        let known = manifold.windowIds
+        return Ask.Request(systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
+                           answer: { answer(from: $0, known: known) })
     }
 }

@@ -1,15 +1,20 @@
 import Foundation
 import os
 
-/// Runs one launcher question through the Claude Code CLI already on this
-/// Mac (`claude -p`), streaming its transcript back and ending in exactly one
-/// `Ask.Outcome`. The prompt goes in on stdin and the CLI is told not to
-/// persist the local session. This does not control the provider's retention.
+// AI-assisted update (SDK route first, locked down like laptop-pool's workers;
+// the Messages API only as its fallback): model claude-opus-5-5; reasoning
+// effort unavailable (not exposed by the harness).
+
+/// Runs one launcher question to the model and ends in exactly one
+/// `Ask.Outcome`. The SDK route first — Claude Code headless (`claude -p`)
+/// on the user's own login, streaming its transcript back; the Messages API
+/// only when that route could not answer and a key source is configured
+/// (`ClaudeAccess`). The prompt goes in on stdin and no local session is
+/// persisted. This does not control the provider's retention.
 @MainActor
 protocol AskRunning: AnyObject {
     var onFinished: ((Ask.Outcome) -> Void)? { get set }
-    func start(prompt: String, arguments: [String],
-               parse: @escaping @Sendable (String) -> Ask.StreamItem)
+    func start(_ request: Ask.Request)
     func cancel()
 }
 
@@ -27,6 +32,11 @@ final class AskRunner: AskRunning {
     private var process: Process?
     private var finished = false
     private var runID: UUID?
+    private var task: Task<Void, Never>?
+
+    /// The longest the SDK route may take before the API route is tried;
+    /// the launcher gives a whole question 120 s.
+    static let sdkDeadline: TimeInterval = 75
 
     /// A byte buffer one reader thread appends to; boxed so the sendable
     /// handlers may hold it.
@@ -34,48 +44,117 @@ final class AskRunner: AskRunning {
         var data = Data()
     }
 
-    /// Locate the CLI; nil when no candidate is an executable file.
+    /// Locate the CLI when the settings do not name it; nil when no
+    /// candidate is an executable file.
     static func locateCLI() -> String? {
         let env = ProcessInfo.processInfo.environment
         return Ask.candidates(home: NSHomeDirectory(), path: env["PATH"])
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    /// `arguments` are the question's CLI arguments (schema + system prompt
-    /// included); `parse` turns one stream-json line into what to show.
-    func start(prompt: String, arguments: [String],
-               parse: @escaping @Sendable (String) -> Ask.StreamItem) {
+    func start(_ request: Ask.Request) {
         cancel()
         let runID = UUID()
         self.runID = runID
         finished = false
-        guard let cli = Self.locateCLI() else {
-            let looked = Ask.candidates(home: NSHomeDirectory(),
-                                        path: ProcessInfo.processInfo.environment["PATH"])
-            finish(.unavailable("No claude CLI found. Looked in:\n" + looked.joined(separator: "\n")))
-            return
+        task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let settings: ClaudeAccess.Settings
+            switch ClaudeRoutes.loadSettings() {
+            case .failure(let problem): self.finish(.unavailable(problem.why), runID: runID); return
+            case .success(let s): settings = s
+            }
+            guard let sdk = await self.runSDK(request, settings: settings, runID: runID), self.runID == runID else { return }
+            switch sdk {
+            case .answered, .malformed:
+                // An answer, or one in the wrong shape: the model was
+                // reached, and asking again elsewhere would pay twice.
+                self.finish(sdk, runID: runID)
+                return
+            case .unavailable(let why), .failed(let why):
+                guard let key = settings.apiKey else {
+                    self.finish(sdk, runID: runID)
+                    return
+                }
+                Self.logger.info("ask: SDK route did not answer; trying the API")
+                self.onNote?("SDK route did not answer (\(why.split(separator: "\n").first ?? "")); asking the API")
+                let api: Ask.Outcome
+                switch await ClaudeRoutes.fetch(key) {
+                case .failure(let problem): api = .unavailable("API key: \(problem.why)")
+                case .success(let key): api = await ClaudeRoutes.callAPI(request, key: key)
+                }
+                guard self.runID == runID else { return }
+                if case .answered = api { Self.logger.info("ask: answered by the API") }
+                self.finish(Self.both(sdk: sdk, api: api), runID: runID)
+            }
         }
+    }
+
+    /// When both routes failed, both reasons.
+    private static func both(sdk: Ask.Outcome, api: Ask.Outcome) -> Ask.Outcome {
+        func why(_ o: Ask.Outcome) -> String? {
+            switch o {
+            case .unavailable(let w), .failed(let w), .malformed(let w): return w
+            case .answered: return nil
+            }
+        }
+        guard let a = why(api), let s = why(sdk) else { return api }
+        let text = "SDK: \(s)\nAPI: \(a)"
+        switch api {
+        case .unavailable: return .unavailable(text)
+        case .malformed: return .malformed(text)
+        default: return .failed(text)
+        }
+    }
+
+    // MARK: - The SDK route
+
+    /// One run of the locked-down CLI; nil when cancelled.
+    private func runSDK(_ request: Ask.Request, settings: ClaudeAccess.Settings, runID: UUID) async -> Ask.Outcome? {
+        guard let cli = settings.cli ?? Self.locateCLI() else {
+            let looked = Ask.candidates(home: NSHomeDirectory(), path: ProcessInfo.processInfo.environment["PATH"])
+            return .unavailable("No claude CLI found. Looked in:\n" + looked.joined(separator: "\n"))
+        }
+        guard FileManager.default.isExecutableFile(atPath: cli) else { return .unavailable("\(cli) is not executable") }
+        var token: String?
+        if let secret = settings.oauthToken {
+            switch await ClaudeRoutes.fetch(secret) {
+            case .failure(let problem): return .unavailable("OAuth token: \(problem.why)")
+            case .success(let t): token = t
+            }
+            guard self.runID == runID else { return nil }
+        }
+        let env = ProcessInfo.processInfo.environment
+        let environment = ClaudeAccess.cliEnvironment(inherited: env, home: NSHomeDirectory(),
+                                                      user: env["USER"] ?? NSUserName(), token: token)
+        // An empty private directory: nothing for the CLI to find around it.
+        let cwd = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcmonad-ask", isDirectory: true)
+        try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return await withCheckedContinuation { (done: CheckedContinuation<Ask.Outcome?, Never>) in
+            launch(cli: cli, request: request, environment: environment, cwd: cwd, runID: runID) { done.resume(returning: $0) }
+        }
+    }
+
+    /// Starts the CLI and calls `done` exactly once: with its outcome, or
+    /// nil when the run is cancelled.
+    private func launch(cli: String, request: Ask.Request, environment: [String: String], cwd: URL, runID: UUID,
+                        done: @escaping (Ask.Outcome?) -> Void) {
+        sdkDone = done
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cli)
-        p.arguments = arguments
-        p.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = [NSHomeDirectory() + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-            .joined(separator: ":") + (env["PATH"].map { ":" + $0 } ?? "")
-        p.environment = env
-
+        p.arguments = request.arguments
+        p.currentDirectoryURL = cwd
+        p.environment = environment
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         p.standardInput = stdin
         p.standardOutput = stdout
         p.standardError = stderr
 
         // Line-buffer stdout on the reader's thread; hand whole lines to the
-        // main actor, in order, over the main queue.
-        // Both pipes must reach end-of-file before the exit status is
-        // read as "no answer": the last line can still be in the pipe
-        // when the process exits, and deciding then would report failure
-        // for a call that succeeded (and re-send the same content later).
+        // main actor, in order, over the main queue. Both pipes must reach
+        // end-of-file before the exit status is read as "no answer": the
+        // last line can still be in the pipe when the process exits.
         let drained = DispatchGroup()
         drained.enter()
         drained.enter()
@@ -89,14 +168,16 @@ final class AskRunner: AskRunning {
                 let lineData = buffer.data.subdata(in: buffer.data.startIndex..<nl)
                 buffer.data.removeSubrange(buffer.data.startIndex...nl)
                 guard let line = String(data: lineData, encoding: .utf8) else { continue }
-                let item = parse(line)
+                let item = request.parseLine(line)
                 DispatchQueue.main.async { [weak self] in
                     MainActor.assumeIsolated {
-                        guard let self, self.runID == runID, !self.finished else { return }
+                        guard let self, self.runID == runID, self.sdkDone != nil else { return }
                         switch item {
                         case .delta(let text): self.onTranscript?(text)
                         case .note(let text): self.onNote?(text)
-                        case .final(let outcome): self.finish(outcome)
+                        case .final(let outcome):
+                            self.stopProcess()
+                            self.resolveSDK(outcome)
                         case .ignore: break
                         }
                     }
@@ -112,8 +193,8 @@ final class AskRunner: AskRunning {
         p.terminationHandler = { [weak self] proc in
             let status = proc.terminationStatus
             let pid = proc.processIdentifier
-            // Runs on the main queue after every stdout line already
-            // posted there, and after stderr has stopped being written.
+            // Runs on the main queue after every stdout line already posted
+            // there, and after stderr has stopped being written.
             drained.notify(queue: .main) { [weak self] in
                 MainActor.assumeIsolated {
                     guard let self, self.runID == runID, self.process?.processIdentifier == pid else { return }
@@ -121,13 +202,9 @@ final class AskRunner: AskRunning {
                     let errText = String(data: errData.data, encoding: .utf8)?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     // A result line normally arrives before exit; if it did
-                    // not, the exit status is the only evidence we have.
-                    if !self.finished {
-                        let why = status == 0
-                            ? "claude exited without a result line" + (errText.isEmpty ? "" : "\n" + errText)
-                            : "claude exited with status \(status)" + (errText.isEmpty ? "" : "\n" + errText)
-                        self.finish(.failed(why))
-                    }
+                    // not, the exit status is the only evidence there is.
+                    self.resolveSDK(.failed((status == 0 ? "claude exited without a result line" : "claude exited with status \(status)")
+                        + (errText.isEmpty ? "" : "\n" + errText)))
                 }
             }
         }
@@ -135,25 +212,24 @@ final class AskRunner: AskRunning {
         do {
             try p.run()
         } catch {
-            finish(.unavailable("Could not start \(cli): \(error.localizedDescription)"))
+            resolveSDK(.unavailable("Could not start \(cli): \(error.localizedDescription)"))
             return
         }
         process = p
-        Self.logger.info("ask: \(Ask.model, privacy: .public) via \(cli, privacy: .public)")
+        Self.logger.info("ask: \(Ask.model, privacy: .public) via the SDK route (\(cli, privacy: .public))")
 
-        // No call may run for ever. A CLI stuck on the network or on a
-        // prompt of its own would otherwise hold what it was sent, and
-        // block every later refresh, until the daemon exits.
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.deadline) { [weak self] in
+        // No run may go on for ever. A CLI stuck on the network or on a
+        // prompt of its own would otherwise hold what it was sent.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.sdkDeadline) { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.runID == runID, !self.finished else { return }
+                guard let self, self.runID == runID, self.sdkDone != nil else { return }
                 self.stopProcess()
-                self.finish(.failed("claude gave no answer within \(Int(Self.deadline)) seconds"))
+                self.resolveSDK(.failed("claude gave no answer within \(Int(Self.sdkDeadline)) seconds"))
             }
         }
 
         // Feed the prompt and close stdin so the CLI knows it has everything.
-        let data = Data(prompt.utf8)
+        let data = Data(request.prompt.utf8)
         let writer = stdin.fileHandleForWriting
         DispatchQueue.global(qos: .userInitiated).async {
             // Cancellation closes stdin; a cancelled write is an expected
@@ -163,14 +239,23 @@ final class AskRunner: AskRunning {
         }
     }
 
-    /// The longest any call may take, whoever started it.
-    static let deadline: TimeInterval = 180
+    /// Where the SDK run in flight reports; called once, then cleared.
+    private var sdkDone: ((Ask.Outcome?) -> Void)?
+
+    private func resolveSDK(_ outcome: Ask.Outcome?) {
+        guard let done = sdkDone else { return }
+        sdkDone = nil
+        done(outcome)
+    }
 
     /// Stop a running call. No outcome is reported for a cancelled call.
     func cancel() {
         runID = nil
         finished = true
+        task?.cancel()
+        task = nil
         stopProcess()
+        resolveSDK(nil)   // a cancelled run ends without an outcome
     }
 
     /// Detach from the child process and terminate it.
@@ -184,8 +269,8 @@ final class AskRunner: AskRunning {
         p.terminate()
     }
 
-    private func finish(_ outcome: Ask.Outcome) {
-        guard !finished else { return }
+    private func finish(_ outcome: Ask.Outcome, runID: UUID) {
+        guard self.runID == runID, !finished else { return }
         finished = true
         // Only the kind is logged: the payloads can carry the model's words
         // about screen contents, which stay on screen.
@@ -194,8 +279,8 @@ final class AskRunner: AskRunning {
             Self.logger.info("ask: \(m.count, privacy: .public) window(s), \(dropped, privacy: .public) dropped")
         case .answered(.workspaces(let s, let dropped)):
             Self.logger.info("ask: \(s.count, privacy: .public) workspace summaries, \(dropped, privacy: .public) dropped")
-        case .unavailable: Self.logger.error("ask: claude CLI unavailable")
-        case .failed: Self.logger.error("ask: claude CLI failed")
+        case .unavailable: Self.logger.error("ask: no route to the model")
+        case .failed: Self.logger.error("ask: the model call failed")
         case .malformed: Self.logger.error("ask: answer was not in the schema")
         }
         onFinished?(outcome)

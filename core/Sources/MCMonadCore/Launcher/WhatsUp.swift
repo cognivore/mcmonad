@@ -36,7 +36,7 @@ enum WhatsUp {
 
     /// The structured-output contract. `tag` is the workspace tag from the manifold.
     static let schemaJSON = #"""
-    {"type":"object","properties":{"workspaces":{"type":"array","items":{"type":"object","properties":{"tag":{"type":"string"},"summary":{"type":"string"},"reason":{"type":"string"}},"required":["tag","summary","reason"]}}},"required":["workspaces"]}
+    {"type":"object","properties":{"workspaces":{"type":"array","items":{"type":"object","properties":{"tag":{"type":"string"},"summary":{"type":"string"},"reason":{"type":"string"}},"required":["tag","summary","reason"],"additionalProperties":false}}},"required":["workspaces"],"additionalProperties":false}
     """#
 
     static let arguments = Ask.arguments(schema: schemaJSON, systemPrompt: systemPrompt)
@@ -67,5 +67,11 @@ enum WhatsUp {
 
     static func parseLine(_ line: String, knownTags: Set<String>) -> Ask.StreamItem {
         Ask.parseLine(line) { answer(from: $0, knownTags: knownTags) }
+    }
+
+    static func request(for manifold: Ask.Manifold) -> Ask.Request {
+        let tags = manifold.tags
+        return Ask.Request(systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
+                           answer: { answer(from: $0, knownTags: tags) })
     }
 }

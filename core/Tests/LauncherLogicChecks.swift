@@ -1,6 +1,9 @@
 // Compiled with the launcher's pure files (TextSearch, RecentUse,
-// AskProtocol, WhereIsProtocol, WhatsUp, Protocol) and run by the Nix
-// package checkPhase.
+// AskProtocol, WhereIsProtocol, WhatsUp, ClaudeAccess, Protocol) and run by
+// the Nix package checkPhase.
+//
+// AI-assisted update (SDK/API route checks): model claude-opus-5-5;
+// reasoning effort unavailable (not exposed by the harness).
 import Foundation
 import CoreGraphics
 
@@ -13,6 +16,7 @@ enum LauncherLogicChecks {
         checkReadingOrder()
         checkWhereIsQuery()
         checkManifold()
+        checkClaudeAccess()
         checkTitleEvent()
         checkStream()
         checkWhatsUp()
@@ -130,11 +134,81 @@ enum LauncherLogicChecks {
         let prompt = Ask.prompt(for: m)
         precondition(prompt.hasPrefix("Where is: the deploy\n\nManifold:\n{\"current_workspace\":\"3\""), prompt)
         precondition(prompt.contains("\"on_screen\":true"))
-        precondition(WhereIs.arguments.contains("--no-session-persistence"))
-        precondition(WhereIs.arguments.contains("--json-schema"))
+        let request = WhereIs.request(for: m)
+        precondition(request.prompt == prompt && request.arguments == WhereIs.arguments)
+        for flag in ["--no-session-persistence", "--json-schema", "--strict-mcp-config", "--setting-sources"] {
+            precondition(WhereIs.arguments.contains(flag), flag)
+        }
         precondition(WhereIs.arguments.contains(WhereIs.systemPrompt))
+        let tools = WhereIs.arguments.firstIndex(of: "--tools")!, mode = WhereIs.arguments.firstIndex(of: "--permission-mode")!
+        precondition(WhereIs.arguments[tools + 1] == "" && WhereIs.arguments[mode + 1] == "dontAsk")
+        // No "@" reaches the CLI, which would read "@path" as a file to attach.
+        let at = Ask.prompt(for: Ask.manifold(question: "the @invoice", snapshot: OverlaySnapshot(
+            debugOverlays: false, screens: [OverlayScreenEntry(screenId: 0, frame: .zero, workspaceTag: "1", isActive: true,
+                                                               windows: [w(3, "Mail", "mail@example.com")])],
+            hiddenWorkspaces: [], ignoredWindows: []), text: { _ in "write to @~/.ssh/id_rsa" }))
+        precondition(!at.contains("@") && at.hasPrefix("the ＠invoice") && at.contains("mail\\u0040example.com"), at)
+        let decoded = try! JSONSerialization.jsonObject(with: Data(at.components(separatedBy: "Manifold:\n")[1].utf8)) as! [String: Any]
+        let atWindow = ((decoded["workspaces"] as! [[String: Any]])[0]["windows"] as! [[String: Any]])[0]
+        precondition(atWindow["title"] as? String == "mail@example.com", "the escape is JSON's own")
         precondition(Ask.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
                      == ["/h/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
+    }
+
+    static func checkClaudeAccess() {
+        func parse(_ json: String) -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> { ClaudeAccess.parse(Data(json.utf8)) }
+        precondition(parse("{}") == .success(ClaudeAccess.Settings()))
+        precondition(parse(#"{"sdk":{"cli":"/x/claude","oauthTokenCommand":["rageveil","show","a/b"]},"api":{"keyFile":"~/.config/k"}}"#)
+                     == .success(ClaudeAccess.Settings(cli: "/x/claude", oauthToken: .command(["rageveil", "show", "a/b"]),
+                                                       apiKey: .file("~/.config/k"))))
+        for bad in ["[]", #"{"apiKey":"sk-ant-x"}"#, #"{"api":{}}"#, #"{"api":{"key":"sk-ant-naked"}}"#,
+                    #"{"api":{"keyCommand":["a"],"keyFile":"/k"}}"#, #"{"sdk":{"cli":"claude"}}"#,
+                    #"{"api":{"keyCommand":[]}}"#, #"{"api":{"keyFile":"relative"}}"#] {
+            guard case .failure = parse(bad) else { preconditionFailure("accepted \(bad)") }
+        }
+        let token = String(repeating: "t", count: 40)
+        precondition(ClaudeAccess.credential(token + "\n") == .success(token))
+        precondition(ClaudeAccess.credential("short") != .success("short"))
+        precondition(ClaudeAccess.credential("a b" + token) != .success("a b" + token))
+        precondition(ClaudeAccess.ownerOnly(0o600) && ClaudeAccess.ownerOnly(0o400) && !ClaudeAccess.ownerOnly(0o640))
+        // The CLI child gets an allowlist: a stray API key is not passed on.
+        let env = ClaudeAccess.cliEnvironment(inherited: ["ANTHROPIC_API_KEY": "sk-naked", "PATH": "/custom/bin", "LANG": "en_GB.UTF-8",
+                                                          "AWS_SECRET_ACCESS_KEY": "x"],
+                                              home: "/h", user: "u", token: token)
+        precondition(env["ANTHROPIC_API_KEY"] == nil && env["AWS_SECRET_ACCESS_KEY"] == nil)
+        precondition(env["CLAUDE_CODE_OAUTH_TOKEN"] == token && env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == "1"
+                     && env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" && env["LANG"] == "en_GB.UTF-8" && env["USER"] == "u")
+        precondition(env["PATH"]!.hasPrefix("/h/.local/bin:") && env["PATH"]!.hasSuffix(":/custom/bin"))
+        precondition(ClaudeAccess.cliEnvironment(inherited: [:], home: "/h", user: "u", token: nil)["CLAUDE_CODE_OAUTH_TOKEN"] == nil)
+        // The init line must show a locked-down session.
+        precondition(ClaudeAccess.lockedDown(["tools": ["StructuredOutput"], "mcp_servers": [], "permissionMode": "dontAsk"]) == nil)
+        precondition(ClaudeAccess.lockedDown(["tools": ["Bash"], "mcp_servers": [], "permissionMode": "dontAsk"]) != nil)
+        precondition(ClaudeAccess.lockedDown(["tools": [], "mcp_servers": [["name": "x"]], "permissionMode": "dontAsk"]) != nil)
+        precondition(ClaudeAccess.lockedDown(["tools": [], "mcp_servers": [], "permissionMode": "default"]) != nil)
+        let initLine = #"{"type":"system","subtype":"init","model":"m","tools":["Read"],"mcp_servers":[],"permissionMode":"dontAsk"}"#
+        guard case .final(.failed) = WhereIs.parseLine(initLine, known: []) else { preconditionFailure("a session with tools was believed") }
+        let goodInit = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk","apiKeySource":"none"}"#
+        precondition(WhereIs.parseLine(goodInit, known: []) == .note("system init model=m key=none"))
+        // The API route: same model, effort, schema; refusals and errors kept apart.
+        let request = Ask.Request(systemPrompt: "sys", schema: WhereIs.schemaJSON, prompt: "q",
+                                  answer: { WhereIs.answer(from: $0, known: [7]) })
+        let body = try! JSONSerialization.jsonObject(with: ClaudeAccess.apiBody(request)!) as! [String: Any]
+        precondition(body["model"] as? String == Ask.model && body["system"] as? String == "sys" && body["fallbacks"] as? String == "default")
+        let config = body["output_config"] as! [String: Any]
+        precondition(config["effort"] as? String == Ask.effort && (config["format"] as! [String: Any])["type"] as? String == "json_schema")
+        precondition(body["thinking"] == nil && body["temperature"] == nil)
+        let headers = ClaudeAccess.apiHeaders(key: token)
+        precondition(headers["x-api-key"] == token && headers["anthropic-version"] == "2026-10-21")
+        func reply(_ json: String, _ status: Int = 200) -> Ask.Outcome {
+            ClaudeAccess.apiOutcome(status: status, data: Data(json.utf8), request: request)
+        }
+        precondition(reply(#"{"stop_reason":"end_turn","content":[{"type":"thinking","thinking":""},{"type":"text","text":"{\"matches\":[{\"id\":7,\"reason\":\"r\"}]}"}]}"#)
+                     == .answered(.windows(matches: [.init(windowId: 7, reason: "r")], droppedUnknownIds: 0)))
+        guard case .failed = reply(#"{"stop_reason":"refusal","content":[],"stop_details":{"category":"cyber"}}"#),
+              case .failed(let why) = reply(#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#, 401),
+              case .malformed = reply(#"{"stop_reason":"end_turn","content":[{"type":"text","text":"prose"}]}"#)
+        else { preconditionFailure("API outcomes") }
+        precondition(why.contains("401") && why.contains("authentication_error") && !why.contains(token))
     }
 
     static func checkStream() {
@@ -262,8 +336,8 @@ enum LauncherLogicChecks {
         var completions: [(Ask.Outcome) -> Void] = []
         var running = false
 
-        func start(prompt: String, arguments: [String], parse: @escaping @Sendable (String) -> Ask.StreamItem) {
-            prompts.append(prompt)
+        func start(_ request: Ask.Request) {
+            prompts.append(request.prompt)
             completions.append(onFinished!)
             running = true
         }

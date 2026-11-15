@@ -958,10 +958,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func askWhereIs(_ query: WhereIsQuery) {
-        beginAsk(question: query.question, terms: query.terms, arguments: WhereIs.arguments) { manifold in
-            let known = manifold.windowIds
-            return { WhereIs.parseLine($0, known: known) }
-        }
+        beginAsk(question: query.question, terms: query.terms, request: WhereIs.request(for:))
     }
 
     /// Cached rows, with when they were made. Nothing is asked unless the
@@ -1054,11 +1051,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     /// Send the question and the manifold of every window to the model, and
-    /// show the exchange while it thinks. `parse` is built once the manifold
-    /// exists, so the answer can be checked against what was asked about.
+    /// show the exchange while it thinks. The request is built once the
+    /// manifold exists, so the answer can be checked against what was asked
+    /// about.
     private func beginAsk(
-        question: String, terms: [String], arguments: [String],
-        parse: (Ask.Manifold) -> @Sendable (String) -> Ask.StreamItem
+        question: String, terms: [String],
+        request makeRequest: (Ask.Manifold) -> Ask.Request
     ) {
         leaveWhereIs()
         askTerms = terms
@@ -1086,14 +1084,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             snapshot: snap,
             text: { [weak self] wid in self?.screenIndex?.entry(for: wid)?.text }
         )
-        let prompt = Ask.prompt(for: manifold)
+        let request = makeRequest(manifold)
         let cli = AskRunner.locateCLI() ?? "claude"
         let windows = manifold.workspaces.reduce(0) { $0 + $1.windows.count }
         let withText = manifold.workspaces.flatMap(\.windows).filter { !($0.text ?? "").isEmpty }.count
         Self.logger.info("ask evidence: \(windows, privacy: .public) windows, \(withText, privacy: .public) with screen text")
-        appendTranscript("→ \(cli) " + arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n")
-        appendTranscript("→ stdin (\(prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces):\n\(prompt)\n\n← ")
-        askRunner.start(prompt: prompt, arguments: arguments, parse: parse(manifold))
+        appendTranscript("→ SDK route: \(cli) " + request.arguments.map(Self.shellQuoted).joined(separator: " ")
+                         + "\n  (the Messages API answers only if this cannot, and only with a key source in ~/.config/mcmonad/claude.json)\n\n")
+        appendTranscript("→ stdin (\(request.prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces):\n\(request.prompt)\n\n← ")
+        askRunner.start(request)
     }
 
     /// Once a second while asking: the hint counts up; past the deadline the

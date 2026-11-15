@@ -1,5 +1,8 @@
 import Foundation
 
+// AI-assisted update (the SDK and API routes, @ escaping): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+
 /// What every launcher question to the model shares — "where is …" and
 /// "what's up": describing every window to it (the manifold), calling the
 /// Claude Code CLI already on this Mac, and reading its stream back into one
@@ -11,9 +14,10 @@ enum Ask {
     static let effort = "low"
 
     /// Arguments after the executable. Print mode with structured output and
-    /// a streamed transcript; no tools; request no local session history.
-    /// The prompt carries screen text; this flag does not control retention
-    /// at the provider or other logging configured in the user's CLI.
+    /// a streamed transcript; locked down the way laptop-pool runs the Agent
+    /// SDK: no tools, no MCP server, no settings, nothing to ask, and no
+    /// local session history. The prompt carries screen text; these flags do
+    /// not control retention at the provider.
     static func arguments(schema: String, systemPrompt: String) -> [String] {
         [
             "-p",
@@ -21,6 +25,10 @@ enum Ask {
             "--effort", effort,
             "--no-session-persistence",
             "--tools", "",
+            "--permission-mode", "dontAsk",
+            "--strict-mcp-config",
+            "--mcp-config", #"{"mcpServers":{}}"#,
+            "--setting-sources", "",
             "--exclude-dynamic-system-prompt-sections",
             "--output-format", "stream-json",
             "--verbose",
@@ -30,8 +38,22 @@ enum Ask {
         ]
     }
 
-    /// Where the Claude Code CLI may live when the daemon's own PATH (a
-    /// launchd agent's, so nearly empty) does not name it.
+    /// One question for the model, whichever route takes it: the prompt,
+    /// the system prompt and schema it is asked under, and how its
+    /// structured answer is read back.
+    struct Request: Sendable {
+        let systemPrompt: String
+        let schema: String
+        let prompt: String
+        let answer: @Sendable ([String: Any]) -> Answer?
+
+        var arguments: [String] { Ask.arguments(schema: schema, systemPrompt: systemPrompt) }
+        func parseLine(_ line: String) -> StreamItem { Ask.parseLine(line, answer: answer) }
+    }
+
+    /// Where the Claude Code CLI may live when the settings do not name it
+    /// and the daemon's own PATH (a launchd agent's, so nearly empty) does
+    /// not either.
     static func candidates(home: String, path: String?) -> [String] {
         var dirs = [home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
         for dir in (path ?? "").split(separator: ":").map(String.init) where !dirs.contains(dir) {
@@ -111,11 +133,16 @@ enum Ask {
         return Manifold(question: question, currentWorkspace: current, workspaces: workspaces)
     }
 
+    /// The question, then the manifold. Every "@" is escaped: the CLI reads
+    /// "@path" in a prompt as a file to attach, and a window title or a line
+    /// of screen text could name one. (In the JSON it is the escape \\u0040;
+    /// in the question line, a full-width ＠.)
     static func prompt(for manifold: Manifold) -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let json = (try? encoder.encode(manifold)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        return "\(manifold.question)\n\nManifold:\n\(json)"
+        let question = manifold.question.replacingOccurrences(of: "@", with: "＠")
+        return "\(question)\n\nManifold:\n" + json.replacingOccurrences(of: "@", with: "\\u0040")
     }
 
     // MARK: - Answer (what the model tells us)
@@ -175,9 +202,13 @@ enum Ask {
             return .note(eventType)
         case "system":
             let subtype = (obj["subtype"] as? String) ?? ""
+            if subtype == "init", obj["tools"] != nil, let why = ClaudeAccess.lockedDown(obj) {
+                return .final(.failed("refused to use the answer: \(why)"))
+            }
             let model = (obj["model"] as? String).map { " model=\($0)" } ?? ""
             let status = (obj["status"] as? String).map { " \($0)" } ?? ""
-            return .note("system \(subtype)\(model)\(status)")
+            let source = (obj["apiKeySource"] as? String).map { " key=\($0)" } ?? ""
+            return .note("system \(subtype)\(model)\(status)\(source)")
         case "rate_limit_event":
             let status = ((obj["rate_limit_info"] as? [String: Any])?["status"] as? String)
                 ?? (obj["status"] as? String) ?? ""

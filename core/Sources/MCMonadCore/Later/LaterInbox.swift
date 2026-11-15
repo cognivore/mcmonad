@@ -91,6 +91,10 @@ struct LaterInbox: Sendable {
         await run("snooze", ["snooze", id.raw]).map { _ in () }
     }
 
+    func wake(_ id: BeadID) async -> Result<Void, LaterFault> {
+        await run("wake", ["wake", id.raw]).map { _ in () }
+    }
+
     func putBack(_ id: BeadID) async -> Result<Void, LaterFault> {
         await run("put-back", ["put-back", id.raw]).map { _ in () }
     }

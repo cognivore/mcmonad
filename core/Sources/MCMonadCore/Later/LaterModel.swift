@@ -109,7 +109,11 @@ struct LaterBead: Decodable, Equatable, Sendable {
     let deferUntil: Date?
     let labels: [String]
     let origin: LaterOrigin?
+    /// The open beads it waits for.
     let waitsFor: [BeadID]
+    /// What may be offered for it, as `later` decides from what bd accepts:
+    /// "start", "prompt", "putBack", "snooze", "wake", "done".
+    let actions: [String]
 }
 
 struct LaterUnreadable: Decodable, Equatable, Sendable {
@@ -219,6 +223,8 @@ enum LaterAction: Equatable, Sendable {
     case copyPrompt(BeadID)
     case openScreenshot(BeadID)
     case snooze(BeadID)
+    /// A snoozed bead comes back now.
+    case wake(BeadID)
     case done(BeadID)
     /// A started bead goes back to waiting its turn.
     case putBack(BeadID)
@@ -283,32 +289,47 @@ enum Later {
         }
     }
 
-    /// The actions on one bead. `originAlive`: its window is still open.
+    /// The actions `later` allows on one bead, as rows; opening its
+    /// screenshot is the launcher's own. `originAlive`: its window is still
+    /// open. An action this launcher does not know is left out.
     static func actionRows(_ bead: LaterBead, originAlive: Bool) -> [LaterRow] {
+        let id = bead.id
         var rows: [LaterRow] = []
-        let goTo: String
-        if let o = bead.origin {
-            goTo = originAlive ? ", and go back to \(o.title.isEmpty ? o.app : clip(o.title, 60))"
-                : (o.workspace.map { ", and go to workspace \($0) (its window has closed)" } ?? "")
-        } else { goTo = "" }
-        let verb = bead.standing == .started ? "Continue" : "Start"
-        rows.append(LaterRow(title: "\(verb): copy the prompt\(goTo)",
-                             detail: "marks \(bead.id) started; paste the prompt where the work is done",
-                             action: .start(bead.id), haystack: "", symbol: "play.circle"))
-        rows.append(LaterRow(title: "Copy the prompt only", detail: nil,
-                             action: .copyPrompt(bead.id), haystack: "", symbol: "doc.on.clipboard"))
-        if bead.origin?.screenshot != nil {
-            rows.append(LaterRow(title: "Open the screenshot", detail: nil,
-                                 action: .openScreenshot(bead.id), haystack: "", symbol: "photo"))
+        for action in bead.actions {
+            switch action {
+            case "start":
+                let goTo: String
+                if let o = bead.origin {
+                    goTo = originAlive ? ", and go back to \(o.title.isEmpty ? o.app : clip(o.title, 60))"
+                        : (o.workspace.map { ", and go to workspace \($0) (its window has closed)" } ?? "")
+                } else { goTo = "" }
+                let verb = bead.standing == .started ? "Continue" : "Start"
+                rows.append(LaterRow(title: "\(verb): copy the prompt\(goTo)",
+                                     detail: "marks \(id) started; paste the prompt where the work is done",
+                                     action: .start(id), haystack: "", symbol: "play.circle"))
+            case "prompt":
+                rows.append(LaterRow(title: "Copy the prompt only", detail: nil,
+                                     action: .copyPrompt(id), haystack: "", symbol: "doc.on.clipboard"))
+                if bead.origin?.screenshot != nil {
+                    rows.append(LaterRow(title: "Open the screenshot", detail: nil,
+                                         action: .openScreenshot(id), haystack: "", symbol: "photo"))
+                }
+            case "putBack":
+                rows.append(LaterRow(title: "Put it back: not started after all", detail: nil,
+                                     action: .putBack(id), haystack: "", symbol: "arrow.uturn.backward"))
+            case "snooze":
+                rows.append(LaterRow(title: "Snooze until tomorrow", detail: "hidden from ready until then",
+                                     action: .snooze(id), haystack: "", symbol: "moon.zzz"))
+            case "wake":
+                rows.append(LaterRow(title: "Wake it: ready again now", detail: nil,
+                                     action: .wake(id), haystack: "", symbol: "sun.max"))
+            case "done":
+                rows.append(LaterRow(title: "Done: close \(id)", detail: nil,
+                                     action: .done(id), haystack: "", symbol: "checkmark.circle"))
+            default:
+                continue
+            }
         }
-        if bead.standing == .started {
-            rows.append(LaterRow(title: "Put it back: not started after all", detail: nil,
-                                 action: .putBack(bead.id), haystack: "", symbol: "arrow.uturn.backward"))
-        }
-        rows.append(LaterRow(title: "Snooze until tomorrow", detail: "hidden from ready until then",
-                             action: .snooze(bead.id), haystack: "", symbol: "moon.zzz"))
-        rows.append(LaterRow(title: "Done: close \(bead.id)", detail: nil,
-                             action: .done(bead.id), haystack: "", symbol: "checkmark.circle"))
         return rows
     }
 

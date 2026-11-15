@@ -212,6 +212,11 @@ final class LaterController: NSObject, NSMenuDelegate {
         mutate { await inbox.done(id) }
     }
 
+    func wake(_ id: BeadID) {
+        guard let inbox else { return }
+        mutate { await inbox.wake(id) }
+    }
+
     func putBack(_ id: BeadID) {
         guard let inbox else { return }
         mutate { await inbox.putBack(id) }

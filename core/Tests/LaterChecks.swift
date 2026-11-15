@@ -2,7 +2,7 @@
 //
 // Compiled with Later/LaterModel.swift and Later/LaterInbox.swift and run by
 // the Nix package checkPhase. The protocol fixtures are what beads-mcmonad's
-// `later` 0.1.0 printed; the inbox checks run a stand-in `later` (a shell
+// `later` (1decc55) printed; the inbox checks run a stand-in `later` (a shell
 // script) through the same process code the daemon uses.
 import Foundation
 
@@ -47,9 +47,10 @@ enum LaterChecks {
       "createdAt":"2026-11-15T22:16:30Z","deferUntil":null,"labels":["app:ghostty","mcmonad","ws:3"],
       "origin":{"window":{"kind":"mac","windowId":123,"pid":456},"app":"Ghostty","title":"codex","workspace":"3",
                 "screenshot":"/later/attachments/20261115-221623.png","savedAt":"2026-11-15T22:16:23.759672Z"},
-      "waitsFor":[]},
+      "waitsFor":[],"actions":["start","prompt","snooze","done"]},
      {"id":"later-lwp","title":"after it","status":"open","standing":"waiting","priority":2,
-      "createdAt":"2026-11-15T22:16:30Z","deferUntil":null,"labels":["later"],"origin":null,"waitsFor":["later-u3r"]}]}
+      "createdAt":"2026-11-15T22:16:30Z","deferUntil":null,"labels":["later"],"origin":null,"waitsFor":["later-u3r"],
+      "actions":["prompt","snooze"]}]}
     """
 
     static let startedJSON = """
@@ -113,13 +114,19 @@ enum LaterChecks {
         expect(rows[0].haystack.contains("pangram") && rows[0].haystack.contains("ghostty"), "searchable")
 
         let a = Later.actionRows(s.beads[0], originAlive: true)
+        let ready = s.beads[0].id
+        expect(a.map(\.action) == [.start(ready), .copyPrompt(ready), .openScreenshot(ready), .snooze(ready), .done(ready)],
+               "the ready bead's actions, as later allows them")
         expect(a.first?.title.hasPrefix("Start: copy the prompt, and go back to codex") == true, "start, window alive")
-        expect(a.contains { $0.action == .openScreenshot(s.beads[0].id) }, "screenshot row")
-        expect(!a.contains { $0.action == .putBack(s.beads[0].id) }, "not started: nothing to put back")
         let gone = Later.actionRows(s.beads[0], originAlive: false)
         expect(gone.first?.title.contains("workspace 3") == true, "window gone: its workspace")
+        let blocked = s.beads[1].id
         let b = Later.actionRows(s.beads[1], originAlive: false)
-        expect(b.first?.title == "Start: copy the prompt" && !b.contains { $0.action == .openScreenshot(s.beads[1].id) }, "no origin")
+        expect(b.map(\.action) == [.copyPrompt(blocked), .snooze(blocked)], "a blocked bead is neither started nor closed")
+        let woken = LaterBead(id: blocked, title: "t", status: "deferred", standing: .waiting, priority: 2, createdAt: Date(),
+                              deferUntil: nil, labels: [], origin: nil, waitsFor: [], actions: ["wake", "prompt", "done", "teleport"])
+        expect(Later.actionRows(woken, originAlive: false).map(\.action) == [.wake(blocked), .copyPrompt(blocked), .done(blocked)],
+               "a snoozed bead is woken; an action this launcher does not know is left out")
 
         let src = LaterSource(window: .mac(windowId: 1, pid: 1), app: "Ghostty", title: "codex", workspace: "3")
         expect(Later.saveRow(words: "x", source: src, snapshot: s).title == "Save for later: “x” — with Ghostty — codex", "save with window")

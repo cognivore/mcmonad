@@ -1377,6 +1377,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .putBack(let id):
             later.putBack(id)
             backToLaterList()
+        case .wake(let id):
+            later.wake(id)
+            backToLaterList()
         }
     }
 

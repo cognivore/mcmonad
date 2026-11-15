@@ -186,6 +186,16 @@ enum LaterChecks {
                "the prompt says where the rest is and how to close it")
 
         expect(Later.screenshotName(at: at, windowId: 42, timeZone: utc) == "20261115-185703-w42", "screenshot name")
+
+        // A 1× ultrawide beside a 2× laptop screen: each window at its own display's scale.
+        let displays = [Later.Display(bounds: CGRect(x: 0, y: 0, width: 3440, height: 1440), scale: 1),
+                        Later.Display(bounds: CGRect(x: -1728, y: 300, width: 1728, height: 1117), scale: 2)]
+        expect(Later.scale(for: CGRect(x: 0, y: 30, width: 3440, height: 1410), displays: displays) == 1, "a window on the 1× display")
+        expect(Later.scale(for: CGRect(x: -1700, y: 400, width: 800, height: 600), displays: displays) == 2, "a window on the 2× display")
+        expect(Later.scale(for: CGRect(x: -200, y: 400, width: 1000, height: 600), displays: displays) == 1, "most of it decides")
+        expect(Later.scale(for: CGRect(x: -1727, y: 1416, width: 900, height: 700), displays: displays) == 2, "a parked window, one point on screen")
+        expect(Later.scale(for: CGRect(x: 9000, y: 9000, width: 10, height: 10), displays: displays) == 1, "on no display: 1×")
+        expect(Later.scale(for: .zero, displays: []) == 1, "no displays known: 1×")
         expect(Later.fence(for: "no tildes") == "~~~", "shortest fence")
         expect(Later.age(from: at, to: at.addingTimeInterval(30)) == "just now", "age")
         expect(Later.age(from: at, to: at.addingTimeInterval(7_300)) == "2 h ago", "age in hours")

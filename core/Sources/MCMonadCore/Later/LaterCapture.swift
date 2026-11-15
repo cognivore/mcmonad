@@ -18,8 +18,9 @@ enum LaterCapture {
         let missing: [String]
     }
 
-    /// Off the main actor. `scale` is the display's backing scale.
-    static func take(windowId: UInt32, into directory: String, at date: Date, scale: CGFloat) async -> Taken {
+    /// Off the main actor. `displays` are the attached displays, read on
+    /// the main actor: the window is captured at its own display's scale.
+    static func take(windowId: UInt32, into directory: String, at date: Date, displays: [Later.Display]) async -> Taken {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -30,6 +31,7 @@ enum LaterCapture {
               window.frame.width >= 8, window.frame.height >= 8 else {
             return Taken(screenshot: nil, text: nil, missing: ["No screenshot: the window had closed before it could be captured."])
         }
+        let scale = Later.scale(for: window.frame, displays: displays)
         let cfg = SCStreamConfiguration()
         cfg.width = Int(window.frame.width * scale)
         cfg.height = Int(window.frame.height * scale)

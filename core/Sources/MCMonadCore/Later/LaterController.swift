@@ -158,13 +158,16 @@ final class LaterController: NSObject, NSMenuDelegate {
         guard case .on(let s) = settings, let title = Later.title(note: note, source: source) else { return }
         let inbox = LaterInbox(cli: s.cli)
         let now = Date()
-        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        let displays = NSScreen.screens.compactMap { screen -> Later.Display? in
+            guard let n = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+            return Later.Display(bounds: CGDisplayBounds(n.uint32Value), scale: screen.backingScaleFactor)
+        }
         saving += 1
         updateStatusItem()
         Task { @MainActor [weak self] in
             var taken = LaterCapture.Taken(screenshot: nil, text: nil, missing: [])
             if let source {
-                taken = await LaterCapture.take(windowId: source.windowId, into: s.attachments, at: now, scale: scale)
+                taken = await LaterCapture.take(windowId: source.windowId, into: s.attachments, at: now, displays: displays)
             }
             let origin = source.map {
                 BeadOrigin(windowId: $0.windowId, pid: $0.pid, app: $0.app, title: $0.title,

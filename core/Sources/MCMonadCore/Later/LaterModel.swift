@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
@@ -502,6 +503,30 @@ enum Later {
             if c == "~" { run += 1; longest = max(longest, run) } else { run = 0 }
         }
         return String(repeating: "~", count: max(3, longest + 1))
+    }
+
+    /// A display as the capture needs it: where it is in global display
+    /// coordinates (top-left origin, as window frames are) and its backing
+    /// scale.
+    struct Display: Equatable, Sendable {
+        let bounds: CGRect
+        let scale: CGFloat
+    }
+
+    /// The backing scale a window is drawn at: that of the display holding
+    /// most of it. ScreenCaptureKit pads a capture asked for at a larger
+    /// scale rather than enlarging it, which leaves a 1× window's text a
+    /// sliver in one corner that OCR cannot read. A window on no display
+    /// (none known) is taken at 1×.
+    static func scale(for frame: CGRect, displays: [Display]) -> CGFloat {
+        let best = displays
+            .map { d -> (CGFloat, CGFloat) in
+                let i = d.bounds.intersection(frame)
+                return (i.isNull ? 0 : i.width * i.height, d.scale)
+            }
+            .max { $0.0 < $1.0 }
+        guard let best, best.0 > 0 else { return 1 }
+        return best.1
     }
 
     /// A screenshot's file name, without the extension: when, then which

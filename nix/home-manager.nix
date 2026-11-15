@@ -35,6 +35,39 @@ let
     configIsDir && builtins.pathExists "${cfg.config}/modules";
   recompileGhcModulesFlag =
     lib.optionalString hasConfigModules "-i -i${homeDir}/.config/mcmonad/modules";
+
+  # AI-assisted update (the "later" inbox: this binding, the
+  # services.mcmonad.later options and their config): model claude-opus-5-5;
+  # reasoning effort unavailable (not exposed by the harness).
+  #
+  # The "later" inbox CLI: bd, always run against one personal database, so
+  # neither the daemon nor a person at a terminal has to say which. It also
+  # creates that database the first time it is needed, under a lock: the
+  # daemon's first refresh asks two questions at once, and two `bd init`s in
+  # one directory would race. bd's role is set for this process alone (the
+  # inbox is no git repository, so bd would otherwise warn on every call).
+  laterDir = cfg.later.directory;
+  laterCli = pkgs.writeShellApplication {
+    name = "later";
+    runtimeInputs = [ pkgs.flock ];
+    text = ''
+      export BEADS_DIR=${lib.escapeShellArg "${laterDir}/beads"}
+      n=''${GIT_CONFIG_COUNT:-0}
+      export "GIT_CONFIG_KEY_$n=beads.role" "GIT_CONFIG_VALUE_$n=maintainer"
+      export GIT_CONFIG_COUNT=$((n + 1))
+      if [ ! -e "$BEADS_DIR/metadata.json" ]; then
+        mkdir -p "$BEADS_DIR"
+        # bd init writes progress to stdout; keep stdout for the command's answer.
+        # The inner script expands $BEADS_DIR itself, after taking the lock.
+        # shellcheck disable=SC2016
+        flock "$BEADS_DIR.init-lock" sh -c '
+          [ -e "$BEADS_DIR/metadata.json" ] && exit 0
+          cd "$BEADS_DIR" && exec "$0" init --quiet --stealth --non-interactive --skip-agents --prefix later
+        ' ${lib.getExe cfg.later.package} >&2
+      fi
+      exec ${lib.getExe cfg.later.package} "$@"
+    '';
+  };
 in
 {
   options.services.mcmonad = {
@@ -115,6 +148,32 @@ in
           workspace layout.
       '';
     };
+
+    later = {
+      enable = lib.mkEnableOption ''
+        the "later" inbox: type `later <note>` (or `todo <note>`) in the
+        launcher to save the note, a screenshot of the window you were in
+        and that window's text as a beads (bd) issue; browse and start
+        them from the launcher's Later mode; see the ready count in the
+        menu bar. Also installs the `later` CLI, which is bd against the
+        same database. Off, nothing of it shows
+      '';
+
+      package = lib.mkPackageOption pkgs "beads" {
+        extraDescription = "The bd CLI the inbox runs.";
+      };
+
+      directory = lib.mkOption {
+        type = lib.types.str;
+        default = "${config.xdg.dataHome}/mcmonad/later";
+        defaultText = lib.literalExpression ''"''${config.xdg.dataHome}/mcmonad/later"'';
+        description = ''
+          Where the inbox lives: its bd database in `beads/` and saved
+          screenshots in `attachments/`. Both hold what was on screen when
+          something was saved, so they stay private to this user.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -124,6 +183,16 @@ in
         message = "services.mcmonad.configFile and services.mcmonad.config are mutually exclusive.";
       }
     ];
+
+    # The daemon reads this to know the inbox is on and where it is; with no
+    # file the feature is off.
+    home.file.".config/mcmonad/later.json" = lib.mkIf cfg.later.enable {
+      text = builtins.toJSON {
+        cli = lib.getExe laterCli;
+        attachments = "${laterDir}/attachments";
+      };
+    };
+    home.packages = lib.mkIf cfg.later.enable [ laterCli ];
 
     home.file.".config/mcmonad/mcmonad.hs" = lib.mkIf (mcmonadHsFile != null) mcmonadHsFile;
     home.file.".config/mcmonad" = lib.mkIf configIsDir {

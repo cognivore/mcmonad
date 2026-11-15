@@ -66,45 +66,59 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// reports (wired by Main). "What's up" reads it; it never waits on a call.
     var whatsUpCache: WhatsUpCache?
 
+    /// The "later" inbox (wired by Main). Off unless home-manager wrote its
+    /// settings: then there is no Later mode and no later rows.
+    var later: LaterController?
+
     // MARK: - Modes
 
     enum Mode: Int, CaseIterable {
         case command
         case window
+        /// What was saved for later; only while the inbox is on.
+        case later
 
         var placeholder: String {
             switch self {
             case .command: return "Run command or app…"
             case .window:  return "Search windows…"
+            case .later:   return "Search what you saved, or type a note to save…"
             }
         }
         var label: String {
             switch self {
             case .command: return "Run"
             case .window:  return "Windows"
+            case .later:   return "Later"
             }
         }
         var glyph: String {
             switch self {
             case .command: return "command"
             case .window:  return "macwindow"
+            case .later:   return "tray.full"
             }
         }
-        func next() -> Mode {
-            let all = Mode.allCases
-            return all[(rawValue + 1) % all.count]
-        }
-        func prev() -> Mode {
-            let all = Mode.allCases
-            return all[(rawValue - 1 + all.count) % all.count]
+        /// The next of `modes` (the ones available now) after this one.
+        func next(among modes: [Mode]) -> Mode { step(1, among: modes) }
+        func prev(among modes: [Mode]) -> Mode { step(-1, among: modes) }
+        private func step(_ by: Int, among modes: [Mode]) -> Mode {
+            guard let i = modes.firstIndex(of: self) else { return modes.first ?? self }
+            return modes[(i + by + modes.count) % modes.count]
         }
     }
 
-    private enum State {
+    /// The modes Tab cycles through now.
+    private var availableModes: [Mode] {
+        later?.isOn == true ? Mode.allCases : [.command, .window]
+    }
+
+    private enum State: Equatable {
         case browsing
         case timerPrompt   // command mode, after choosing "Timer": awaiting minutes
         case asking        // "where is …" sent to the model; transcript on screen
         case answered      // the model's list (or its failure) on screen
+        case laterBead(BeadID)  // one saved-for-later bead's actions on screen
     }
 
     // MARK: - Items
@@ -119,6 +133,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case whatsUp
         case viewWorkspace(tag: String)
         case setScreenRole(uuid: String, role: ScreenRole)
+        case later(LaterAction)
         case hint
     }
 
@@ -132,6 +147,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         var subtitle: NSAttributedString? = nil
         /// A "!" query: read every window before acting.
         var force = false
+        /// An SF Symbol for rows that carry their own (later rows).
+        var symbol: String? = nil
         /// For window rows: the id to look up in the screen index.
         var windowId: UInt32? {
             if case .focusWindow(let id, _) = kind { return id }
@@ -193,6 +210,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     /// The window focused before the panel opened, restored on Esc.
     private var restoreTarget: (windowId: UInt32, pid: pid_t)?
+    /// That window, described for a note saved for later.
+    private var laterSource: LaterSource?
+    /// The Later list's query, kept while one bead's actions are shown.
+    private var laterQuery = ""
 
     private var keyMonitor: Any?
 
@@ -252,7 +273,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     func show(mode: Mode) {
-        self.mode = mode
+        // The inbox may have been switched on or off since the last open.
+        later?.reloadSettings()
+        later?.refresh()
+        self.mode = availableModes.contains(mode) ? mode : .command
         self.state = .browsing
         let panel = ensurePanel()
 
@@ -262,6 +286,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         screenIndex?.requestSoon(after: 0)
 
         restoreTarget = WindowFocus.frontmostFocusedWindow()
+        laterSource = restoreTarget.flatMap { later?.describe(windowId: $0.windowId, pid: $0.pid) }
 
         searchField.stringValue = ""
         applyModeChrome()
@@ -330,6 +355,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             panel?.makeFirstResponder(searchField)
             return
         }
+        if case .laterBead = state {
+            backToLaterList()
+            return
+        }
+        dismissRestoringFocus()
+    }
+
+    /// Close the panel and hand focus back to the window it opened over.
+    private func dismissRestoringFocus() {
         let target = restoreTarget
         restoreTarget = nil
         hide()
@@ -342,7 +376,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private func cycleMode(forward: Bool) {
         // Tab always returns to the top-level browsing state.
-        switchTo(forward ? mode.next() : mode.prev())
+        let modes = availableModes
+        switchTo(forward ? mode.next(among: modes) : mode.prev(among: modes))
     }
 
     /// Switch to a top-level mode, resetting any sub-prompt and the query.
@@ -377,6 +412,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             glyphName = "sparkles"
             placeholder = "where is …"
             modeText = "Where is"
+        case .laterBead:
+            glyphName = Mode.later.glyph
+            placeholder = "Type to search the inbox"
+            modeText = Mode.later.label
         case .browsing:
             glyphName = mode.glyph
             placeholder = mode.placeholder
@@ -406,12 +445,14 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             hintLabel.stringValue = "asking \(Ask.model) at \(Ask.effort) effort · \(secs) s · esc cancel"
         case .answered:
             hintLabel.stringValue = "↩ select · esc back"
+        case .laterBead:
+            hintLabel.stringValue = "↩ select · esc back to the list"
         case .browsing:
             var ocr = ""
             if mode == .window, screenIndex?.availability == .denied {
                 ocr = " · ⚠ screen index: grant Screen Recording to MCMonadCore.app"
             }
-            hintLabel.stringValue = "⇥ \(mode.next().label) · ↩ select\(voiceHint) · esc cancel\(ocr)"
+            hintLabel.stringValue = "⇥ \(mode.next(among: availableModes).label) · ↩ select\(voiceHint) · esc cancel\(ocr)"
         }
     }
 
@@ -768,6 +809,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             // (see controlTextDidChange) rather than re-ranking it.
             break
 
+        case .laterBead(let id):
+            filtered = laterBeadItems(id)
+
         case .browsing:
             // A leading "!" asks for a fresh reading of every window first.
             let force = q.hasPrefix("!")
@@ -793,6 +837,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                     items.append(timerCommandItem())
                 }
             }
+            items += laterCommandItems(q)
             switch mode {
             case .command:
                 // Don't show builtin commands twice when a parsed row is present.
@@ -801,9 +846,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                         && !(screenshotCmd != nil && $0.isScreenshot)
                         && !(whatsUp && $0.isWhatsUp)
                 }
-                items += rank(q, in: base)
+                // Saved beads are found by what they say, like apps.
+                items += rank(q, in: q.isEmpty ? base : base + laterBeadListItems())
             case .window:
                 items += rankWindows(q)
+            case .later:
+                items += laterListItems(q)
             }
             filtered = items
         }
@@ -891,6 +939,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .setScreenRole(let uuid, let role):
             finish()
             onSetScreenRole?(uuid, role)
+        case .later(let action):
+            activateLater(action)
         case .launchApp(let app):
             finish()
             appIndex.launch(app)
@@ -1228,6 +1278,157 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         return s
     }
 
+    // MARK: - Later (the saved-for-later inbox)
+
+    private func laterItem(_ row: LaterRow) -> Item {
+        Item(title: row.title, kind: .later(row.action), haystack: row.haystack,
+             subtitle: row.detail.map { Self.highlighted($0, ranges: []) }, symbol: row.symbol)
+    }
+
+    /// "later …" / "todo …" in any mode: the row that saves it.
+    private func laterCommandItems(_ q: String) -> [Item] {
+        guard let later, later.isOn, let note = LaterNote(q) else { return [] }
+        var rows = [laterItem(Later.saveRow(note: note, source: laterSource, snapshot: later.snapshot))]
+        if note.text.isEmpty, laterSource != nil {
+            rows.append(laterItem(Later.browseRow(snapshot: later.snapshot)))
+        }
+        return rows
+    }
+
+    /// Every open bead as a row, in the inbox's order.
+    private func laterBeadListItems() -> [Item] {
+        guard let later, later.isOn, let snap = later.snapshot else { return [] }
+        return Later.beadRows(snap, now: Date()).map(laterItem)
+    }
+
+    /// The Later list: what is wrong, then the beads (ranked by the query
+    /// when there is one), then a row that saves the query as a note.
+    private func laterListItems(_ q: String) -> [Item] {
+        guard let later, later.isOn else {
+            return [hintItem("The later inbox is off: set services.mcmonad.later.enable in home-manager.")]
+        }
+        var rows: [Item] = []
+        if let fault = later.fault { rows.append(hintItem("⚠ " + fault.description)) }
+        guard let snap = later.snapshot else { return rows + [hintItem("Reading the inbox…")] }
+        if snap.unreadable > 0 {
+            rows.append(hintItem("\(snap.unreadable) bead(s) could not be read; `\(Later.cliName) list` shows them"))
+        }
+        let beads = laterBeadListItems()
+        if q.isEmpty {
+            rows.append(hintItem("\(snap.readyCount) ready · \(snap.startedCount) started · \(snap.beads.count) open · ↩ on one shows what you can do"))
+            if beads.isEmpty {
+                rows.append(hintItem("Nothing saved. Type “later <note>” in any mode to save it with the window you are in."))
+            }
+            return rows + beads
+        }
+        // A "later …" query already has its save row at the top.
+        if LaterNote(q) != nil { return rows }
+        return rows + rank(q, in: beads)
+            + [laterItem(Later.saveRow(note: LaterNote(text: q, priority: nil), source: laterSource, snapshot: snap))]
+    }
+
+    /// One bead's actions, under its title.
+    private func laterBeadItems(_ id: BeadID) -> [Item] {
+        guard let later, let snap = later.snapshot, let bead = snap.bead(id) else {
+            return [hintItem("That bead is no longer open. Esc goes back to the list.")]
+        }
+        var head = hintItem(bead.title)
+        head.subtitle = Later.beadRows(snap, now: Date())
+            .first { $0.action == .open(id) }?.detail
+            .map { Self.highlighted($0, ranges: []) }
+        let actions = Later.actionRows(bead, standing: snap.standing(bead), originAlive: later.originAlive(bead))
+        return [head] + actions.map(laterItem)
+    }
+
+    private func activateLater(_ action: LaterAction) {
+        guard let later else { return }
+        switch action {
+        case .save(let note):
+            // The note is about the window the launcher opened over: go back to it.
+            let source = laterSource
+            dismissRestoringFocus()
+            later.save(note: note, source: source)
+        case .browse:
+            switchTo(.later)
+        case .open(let id):
+            openLaterBead(id)
+        case .start(let id):
+            finish()
+            later.start(id)
+        case .copyPrompt(let id):
+            later.copyPrompt(id)
+            dismissRestoringFocus()
+        case .openScreenshot(let id):
+            finish()
+            later.openScreenshot(id)
+        case .snooze(let id):
+            later.snooze(id)
+            backToLaterList()
+        case .done(let id):
+            later.done(id)
+            backToLaterList()
+        case .putBack(let id):
+            later.putBack(id)
+            backToLaterList()
+        }
+    }
+
+    private func openLaterBead(_ id: BeadID) {
+        if state == .browsing, mode == .later { laterQuery = searchField.stringValue }
+        leaveWhereIs()
+        mode = .later
+        state = .laterBead(id)
+        searchField.stringValue = ""
+        applyModeChrome()
+        applyFilter("")
+        panel?.makeFirstResponder(searchField)
+    }
+
+    private func backToLaterList() {
+        state = .browsing
+        mode = .later
+        searchField.stringValue = laterQuery
+        applyModeChrome()
+        applyFilter(laterQuery)
+        panel?.makeFirstResponder(searchField)
+    }
+
+    /// Open on the Later list (the menu-bar item), at one bead if given.
+    func showLater(at id: BeadID?) {
+        guard later?.isOn == true else { return }
+        laterQuery = ""
+        if panel?.isVisible == true { switchTo(.later) } else { show(mode: .later) }
+        if let id { openLaterBead(id) }
+    }
+
+    /// Open in `mode` with `text` already typed, the caret after it.
+    func show(mode: Mode, typing text: String) {
+        if panel?.isVisible == true { switchTo(mode) } else { show(mode: mode) }
+        searchField.stringValue = text
+        searchField.currentEditor()?.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+        applyFilter(text)
+    }
+
+    /// The inbox changed: redraw whatever shows it, keeping the selection
+    /// where it still lands on a row that can be chosen.
+    func laterUpdated() {
+        guard let panel, panel.isVisible else { return }
+        let query = searchField.stringValue
+        switch state {
+        case .laterBead:
+            break
+        case .browsing where mode == .later || LaterNote(query) != nil || (mode == .command && !query.isEmpty):
+            break
+        default:
+            return
+        }
+        let keep = tableView.selectedRow
+        applyFilter(query)
+        if keep >= 0, keep < filtered.count, filtered[keep].activatable {
+            tableView.selectRowIndexes(IndexSet(integer: keep), byExtendingSelection: false)
+        }
+    }
+
     // MARK: - Voice
 
     private func wireVoice() {
@@ -1327,6 +1528,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             return
         }
         if state == .asking || state == .answered { return }
+        // A bead's actions change it; speech never picks one of them.
+        if case .laterBead = state { return }
         // A spoken "where is …" or "what's up" asks the model, in any mode.
         if let ask = WhereIsQuery(text) {
             beginWhereIs(ask)
@@ -1334,6 +1537,15 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         }
         if WhatsUp.matches(text) {
             showWhatsUp(refresh: false)
+            return
+        }
+        // A spoken "later …" saves the note at once, in any mode.
+        if let later, later.isOn, let note = LaterNote(text) {
+            if note.text.isEmpty {
+                switchTo(.later)
+            } else {
+                activateLater(.save(note))
+            }
             return
         }
         // A spoken "timer …" sets a countdown in ANY mode — dictation isn't
@@ -1494,6 +1706,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .whereIs, .whatsUp:        return symbolIcon("sparkles")
         case .viewWorkspace:            return symbolIcon("rectangle.3.group")
         case .setScreenRole:            return symbolIcon("display.2")
+        case .later:                    return item.symbol.flatMap { symbolIcon($0) }
         case .hint:                     return symbolIcon("info.circle")
         }
     }
@@ -1547,6 +1760,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         if voice.isListening { voice.stop() }
         if state == .asking || state == .answered {
             leaveWhereIs()
+            state = .browsing
+            applyModeChrome()
+        }
+        // Typing over a bead's actions searches the inbox again.
+        if case .laterBead = state {
             state = .browsing
             applyModeChrome()
         }

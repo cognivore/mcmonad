@@ -638,6 +638,27 @@ struct MCMonadCoreApp {
             socketServer?.send(.timerStart(seconds: seconds, label: label))
         }
 
+        // The "later" inbox: on when home-manager wrote its settings
+        // (services.mcmonad.later), otherwise nothing of it shows. bd owns
+        // the beads; this reads them, saves to them, and keeps the ready
+        // count in the menu bar. Going back to a bead's window or workspace
+        // uses the same paths as the menubar tree.
+        let later = LaterController()
+        spotlight.later = later
+        later.snapshotProvider = { [weak overlayManager] in overlayManager?.cachedSnapshot }
+        later.onFocusWindow = { [weak socketServer] wid, pid in
+            socketServer?.send(.menuFocusWindow(windowId: wid, pid: pid))
+        }
+        later.onViewWorkspace = { [weak socketServer] tag in
+            socketServer?.send(.menuViewWorkspace(tag: tag))
+        }
+        later.onOpenLauncher = { [weak spotlight] id in spotlight?.showLater(at: id) }
+        later.onOpenLauncherWithText = { [weak spotlight] text in
+            spotlight?.show(mode: .command, typing: text)
+        }
+        later.onChanged = { [weak spotlight] in spotlight?.laterUpdated() }
+        later.reloadSettings()
+
         // TimerController is a pure renderer/clock; its state arrives via the
         // set-timers command, and every user action flows back to the brain.
         executor.onSetTimers = { [weak timerController] timers in
@@ -673,8 +694,13 @@ struct MCMonadCoreApp {
         }
         // Opt+P / Opt+Shift+P → Haskell → show-spotlight command → here.
         executor.onShowSpotlight = { [weak spotlight] modeStr in
-            let mode: SpotlightController.Mode =
-                (modeStr == "window") ? .window : .command
+            let mode: SpotlightController.Mode
+            switch modeStr {
+            case "window": mode = .window
+            // `showSpotlight "later"` in mcmonad.hs; command mode while the inbox is off.
+            case "later": mode = .later
+            default: mode = .command
+            }
             spotlight?.toggle(mode: mode)
         }
 
@@ -828,7 +854,7 @@ struct MCMonadCoreApp {
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, queryServer, executor, eventBridge, dragHandler,
                       mouseDownMonitor, spotlight, timerController, screenIndex,
-                      whatsUpCache, terminationWatch)
+                      whatsUpCache, terminationWatch, later)
     }
 
     // Static storage to prevent ARC from deallocating services

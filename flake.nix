@@ -82,6 +82,12 @@
                 Tests/ScreenRoleMapChecks.swift \
                 -o .build/screen-role-map-checks
               .build/screen-role-map-checks
+              /usr/bin/swiftc -swift-version 6 \
+                Sources/MCMonadCore/Later/LaterModel.swift \
+                Sources/MCMonadCore/Later/LaterInbox.swift \
+                Tests/LaterChecks.swift \
+                -o .build/later-checks
+              .build/later-checks
               runHook postCheck
             '';
             installPhase = ''

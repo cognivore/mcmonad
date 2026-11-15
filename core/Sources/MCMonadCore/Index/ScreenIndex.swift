@@ -331,7 +331,8 @@ final class ScreenIndex {
 
     // MARK: - Pixels → text (off the main actor)
 
-    private nonisolated static func recognise(_ image: CGImage) -> [String] {
+    /// Also reads a window saved for later (`LaterCapture`).
+    nonisolated static func recognise(_ image: CGImage) -> [String] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true

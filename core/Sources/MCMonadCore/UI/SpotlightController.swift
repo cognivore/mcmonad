@@ -947,7 +947,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         removeKeyMonitor()
         let alert = NSAlert()
         alert.messageText = "Send window information to Claude for this search?"
-        alert.informativeText = "Your question, workspace names, app names, window titles and excerpts of recognised screen text from visible and hidden workspaces will be sent to Anthropic through your Claude CLI. This authorises one search; it does not enable background monitoring."
+        alert.informativeText = "Your question, workspace names, app names, window titles and excerpts of recognised screen text from visible and hidden workspaces — including lines and titles those windows, and windows closed today, showed earlier today — will be sent to Anthropic through your Claude CLI, or through the Messages API if the CLI cannot answer and ~/.config/mcmonad/claude.json names a key. This authorises one search; it does not enable background monitoring."
         alert.addButton(withTitle: "Send this search")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: panel) { [weak self] response in

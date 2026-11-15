@@ -1,20 +1,19 @@
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 //
 // Compiled with Later/LaterModel.swift and Later/LaterInbox.swift and run by
-// the Nix package checkPhase. The model checks use bd 1.3.4's real JSON
-// shapes; the inbox checks run a stand-in CLI (a shell script) through the
-// same process code the daemon uses.
+// the Nix package checkPhase. The protocol fixtures are what beads-mcmonad's
+// `later` 0.1.0 printed; the inbox checks run a stand-in `later` (a shell
+// script) through the same process code the daemon uses.
 import Foundation
 
 @main
 enum LaterChecks {
     static func main() async {
-        checkSettings()
-        checkNote()
-        checkParse()
-        checkSnapshot()
-        checkComposition()
+        checkVerb()
+        checkProtocol()
+        checkRequest()
         checkRows()
+        checkScale()
         await checkInbox()
         print("Later checks passed")
     }
@@ -26,229 +25,137 @@ enum LaterChecks {
         }
     }
 
-    // MARK: Settings
+    // MARK: The verb
 
-    static func checkSettings() {
-        let f = "/h/.config/mcmonad/later.json"
-        expect(LaterSettings.load(nil, file: f) == .off, "no file is off")
-        let good = Data(#"{"cli": "/nix/store/x-later/bin/later", "attachments": "/h/.local/share/mcmonad/later/attachments"}"#.utf8)
-        expect(LaterSettings.load(good, file: f) == .on(LaterSettings(cli: "/nix/store/x-later/bin/later",
-                                                                     attachments: "/h/.local/share/mcmonad/later/attachments")),
-               "a good file is on")
-        if case .unusable(let why) = LaterSettings.load(Data(#"{"cli": "later", "attachments": "/a"}"#.utf8), file: f) {
-            expect(why.contains("absolute") && why.contains(f), "a relative cli is refused, saying why and where")
-        } else { expect(false, "a relative cli must be unusable") }
-        if case .unusable(let why) = LaterSettings.load(Data("not json".utf8), file: f) {
-            expect(why.contains(f), "garbage names the file")
-        } else { expect(false, "garbage must be unusable") }
-        if case .unusable = LaterSettings.load(Data(#"{"cli": "/x"}"#.utf8), file: f) {} else {
-            expect(false, "a missing field is unusable, not off")
-        }
+    static func checkVerb() {
+        expect(LaterVerb.words(in: "later check the pangram API") == "check the pangram API", "later + words")
+        expect(LaterVerb.words(in: "todo p1 split rageveil") == "p1 split rageveil", "the priority is later's to read")
+        expect(LaterVerb.words(in: "Later: ask about h10n") == "ask about h10n", "dictated punctuation")
+        expect(LaterVerb.words(in: "To do, call the bank") == "call the bank", "dictated 'to do'")
+        expect(LaterVerb.words(in: "  later  ") == "", "the verb alone")
+        expect(LaterVerb.words(in: "latergator") == nil, "a longer word is not the verb")
+        expect(LaterVerb.words(in: "todoist") == nil, "an app name is not the verb")
+        expect(LaterVerb.words(in: "timer 5 later") == nil, "the verb must come first")
+        expect(LaterVerb.words(in: "") == nil, "empty")
     }
 
-    // MARK: What the user types or says
+    // MARK: Protocol 1, as later printed it
 
-    static func checkNote() {
-        expect(LaterNote("later check the pangram API") == LaterNote(text: "check the pangram API", priority: nil), "later + text")
-        expect(LaterNote("todo p1 split rageveil") == LaterNote(text: "split rageveil", priority: 1), "todo + priority")
-        expect(LaterNote("Later: ask about h10n") == LaterNote(text: "ask about h10n", priority: nil), "dictated punctuation")
-        expect(LaterNote("To do, call the bank") == LaterNote(text: "call the bank", priority: nil), "dictated 'to do'")
-        expect(LaterNote("later") == LaterNote(text: "", priority: nil), "the verb alone")
-        expect(LaterNote("  later   P0  ") == LaterNote(text: "", priority: 0), "spaces and upper-case priority")
-        expect(LaterNote("later p9 thing") == LaterNote(text: "p9 thing", priority: nil), "p9 is not a priority")
-        expect(LaterNote("latergator") == nil, "a longer word is not the verb")
-        expect(LaterNote("todoist") == nil, "an app name is not the verb")
-        expect(LaterNote("timer 5 later") == nil, "the verb must come first")
-        expect(LaterNote("") == nil, "empty")
-    }
-
-    // MARK: Parsing bd's answers
-
-    /// `bd list --json`, as bd 1.3.4 writes it.
-    static let listJSON = """
-    [
-      {"id": "later-sqx", "title": "concurrent 3", "status": "in_progress", "priority": 2, "issue_type": "task",
-       "assignee": "cognivore", "created_at": "2026-11-15T19:34:00Z", "updated_at": "2026-11-15T19:34:20Z",
-       "dependency_count": 0, "dependent_count": 0, "comment_count": 0},
-      {"id": "later-a9c", "title": "concurrent 2", "status": "deferred", "priority": 2, "issue_type": "task",
-       "created_at": "2026-11-15T19:34:00Z", "defer_until": "2026-11-16T19:34:20Z"},
-      {"id": "later-lq1", "title": "check pangram API for h10n", "description": "Captured.\\n", "status": "open",
-       "priority": 1, "issue_type": "task", "created_at": "2026-11-15T19:33:39.446016Z",
-       "metadata": {"mcmonad": {"app": "Ghostty", "pid": 456, "title": "codex", "windowId": 123,
-                                "workspace": "3", "screenshot": "/tmp/x.png", "savedAt": "2026-11-15T19:33:39Z"}},
-       "labels": ["app:ghostty", "ws:3"]},
-      {"id": "later-zzz", "title": "made by an agent", "status": "open", "priority": 2,
-       "created_at": "2026-11-15T18:00:00Z", "metadata": {"other-tool": {"x": 1}}},
-      {"id": "later-bad", "title": "unreadable date", "status": "open", "created_at": "yesterday"},
-      {"title": "no id", "status": "open", "created_at": "2026-11-15T18:00:00Z"},
-      {"id": "later-ped", "title": "a custom status", "status": "pinned", "priority": 3,
-       "created_at": "2026-11-15T17:00:00Z", "metadata": {"mcmonad": {"app": 7}}}
-    ]
+    static let snapshotJSON = """
+    {"protocol":1,"readAt":"2026-11-15T22:16:32.183032Z","unreadable":[],"beads":[
+     {"id":"later-u3r","title":"check pangram API","status":"open","standing":"ready","priority":1,
+      "createdAt":"2026-11-15T22:16:30Z","deferUntil":null,"labels":["app:ghostty","mcmonad","ws:3"],
+      "origin":{"window":{"kind":"mac","windowId":123,"pid":456},"app":"Ghostty","title":"codex","workspace":"3",
+                "screenshot":"/later/attachments/20261115-221623.png","savedAt":"2026-11-15T22:16:23.759672Z"},
+      "waitsFor":[]},
+     {"id":"later-lwp","title":"after it","status":"open","standing":"waiting","priority":2,
+      "createdAt":"2026-11-15T22:16:30Z","deferUntil":null,"labels":["later"],"origin":null,"waitsFor":["later-u3r"]}]}
     """
 
-    static func parsedList() -> BeadList {
-        guard case .success(let list) = Later.parseList(Data(listJSON.utf8)) else {
-            expect(false, "the list parses"); fatalError()
-        }
-        return list
-    }
+    static let startedJSON = """
+    {"protocol":1,"id":"later-u3r","prompt":"check pangram API\\n\\n(Saved for later as later-u3r on 2026-11-15 22:16 from Ghostty — “codex”. `later show later-u3r` prints everything saved with it.)","claimed":true,
+     "origin":{"window":{"kind":"wayland","identifier":"toplevel-9"},"app":"foot","title":"","workspace":null,"screenshot":null,"savedAt":"2026-11-15T22:16:23Z"}}
+    """
 
-    static func checkParse() {
-        let list = parsedList()
-        expect(list.beads.map(\.id.raw) == ["later-sqx", "later-a9c", "later-lq1", "later-zzz", "later-ped"],
-               "good beads kept in order")
-        expect(list.unreadable == 2, "an unreadable date and a missing id are counted, not fatal")
-        let lq1 = list.beads[2]
-        expect(lq1.origin == BeadOrigin(windowId: 123, pid: 456, app: "Ghostty", title: "codex", workspace: "3",
-                                        screenshot: "/tmp/x.png", savedAt: "2026-11-15T19:33:39Z"),
-               "the launcher's origin is read back")
-        expect(lq1.priority == 1 && lq1.labels == ["app:ghostty", "ws:3"] && lq1.description == "Captured.\n", "fields")
-        expect(list.beads[3].origin == nil, "another tool's metadata is not an origin")
-        expect(list.beads[4].origin == nil, "a malformed origin is dropped, the bead kept")
-        expect(list.beads[4].status == .other("pinned"), "an unknown status is kept as written")
-        expect(list.beads[1].deferUntil == Date.iso("2026-11-16T19:34:20Z"), "defer_until")
-        expect(Date.iso("2026-11-15T19:33:39.446016Z") != nil, "fractional seconds")
-
-        if case .failure(let e) = Later.parseList(Data(#"{"error": "no"}"#.utf8)) {
-            expect(e.description.contains("JSON array") && e.description.contains("error"), "says what was expected and what came")
-        } else { expect(false, "an object is not a list") }
-        if case .success(let empty) = Later.parseList(Data("[]".utf8)) {
-            expect(empty.beads.isEmpty && empty.unreadable == 0, "an empty inbox is valid")
-        } else { expect(false, "[] parses") }
-
-        let created = #"{"created_at": "2026-11-15T19:33:39.446016Z", "id": "later-new", "title": "t", "status": "open", "priority": 2, "schema_version": 1}"#
-        expect((try? Later.parseOne(Data(created.utf8)).get())?.id.raw == "later-new", "bd create --json")
-        if case .success = Later.parseOne(Data(#"{"id": "", "title": "t", "status": "open", "created_at": "2026-11-15T19:33:39Z"}"#.utf8)) {
-            expect(false, "an empty id is not a bead")
+    static func snapshot() -> LaterSnapshot {
+        switch Later.decode(LaterSnapshot.self, Data(snapshotJSON.utf8), version: { $0.protocol }) {
+        case .success(let s): return s
+        case .failure(let e): expect(false, "the snapshot decodes: \(e)"); fatalError()
         }
     }
 
-    // MARK: The inbox as the launcher sees it
+    static func checkProtocol() {
+        let s = snapshot()
+        expect(s.beads.map(\.id.raw) == ["later-u3r", "later-lwp"], "order is later's")
+        expect(s.readyCount == 1 && s.startedCount == 0, "counts")
+        expect(s.beads[0].origin?.window == .mac(windowId: 123, pid: 456), "mac window")
+        expect(s.beads[0].origin?.screenshot == "/later/attachments/20261115-221623.png", "screenshot path")
+        expect(s.beads[1].waitsFor == [BeadID(raw: "later-u3r")] && s.beads[1].standing == .waiting, "waits for")
+        expect(s.beads[0].origin?.savedAt == Date.iso("2026-11-15T22:16:23.759672Z"), "fractional seconds")
 
-    static func checkSnapshot() {
-        let list = parsedList()
-        let ready = BeadList(beads: list.beads.filter { ["later-lq1", "later-zzz"].contains($0.id.raw) }, unreadable: 0)
-        let s = LaterSnapshot(list: list, ready: ready, readAt: Date())
-        expect(s.beads.map(\.id.raw) == ["later-sqx", "later-lq1", "later-zzz", "later-a9c", "later-ped"],
-               "started, then ready by priority, then waiting by priority")
-        expect(s.readyCount == 2 && s.startedCount == 1, "counts")
-        expect(s.standing(s.bead(BeadID(raw: "later-a9c"))!) == .waiting, "snoozed is waiting")
-        expect(s.unreadable == 2, "unreadable carried")
+        if case .success(let st) = Later.decode(LaterStarted.self, Data(startedJSON.utf8), version: { $0.protocol }) {
+            expect(st.claimed && st.origin?.window == .wayland(identifier: "toplevel-9"), "started, from Linux")
+        } else { expect(false, "started decodes") }
 
-        let closed = Bead(id: BeadID(raw: "later-c"), title: "c", description: "", status: .closed, priority: 0,
-                          labels: [], createdAt: Date(), deferUntil: nil, origin: nil)
-        let withClosed = LaterSnapshot(list: BeadList(beads: [closed], unreadable: 0),
-                                       ready: BeadList(beads: [], unreadable: 0), readAt: Date())
-        expect(withClosed.beads.isEmpty, "closed beads are not shown")
+        let v2 = snapshotJSON.replacingOccurrences(of: "\"protocol\":1", with: "\"protocol\":2")
+        if case .failure(let e) = Later.decode(LaterSnapshot.self, Data(v2.utf8), version: { $0.protocol }) {
+            expect(e.description.contains("protocol 2"), "another version says which: \(e)")
+        } else { expect(false, "protocol 2 must be refused") }
+        if case .failure(let e) = Later.decode(LaterSnapshot.self, Data("later: no".utf8), version: { $0.protocol }) {
+            expect(e.description.contains("later: no"), "garbage is quoted")
+        } else { expect(false, "garbage must be refused") }
+        let oddStanding = snapshotJSON.replacingOccurrences(of: "\"standing\":\"ready\"", with: "\"standing\":\"maybe\"")
+        if case .success = Later.decode(LaterSnapshot.self, Data(oddStanding.utf8), version: { $0.protocol }) {
+            expect(false, "a standing protocol 1 does not have is refused")
+        }
     }
 
-    // MARK: Composition
+    static func checkRequest() {
+        let source = LaterSource(window: .mac(windowId: 42, pid: 7), app: "Ghostty", title: "codex", workspace: nil)
+        let data = Later.encode(LaterSaveRequest(words: "p1 note", source: source, screenshot: "/tmp/x.png", text: nil, missing: ["No text."]))
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        expect(json["protocol"] as? Int == 1 && json["words"] as? String == "p1 note", "version and words")
+        let window = ((json["source"] as? [String: Any])?["window"] as? [String: Any]) ?? [:]
+        expect(window["kind"] as? String == "mac" && window["windowId"] as? Int == 42 && window["pid"] as? Int == 7, "mac window: \(window)")
+        expect(json["text"] == nil && (json["source"] as? [String: Any])?["workspace"] == nil, "absent stays absent")
+        expect(json["screenshot"] as? String == "/tmp/x.png" && json["missing"] as? [String] == ["No text."], "capture")
+    }
 
-    static func checkComposition() {
-        let utc = TimeZone(identifier: "UTC")!
-        let at = Date.iso("2026-11-15T18:57:03Z")!
-        let source = LaterSource(windowId: 42, pid: 7, app: "Ghostty", title: "codex: visageveil", workspace: "3")
+    // MARK: Rows
 
-        expect(Later.title(note: LaterNote(text: "split rageveil", priority: nil), source: source) == "split rageveil", "note is the title")
-        expect(Later.title(note: LaterNote(text: "", priority: nil), source: source) == "Ghostty — codex: visageveil", "window is the title")
-        expect(Later.title(note: LaterNote(text: "", priority: nil), source: nil) == nil, "nothing to save")
-        let long = LaterSource(windowId: 1, pid: 1, app: "A", title: String(repeating: "x", count: 500), workspace: nil)
-        expect(Later.title(note: LaterNote(text: "", priority: nil), source: long)!.count == Later.maxTitle + 1, "long titles are clipped")
+    static func checkRows() {
+        let s = snapshot()
+        let now = Date.iso("2026-11-15T23:00:00Z") ?? Date()
+        let rows = Later.beadRows(s, now: now)
+        expect(rows.count == 2 && rows[0].title == "◆ check pangram API" && rows[1].title == "◇ after it", "marks")
+        expect(rows[0].detail?.contains("later-u3r · P1 · ready · Ghostty — codex · ws 3") == true, "detail: \(rows[0].detail ?? "")")
+        expect(rows[1].detail?.contains("blocked") == true, "waiting on another bead is blocked")
+        expect(rows[0].haystack.contains("pangram") && rows[0].haystack.contains("ghostty"), "searchable")
 
-        expect(Later.labels(source: LaterSource(windowId: 1, pid: 1, app: "Google Chrome, Beta", title: "", workspace: "a b")) ==
-               ["mcmonad", "ws:a-b", "app:google-chrome--beta"], "no commas or spaces inside a label")
+        let a = Later.actionRows(s.beads[0], originAlive: true)
+        expect(a.first?.title.hasPrefix("Start: copy the prompt, and go back to codex") == true, "start, window alive")
+        expect(a.contains { $0.action == .openScreenshot(s.beads[0].id) }, "screenshot row")
+        expect(!a.contains { $0.action == .putBack(s.beads[0].id) }, "not started: nothing to put back")
+        let gone = Later.actionRows(s.beads[0], originAlive: false)
+        expect(gone.first?.title.contains("workspace 3") == true, "window gone: its workspace")
+        let b = Later.actionRows(s.beads[1], originAlive: false)
+        expect(b.first?.title == "Start: copy the prompt" && !b.contains { $0.action == .openScreenshot(s.beads[1].id) }, "no origin")
 
-        let text = "$ codex\n~~~ a tilde fence ~~~~ inside\n```\nbackticks\n```"
-        let d = Later.description(source: source, screenshot: "/s/20261115-185703-w42.png", screenText: text,
-                                  missing: [], savedAt: at, timeZone: utc)
-        expect(d.hasPrefix("Saved for later from Ghostty — “codex: visageveil” on workspace 3, 2026-11-15 18:57."), "who, where, when")
-        expect(d.contains("Screenshot of the window: /s/20261115-185703-w42.png"), "screenshot path")
-        expect(d.contains("~~~~~text\n" + text + "\n~~~~~"), "the fence outlasts the text's own tildes")
-        let none = Later.description(source: nil, screenshot: nil, screenText: nil,
-                                     missing: ["No screenshot: denied."], savedAt: at, timeZone: utc)
-        expect(none.contains("no window was focused") && none.contains("No screenshot: denied."), "absences are said")
-        let huge = Later.description(source: source, screenshot: nil, screenText: String(repeating: "y", count: 50_000),
-                                     missing: [], savedAt: at, timeZone: utc)
-        expect(huge.count < Later.maxText + 1_000, "window text is bounded")
+        let src = LaterSource(window: .mac(windowId: 1, pid: 1), app: "Ghostty", title: "codex", workspace: "3")
+        expect(Later.saveRow(words: "x", source: src, snapshot: s).title == "Save for later: “x” — with Ghostty — codex", "save with window")
+        expect(Later.saveRow(words: "", source: src, snapshot: s).action == .save(""), "save the window itself")
+        expect(Later.saveRow(words: "", source: nil, snapshot: s).action == .browse, "nothing to save: browse")
+        expect(Later.viewRow.action == .openView && Later.viewRow.haystack.contains("graph"), "the page is findable as a graph")
+    }
 
-        // The metadata the launcher writes is the origin it reads back.
-        let origin = BeadOrigin(windowId: 42, pid: 7, app: "Ghostty", title: "codex: \"quoted\"/path", workspace: "3",
-                                screenshot: "/s/a.png", savedAt: at.iso)
-        let json = #"[{"id": "later-m", "title": "t", "status": "open", "created_at": "2026-11-15T18:57:03Z", "metadata": "#
-            + Later.metadata(origin) + "}]"
-        expect((try? Later.parseList(Data(json.utf8)).get())?.beads.first?.origin == origin, "metadata round-trips")
-
-        let bead = Bead(id: BeadID(raw: "later-lq1"), title: "check pangram API for h10n", description: "", status: .open,
-                        priority: 2, labels: [], createdAt: at, deferUntil: nil, origin: origin)
-        let p = Later.prompt(for: bead, timeZone: utc)
-        expect(p.hasPrefix("check pangram API for h10n\n\n(Saved for later as later-lq1 on 2026-11-15 18:57 from Ghostty"), "prompt head")
-        expect(p.contains("/s/a.png") && p.contains("`later show later-lq1`") && p.contains("`later close later-lq1 --reason"),
-               "the prompt says where the rest is and how to close it")
-
-        expect(Later.screenshotName(at: at, windowId: 42, timeZone: utc) == "20261115-185703-w42", "screenshot name")
-
-        // A 1× ultrawide beside a 2× laptop screen: each window at its own display's scale.
+    static func checkScale() {
         let displays = [Later.Display(bounds: CGRect(x: 0, y: 0, width: 3440, height: 1440), scale: 1),
                         Later.Display(bounds: CGRect(x: -1728, y: 300, width: 1728, height: 1117), scale: 2)]
         expect(Later.scale(for: CGRect(x: 0, y: 30, width: 3440, height: 1410), displays: displays) == 1, "a window on the 1× display")
         expect(Later.scale(for: CGRect(x: -1700, y: 400, width: 800, height: 600), displays: displays) == 2, "a window on the 2× display")
         expect(Later.scale(for: CGRect(x: -200, y: 400, width: 1000, height: 600), displays: displays) == 1, "most of it decides")
-        expect(Later.scale(for: CGRect(x: -1727, y: 1416, width: 900, height: 700), displays: displays) == 2, "a parked window, one point on screen")
+        expect(Later.scale(for: CGRect(x: -1727, y: 1416, width: 900, height: 700), displays: displays) == 2, "a parked window")
         expect(Later.scale(for: CGRect(x: 9000, y: 9000, width: 10, height: 10), displays: displays) == 1, "on no display: 1×")
-        expect(Later.scale(for: .zero, displays: []) == 1, "no displays known: 1×")
-        expect(Later.fence(for: "no tildes") == "~~~", "shortest fence")
-        expect(Later.age(from: at, to: at.addingTimeInterval(30)) == "just now", "age")
-        expect(Later.age(from: at, to: at.addingTimeInterval(7_300)) == "2 h ago", "age in hours")
     }
 
-    // MARK: Launcher rows
+    // MARK: `later`, through the real process code
 
-    static func checkRows() {
-        let list = parsedList()
-        let ready = BeadList(beads: list.beads.filter { $0.id.raw == "later-lq1" }, unreadable: 0)
-        let s = LaterSnapshot(list: list, ready: ready, readAt: Date())
-        let now = Date.iso("2026-11-15T20:00:00Z")!
-        let rows = Later.beadRows(s, now: now)
-        expect(rows.count == s.beads.count, "one row per open bead")
-        expect(rows[0].title.hasPrefix("▸ ") && rows[1].title.hasPrefix("◆ ") && rows.last!.title.hasPrefix("◇ "), "marks")
-        expect(rows[1].haystack.contains("pangram") && rows[1].haystack.contains("ghostty") && rows[1].haystack.contains("later-lq1"),
-               "searchable by note, app and id")
-        expect(rows.first { $0.action == .open(BeadID(raw: "later-a9c")) }!.detail!.contains("snoozed, back in"), "snoozed says when")
-
-        let started = s.bead(BeadID(raw: "later-sqx"))!
-        let a = Later.actionRows(started, standing: .started, originAlive: false)
-        expect(a.first!.title.hasPrefix("Continue") && a.contains { $0.action == .putBack(started.id) }, "a started bead continues")
-        expect(!a.contains { $0.action == .openScreenshot(started.id) }, "no screenshot row without one")
-        let lq1 = s.bead(BeadID(raw: "later-lq1"))!
-        let b = Later.actionRows(lq1, standing: .ready, originAlive: true)
-        expect(b.first!.title.contains("go back to codex") && b.contains { $0.action == .openScreenshot(lq1.id) }, "ready, window alive")
-        let c = Later.actionRows(lq1, standing: .ready, originAlive: false)
-        expect(c.first!.title.contains("workspace 3"), "window gone: its workspace")
-
-        let save = Later.saveRow(note: LaterNote(text: "x", priority: 1), source: nil, snapshot: s)
-        expect(save.action == .save(LaterNote(text: "x", priority: 1)) && save.detail!.contains("note alone"), "save without a window")
-        let nothing = Later.saveRow(note: LaterNote(text: "", priority: nil), source: nil, snapshot: s)
-        expect(nothing.action == .browse && nothing.title.contains("1 ready, 1 started"), "nothing to save: browse instead")
-    }
-
-    // MARK: The inbox CLI, through the real process code
-
-    static func stand_in() -> String {
+    static func standIn() -> String {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("later-checks-\(getpid())")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("later").path
+        let snapshot = snapshotJSON.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "'", with: "")
         let script = """
         #!/bin/sh
-        # Stand-in for the later CLI: answers by subcommand, logs its arguments.
+        # Stand-in for later: answers by command, keeps what it was sent.
         printf '%s\\n' "$@" > "$0.$1.args"
         case "$1" in
-          list)  printf '%s' '[{"id":"later-a","title":"a","status":"open","priority":2,"created_at":"2026-11-15T18:00:00Z"},{"id":"later-b","title":"b","status":"in_progress","priority":2,"created_at":"2026-11-15T18:00:00Z"}]' ;;
-          ready) printf '%s' '[{"id":"later-a","title":"a","status":"open","priority":2,"created_at":"2026-11-15T18:00:00Z"}]' ;;
-          create) for a in "$@"; do case "$a" in --title=*) t="${a#--title=}" ;; esac; done
-                  body=$(cat); printf '{"id":"later-n","title":"%s","status":"open","priority":2,"created_at":"2026-11-15T18:00:00Z","description":"%s"}' "$t" "$body" ;;
-          fail)  echo "line one" >&2; echo "Error: no issue found matching later-x" >&2; exit 3 ;;
-          slow)  sleep 5 ;;
-          junk)  echo "warning: not json" ;;
+          snapshot) printf '%s' '\(snapshot)' ;;
+          save)     cat > "$0.save.stdin"; printf '%s' '{"protocol":1,"id":"later-new","title":"t"}' ;;
+          prompt)   printf 'the prompt\\n' ;;
+          done)     echo "later: bd close failed with status 1: no issue found matching $2" >&2; exit 1 ;;
+          snooze)   sleep 5 ;;
+          start)    printf '%s' '{"protocol":2,"id":"x","prompt":"","claimed":false,"origin":null}' ;;
         esac
         """
         FileManager.default.createFile(atPath: path, contents: Data(script.utf8), attributes: [.posixPermissions: 0o755])
@@ -256,40 +163,39 @@ enum LaterChecks {
     }
 
     static func checkInbox() async {
-        let cli = stand_in()
+        let cli = standIn()
         let inbox = LaterInbox(cli: cli, deadline: 1)
 
-        guard case .success(let snap) = await inbox.snapshot(now: Date()) else { expect(false, "snapshot"); return }
-        expect(snap.beads.map(\.id.raw) == ["later-b", "later-a"] && snap.ready == [BeadID(raw: "later-a")], "list + ready")
-        for verb in ["list", "ready"] {
-            let logged = (try? String(contentsOfFile: "\(cli).\(verb).args", encoding: .utf8)) ?? ""
-            expect(logged.contains("--limit=0\n"), "\(verb) asks for every bead, not bd's default page: \(logged)")
+        guard case .success(let s) = await inbox.snapshot() else { expect(false, "snapshot"); return }
+        expect(s.beads.count == 2, "snapshot through a process")
+
+        let source = LaterSource(window: .mac(windowId: 42, pid: 7), app: "Ghostty", title: "codex", workspace: "3")
+        guard case .success(let saved) = await inbox.save(LaterSaveRequest(words: "p1 note", source: source, screenshot: nil, text: "x", missing: [])) else {
+            expect(false, "save"); return
         }
+        expect(saved.id == BeadID(raw: "later-new"), "saved id")
+        let sent = (try? String(contentsOfFile: cli + ".save.stdin", encoding: .utf8)) ?? ""
+        expect(sent.contains("\"words\":\"p1 note\"") && sent.contains("\"kind\":\"mac\""), "the request goes in on stdin: \(sent)")
 
-        let created = await inbox.create(title: "--not-a-flag", description: "body text", priority: 1,
-                                         labels: ["mcmonad", "ws:3"], metadata: nil)
-        guard case .success(let bead) = created else { expect(false, "create: \(created)"); return }
-        expect(bead.title == "--not-a-flag", "a title like a flag stays the title")
-        expect(bead.description == "body text", "the description goes in on stdin")
-        let args = (try? String(contentsOfFile: cli + ".create.args", encoding: .utf8)) ?? ""
-        expect(args == "create\n--json\n--title=--not-a-flag\n--body-file=-\n--labels=mcmonad,ws:3\n--priority=1\n", "create arguments: \(args)")
+        expect(await inbox.prompt(BeadID(raw: "later-u3r")) == .success("the prompt"), "prompt as text")
+        let args = (try? String(contentsOfFile: cli + ".prompt.args", encoding: .utf8)) ?? ""
+        expect(args == "prompt\nlater-u3r\n", "prompt arguments: \(args)")
 
-        if case .failure(.exited(let verb, let status, let err)) = await inbox.run("fail", ["fail"]) {
-            expect(verb == "fail" && status == 3 && err.hasSuffix("no issue found matching later-x"), "exit status and stderr")
+        if case .failure(.exited(let verb, let status, let err)) = await inbox.done(BeadID(raw: "later-x")) {
+            expect(verb == "done" && status == 1 && err == "bd close failed with status 1: no issue found matching later-x", "stderr kept, prefix dropped: \(err)")
         } else { expect(false, "a non-zero exit is a fault") }
 
         let t0 = Date()
-        if case .failure(.timedOut(_, let s)) = await inbox.run("slow", ["slow"]) {
-            expect(s == 1 && Date().timeIntervalSince(t0) < 4, "stopped at the deadline")
+        if case .failure(.timedOut(_, let secs)) = await inbox.snooze(BeadID(raw: "later-x")) {
+            expect(secs == 1 && Date().timeIntervalSince(t0) < 4, "stopped at the deadline")
         } else { expect(false, "a hung call times out") }
 
-        if case .failure(.malformed) = await LaterInbox(cli: cli).run("junk", ["junk"]).flatMap({ d in
-            Later.parseList(d).map { _ in d }.mapError { LaterFault.malformed(verb: "junk", $0) } }) {} else {
-            expect(false, "non-JSON is malformed")
-        }
+        if case .failure(.malformed(let verb, let why)) = await inbox.start(BeadID(raw: "later-x")) {
+            expect(verb == "start" && why.description.contains("protocol 2"), "a later of another protocol is refused")
+        } else { expect(false, "protocol 2 from later must be refused") }
 
-        if case .failure(.missing(let path)) = await LaterInbox(cli: "/nonexistent/later").snapshot(now: Date()) {
-            expect(path == "/nonexistent/later", "a missing CLI says which path")
-        } else { expect(false, "a missing CLI is a fault") }
+        if case .failure(.missing(let path)) = await LaterInbox(cli: "/nonexistent/later").snapshot() {
+            expect(path == "/nonexistent/later", "a missing later says which path")
+        } else { expect(false, "a missing later is a fault") }
     }
 }

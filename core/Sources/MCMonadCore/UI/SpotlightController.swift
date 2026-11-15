@@ -273,8 +273,6 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     func show(mode: Mode) {
-        // The inbox may have been switched on or off since the last open.
-        later?.reloadSettings()
         later?.refresh()
         self.mode = availableModes.contains(mode) ? mode : .command
         self.state = .browsing
@@ -847,7 +845,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                         && !(whatsUp && $0.isWhatsUp)
                 }
                 // Saved beads are found by what they say, like apps.
-                items += rank(q, in: q.isEmpty ? base : base + laterBeadListItems())
+                items += rank(q, in: q.isEmpty ? base : base + laterSearchItems())
             case .window:
                 items += rankWindows(q)
             case .later:
@@ -1287,9 +1285,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     /// "later …" / "todo …" in any mode: the row that saves it.
     private func laterCommandItems(_ q: String) -> [Item] {
-        guard let later, later.isOn, let note = LaterNote(q) else { return [] }
-        var rows = [laterItem(Later.saveRow(note: note, source: laterSource, snapshot: later.snapshot))]
-        if note.text.isEmpty, laterSource != nil {
+        guard let later, later.isOn, let words = LaterVerb.words(in: q) else { return [] }
+        var rows = [laterItem(Later.saveRow(words: words, source: laterSource, snapshot: later.snapshot))]
+        if words.isEmpty, laterSource != nil {
             rows.append(laterItem(Later.browseRow(snapshot: later.snapshot)))
         }
         return rows
@@ -1301,17 +1299,23 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         return Later.beadRows(snap, now: Date()).map(laterItem)
     }
 
+    /// What the command search can find of the inbox: its beads, and its page.
+    private func laterSearchItems() -> [Item] {
+        guard let later, later.isOn else { return [] }
+        return laterBeadListItems() + [laterItem(Later.viewRow)]
+    }
+
     /// The Later list: what is wrong, then the beads (ranked by the query
     /// when there is one), then a row that saves the query as a note.
     private func laterListItems(_ q: String) -> [Item] {
         guard let later, later.isOn else {
-            return [hintItem("The later inbox is off: set services.mcmonad.later.enable in home-manager.")]
+            return [hintItem("This mcmonad is built without the later inbox: set services.mcmonad.later in home-manager.")]
         }
         var rows: [Item] = []
         if let fault = later.fault { rows.append(hintItem("⚠ " + fault.description)) }
         guard let snap = later.snapshot else { return rows + [hintItem("Reading the inbox…")] }
-        if snap.unreadable > 0 {
-            rows.append(hintItem("\(snap.unreadable) bead(s) could not be read; `\(Later.cliName) list` shows them"))
+        if !snap.unreadable.isEmpty {
+            rows.append(hintItem("\(snap.unreadable.count) bead(s) could not be read; `\(Later.cliName) list` shows them"))
         }
         let beads = laterBeadListItems()
         if q.isEmpty {
@@ -1319,12 +1323,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             if beads.isEmpty {
                 rows.append(hintItem("Nothing saved. Type “later <note>” in any mode to save it with the window you are in."))
             }
-            return rows + beads
+            return rows + [laterItem(Later.viewRow)] + beads
         }
         // A "later …" query already has its save row at the top.
-        if LaterNote(q) != nil { return rows }
-        return rows + rank(q, in: beads)
-            + [laterItem(Later.saveRow(note: LaterNote(text: q, priority: nil), source: laterSource, snapshot: snap))]
+        if LaterVerb.words(in: q) != nil { return rows }
+        return rows + rank(q, in: beads + [laterItem(Later.viewRow)])
+            + [laterItem(Later.saveRow(words: q, source: laterSource, snapshot: snap))]
     }
 
     /// One bead's actions, under its title.
@@ -1336,20 +1340,23 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         head.subtitle = Later.beadRows(snap, now: Date())
             .first { $0.action == .open(id) }?.detail
             .map { Self.highlighted($0, ranges: []) }
-        let actions = Later.actionRows(bead, standing: snap.standing(bead), originAlive: later.originAlive(bead))
+        let actions = Later.actionRows(bead, originAlive: later.originAlive(bead.origin))
         return [head] + actions.map(laterItem)
     }
 
     private func activateLater(_ action: LaterAction) {
         guard let later else { return }
         switch action {
-        case .save(let note):
+        case .save(let words):
             // The note is about the window the launcher opened over: go back to it.
             let source = laterSource
             dismissRestoringFocus()
-            later.save(note: note, source: source)
+            later.save(words: words, source: source)
         case .browse:
             switchTo(.later)
+        case .openView:
+            finish()
+            later.openView()
         case .open(let id):
             openLaterBead(id)
         case .start(let id):
@@ -1417,7 +1424,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         switch state {
         case .laterBead:
             break
-        case .browsing where mode == .later || LaterNote(query) != nil || (mode == .command && !query.isEmpty):
+        case .browsing where mode == .later || LaterVerb.words(in: query) != nil || (mode == .command && !query.isEmpty):
             break
         default:
             return
@@ -1540,11 +1547,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             return
         }
         // A spoken "later …" saves the note at once, in any mode.
-        if let later, later.isOn, let note = LaterNote(text) {
-            if note.text.isEmpty {
+        if let later, later.isOn, let words = LaterVerb.words(in: text) {
+            if words.isEmpty {
                 switchTo(.later)
             } else {
-                activateLater(.save(note))
+                activateLater(.save(words))
             }
             return
         }

@@ -7,11 +7,12 @@ import UniformTypeIdentifiers
 /// What saving a window for later keeps of it: its picture as a PNG and the
 /// text read off that picture, both at the moment it was saved. Unlike the
 /// screen index, which never writes what it reads, this writes both on
-/// purpose: the user asked for this window to be kept. Both stay on this
-/// Mac, in the inbox and its attachments directory.
+/// purpose: the user asked for this window to be kept. The picture goes to
+/// a private temporary file that `later save` moves into the inbox; both
+/// stay on this Mac.
 enum LaterCapture {
     struct Taken: Sendable {
-        /// The PNG's absolute path, when one was written.
+        /// The temporary PNG's absolute path, when one was written.
         let screenshot: String?
         let text: String?
         /// Why the screenshot or the text is missing, in words.
@@ -20,7 +21,7 @@ enum LaterCapture {
 
     /// Off the main actor. `displays` are the attached displays, read on
     /// the main actor: the window is captured at its own display's scale.
-    static func take(windowId: UInt32, into directory: String, at date: Date, displays: [Later.Display]) async -> Taken {
+    static func take(windowId: UInt32, displays: [Later.Display]) async -> Taken {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -49,7 +50,7 @@ enum LaterCapture {
         let text = ScreenIndex.recognise(image).joined(separator: "\n")
         var missing: [String] = []
         let path: String?
-        switch write(image, into: directory, name: Later.screenshotName(at: date, windowId: windowId, timeZone: .current)) {
+        switch write(image) {
         case .success(let p): path = p
         case .failure(let why): path = nil; missing.append("No screenshot: \(why)")
         }
@@ -64,21 +65,11 @@ enum LaterCapture {
         return "No screenshot: capturing the window failed (\(error.localizedDescription))."
     }
 
-    /// Write `image` as `<directory>/<name>.png` (or `<name>-2.png`, … if
-    /// taken), creating the directory private to this user.
-    private static func write(_ image: CGImage, into directory: String, name: String) -> Result<String, CaptureWriteError> {
-        do {
-            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-        } catch {
-            return .failure(CaptureWriteError("could not create \(directory): \(error.localizedDescription)"))
-        }
-        var path = "\(directory)/\(name).png"
-        var n = 2
-        while FileManager.default.fileExists(atPath: path) {
-            path = "\(directory)/\(name)-\(n).png"
-            n += 1
-        }
+    /// Write `image` as a PNG in this user's temporary directory, readable
+    /// by this user only.
+    private static func write(_ image: CGImage) -> Result<String, CaptureWriteError> {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcmonad-later-\(UUID().uuidString).png").path
         guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL,
                                                          UTType.png.identifier as CFString, 1, nil) else {
             return .failure(CaptureWriteError("could not open \(path) for writing"))
@@ -86,6 +77,12 @@ enum LaterCapture {
         CGImageDestinationAddImage(dest, image, nil)
         guard CGImageDestinationFinalize(dest) else {
             return .failure(CaptureWriteError("writing \(path) failed"))
+        }
+        do {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        } catch {
+            try? FileManager.default.removeItem(atPath: path)
+            return .failure(CaptureWriteError("could not make \(path) private: \(error.localizedDescription)"))
         }
         return .success(path)
     }

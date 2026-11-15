@@ -638,12 +638,12 @@ struct MCMonadCoreApp {
             socketServer?.send(.timerStart(seconds: seconds, label: label))
         }
 
-        // The "later" inbox: on when home-manager wrote its settings
-        // (services.mcmonad.later), otherwise nothing of it shows. bd owns
-        // the beads; this reads them, saves to them, and keeps the ready
-        // count in the menu bar. Going back to a bead's window or workspace
+        // The "later" inbox: on when this mcmonad was built with `later`
+        // (services.mcmonad.later), otherwise nothing of it shows. `later`
+        // owns the beads; this reads them, saves to them, and keeps the
+        // ready count in the menu bar. Going back to a bead's window or workspace
         // uses the same paths as the menubar tree.
-        let later = LaterController()
+        let later = LaterController(cli: LaterInbox.inBundle())
         spotlight.later = later
         later.snapshotProvider = { [weak overlayManager] in overlayManager?.cachedSnapshot }
         later.onFocusWindow = { [weak socketServer] wid, pid in
@@ -657,7 +657,6 @@ struct MCMonadCoreApp {
             spotlight?.show(mode: .command, typing: text)
         }
         later.onChanged = { [weak spotlight] in spotlight?.laterUpdated() }
-        later.reloadSettings()
 
         // TimerController is a pure renderer/clock; its state arrives via the
         // set-timers command, and every user action flows back to the brain.

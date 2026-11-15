@@ -244,7 +244,7 @@ event logging and IPC decode failures also withhold window content. File logs
 rotate daily and keep two archives by default; that policy applies only to
 mcmonad's local log files, not to information sent to a provider.
 
-**"later …" saves it for when this is done — off by default.**
+**"later …" saves it for when this is done — when mcmonad is built with it.**
 
 *AI-assisted update (this section): model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).*
 
@@ -257,8 +257,8 @@ lowest). `later` on its own saves the window as it is, under its title.
 
 `Tab` reaches the **Later** mode: what is started (▸), then what is ready
 (◆) by priority and oldest first, then what is snoozed or blocked (◇).
-Typing searches them; saved beads also turn up in the command search.
-Return on a bead offers:
+Typing searches them; saved beads also turn up in the command search, and
+"graph" finds the inbox's page. Return on a bead offers:
 
 - **Start**: mark it started, put a prompt on the clipboard, and go back to
   the window it was saved from, or to its workspace if that window has
@@ -268,35 +268,36 @@ Return on a bead offers:
 - copy the prompt only, open the screenshot, snooze until tomorrow, done.
 
 While anything is ready, a `◆ 3` item in the menu bar keeps the count in
-sight; its menu lists the beads and opens the launcher on any of them. It
-disappears when nothing is ready.
+sight; its menu lists the beads, opens the launcher on any of them, and
+opens the inbox as a page. It disappears when nothing is ready.
 
-The inbox is plain bd. The `later` command is bd pointed at it
+Everything about the beads is decided by `later`, from
+[beads-mcmonad](https://forge.sweater.vac.fere.me/okashi-tech/beads-mcmonad),
+which is bound to a bd. mcmonad captures the window and asks `later` the
+rest over a small versioned JSON protocol. The same `later` is on your PATH:
+`later view` opens the inbox as a page with its dependency graph, every
+screenshot and everything saved; any bd command works on the inbox
 (`later ready`, `later show later-a1b`, `later close later-a1b`), so agents
-and terminals see the same beads; a bead closed there leaves the launcher at
-the next refresh (on open, and every minute).
+and terminals see the same beads, and a bead closed there leaves the
+launcher at the next refresh (on open, and every minute).
 
-Turn it on in home-manager:
+Build it in with home-manager:
 
 ```nix
-services.mcmonad.later = {
-  enable = true;
-  # package = pkgs.beads;   # the bd to run (the default)
-  # directory = "${config.xdg.dataHome}/mcmonad/later";   # the default: beads/ and attachments/
-};
+services.mcmonad.later = beads-mcmonad.packages.${pkgs.stdenv.hostPlatform.system}.later;
 ```
 
-That writes `~/.config/mcmonad/later.json`, which the daemon reads whenever
-the launcher opens; with no file there is no Later mode, no menu-bar item
-and no later rows. Bind a key to the Later mode with
-`showSpotlight "later"`.
+or, without home-manager, `mcmonad-app.override { later = …; }`. The app is
+then built with `later` inside MCMonadCore.app; an app built without it has
+no Later mode, no menu-bar item and no later rows. Bind a key to the Later
+mode with `showSpotlight "later"`.
 
 Unlike the screen index, saving **writes what was on screen to disk on
-purpose**: the screenshot under `attachments/` and the window's text in the
-bead's description, both in the inbox directory and nowhere else; nothing is
-sent anywhere. Capturing needs the same *Screen & System Audio Recording*
-permission as the index; without it the note is saved without them, and
-the bead says why. Logs record bead ids and outcomes, never notes or text.
+purpose**: the screenshot and the window's text, in the inbox
+(`~/.local/share/later` by default) and nowhere else; nothing is sent
+anywhere. Capturing needs the same *Screen & System Audio Recording*
+permission as the index; without it the note is saved without them, and the
+bead says why. Logs record bead ids and outcomes, never notes or text.
 
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first

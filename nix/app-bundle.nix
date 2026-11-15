@@ -1,4 +1,11 @@
-{ pkgs, mcmonad, mcmonad-core, mcmonad-ghc }:
+# AI-assisted update (the optional `later`: the argument, its copy into
+# MCMonadCore.app and its signature): model claude-opus-5-5; reasoning effort
+# unavailable (not exposed by the harness).
+#
+# `later` (beads-mcmonad) is the later inbox's program. Given, it goes into
+# MCMonadCore.app/Contents/Helpers, where the daemon looks for it: an app
+# built with it has the inbox, one built without it does not.
+{ pkgs, mcmonad, mcmonad-core, mcmonad-ghc, later ? null }:
 
 let
   resourceDir = ../core/Sources/MCMonadCore/Resources;
@@ -53,6 +60,11 @@ pkgs.stdenv.mkDerivation {
     mkdir -p "$CORE_APP/MacOS"
     cp ${mcmonad-core}/bin/mcmonad-core "$CORE_APP/MacOS/mcmonad-core"
     chmod +x "$CORE_APP/MacOS/mcmonad-core"
+    ${pkgs.lib.optionalString (later != null) ''
+      mkdir -p "$CORE_APP/Helpers"
+      cp ${pkgs.lib.getExe later} "$CORE_APP/Helpers/later"
+      chmod +x "$CORE_APP/Helpers/later"
+    ''}
     cat > "$CORE_APP/Info.plist" <<'COREPLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -452,6 +464,7 @@ GHCWRAPPER
     echo "Verifying no remaining /nix/store references in binaries..."
     REMAINING=0
     ALL_BINARIES=("$APP/MacOS/mcmonad" "MCMonadCore.app/Contents/MacOS/mcmonad-core")
+    [ -e "MCMonadCore.app/Contents/Helpers/later" ] && ALL_BINARIES+=("MCMonadCore.app/Contents/Helpers/later")
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && ALL_BINARIES+=("$tool")
     done
@@ -554,6 +567,10 @@ PLIST
     # a computable designated code requirement — the thing TCC needs to present
     # and persist the mic/speech grant. home-manager re-signs this bundle with a
     # stable cert so the grant survives rebuilds.
+    # Nested code is signed before the bundle that seals it.
+    if [ -e "MCMonadCore.app/Contents/Helpers/later" ]; then
+      /usr/bin/codesign --force --sign - "MCMonadCore.app/Contents/Helpers/later"
+    fi
     /usr/bin/codesign --force --sign - --entitlements ${coreEntitlements} \
       "MCMonadCore.app"
     for tool in "$GHC_BUNDLE/bin/"*; do

@@ -3,31 +3,31 @@ import os
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 
-/// Why a call to the inbox CLI gave no usable answer. Each case says, in
-/// words, what was being done; only `verb` (never a note, a title or the
-/// window text in the arguments) goes to the log.
+/// Why a call to `later` gave no usable answer. Each case says, in words,
+/// what was being done; only `verb` (never a note, a title or window text)
+/// goes to the log.
 enum LaterFault: Error, Equatable, Sendable, CustomStringConvertible {
-    /// The configured CLI is not an executable file: the settings name a
-    /// wrong path, or a home-manager generation that was collected.
+    /// The `later` mcmonad was built with is not an executable file.
     case missing(cli: String)
     case launch(cli: String, reason: String)
-    /// It ran and exited non-zero. `stderr` is the end of what it said.
+    /// It ran and exited non-zero. `stderr` is the end of what it said:
+    /// `later` explains there what failed and what happened to the change.
     case exited(verb: String, status: Int32, stderr: String)
     case timedOut(verb: String, seconds: Int)
-    case malformed(verb: String, LaterParseError)
+    case malformed(verb: String, LaterDecodeError)
 
     var description: String {
         switch self {
         case .missing(let cli):
-            return "The later inbox CLI \(cli) is not an executable file. Run home-manager switch, or check ~/.config/mcmonad/later.json."
+            return "later is not at \(cli): mcmonad was built with a later that is no longer there; switch home-manager again."
         case .launch(let cli, let reason):
             return "Could not start \(cli): \(reason)"
         case .exited(let verb, let status, let stderr):
-            return "`\(Later.cliName) \(verb)` failed with status \(status)" + (stderr.isEmpty ? "" : ": \(stderr)")
+            return "`later \(verb)` failed with status \(status)" + (stderr.isEmpty ? "" : ": \(stderr)")
         case .timedOut(let verb, let seconds):
-            return "`\(Later.cliName) \(verb)` gave no answer within \(seconds) s and was stopped"
+            return "`later \(verb)` gave no answer within \(seconds) s and was stopped; it may or may not have done its work"
         case .malformed(let verb, let why):
-            return "`\(Later.cliName) \(verb)` answered something unexpected: \(why)"
+            return "`later \(verb)` answered something unexpected: \(why)"
         }
     }
 
@@ -43,70 +43,73 @@ enum LaterFault: Error, Equatable, Sendable, CustomStringConvertible {
     }
 }
 
-/// The inbox CLI (`later`, home-manager's wrapper that runs `bd` against
-/// the inbox database). Every call is one process with a deadline, run off
-/// the main actor, ending in one outcome. bd's embedded Dolt takes
-/// concurrent readers and writers from separate processes, so a refresh
-/// may overlap a save or a `later` typed in a terminal.
+/// `later`, the inbox's own program (beads-mcmonad), which mcmonad is built
+/// with. It owns everything about beads; this runs it, one process per
+/// call with a deadline, off the main actor, and reads its protocol-1
+/// answers.
 struct LaterInbox: Sendable {
     private static let logger = Logger(subsystem: "com.mcmonad.core", category: "Later")
 
     let cli: String
-    /// The longest one call may take. A create with Dolt's first-run
-    /// initialisation takes a few seconds; nothing should take this long.
+    /// The longest one call may take. A first call creates the database,
+    /// which takes a few seconds; nothing should take this long.
     var deadline: TimeInterval = 30
+
+    /// `later` inside the running bundle, where a build with the inbox puts
+    /// it; nil for a build without it.
+    static func inBundle(_ bundle: Bundle = .main) -> String? {
+        let path = bundle.bundleURL.appendingPathComponent("Contents/Helpers/later").path
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+    }
 
     // MARK: Operations
 
-    /// Every open bead, and bd's own answer to which of them are ready.
-    /// `--limit 0`: bd lists 50 (ready: 100) by default, and a silently
-    /// shortened inbox would hide what was saved.
-    func snapshot(now: Date) async -> Result<LaterSnapshot, LaterFault> {
-        async let list = beads("list", ["list", "--json", "--limit=0"])
-        async let ready = beads("ready", ["ready", "--json", "--limit=0"])
-        let (l, r) = await (list, ready)
-        switch (l, r) {
-        case (.failure(let f), _), (_, .failure(let f)): return .failure(f)
-        case (.success(let l), .success(let r)): return .success(LaterSnapshot(list: l, ready: r, readAt: now))
+    func snapshot() async -> Result<LaterSnapshot, LaterFault> {
+        await answer("snapshot", ["snapshot"], LaterSnapshot.self) { $0.protocol }
+    }
+
+    func save(_ request: LaterSaveRequest) async -> Result<LaterSaved, LaterFault> {
+        await answer("save", ["save"], LaterSaved.self, stdin: Later.encode(request)) { $0.protocol }
+    }
+
+    func start(_ id: BeadID) async -> Result<LaterStarted, LaterFault> {
+        await answer("start", ["start", id.raw], LaterStarted.self) { $0.protocol }
+    }
+
+    /// The prompt as plain text.
+    func prompt(_ id: BeadID) async -> Result<String, LaterFault> {
+        await run("prompt", ["prompt", id.raw]).map {
+            String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .newlines)
         }
     }
 
-    func create(title: String, description: String, priority: Int?, labels: [String],
-                metadata: String?) async -> Result<Bead, LaterFault> {
-        // `--flag=value` throughout: a title that starts with "-" stays a value.
-        var args = ["create", "--json", "--title=\(title)", "--body-file=-", "--labels=\(labels.joined(separator: ","))"]
-        if let priority { args.append("--priority=\(priority)") }
-        if let metadata { args.append("--metadata=\(metadata)") }
-        return await run("create", args, stdin: Data(description.utf8)).flatMap { data in
-            Later.parseOne(data).mapError { .malformed(verb: "create", $0) }
-        }
+    func done(_ id: BeadID) async -> Result<Void, LaterFault> {
+        await run("done", ["done", id.raw]).map { _ in () }
     }
 
-    func claim(_ id: BeadID) async -> Result<Void, LaterFault> {
-        await run("update --claim", ["update", id.raw, "--claim", "--json"]).map { _ in () }
+    func snooze(_ id: BeadID) async -> Result<Void, LaterFault> {
+        await run("snooze", ["snooze", id.raw]).map { _ in () }
     }
 
     func putBack(_ id: BeadID) async -> Result<Void, LaterFault> {
-        await run("update --status", ["update", id.raw, "--status=open", "--assignee=", "--json"]).map { _ in () }
+        await run("put-back", ["put-back", id.raw]).map { _ in () }
     }
 
-    func close(_ id: BeadID) async -> Result<Void, LaterFault> {
-        await run("close", ["close", id.raw, "--reason=Done (from the mcmonad launcher)", "--json"]).map { _ in () }
+    /// Write the inbox as a page and open it.
+    func view() async -> Result<Void, LaterFault> {
+        await run("view", ["view"]).map { _ in () }
     }
 
-    func snooze(_ id: BeadID, until: String) async -> Result<Void, LaterFault> {
-        await run("defer", ["defer", id.raw, "--until=\(until)", "--json"]).map { _ in () }
-    }
-
-    private func beads(_ verb: String, _ args: [String]) async -> Result<BeadList, LaterFault> {
-        await run(verb, args).flatMap { data in
-            Later.parseList(data).mapError { .malformed(verb: verb, $0) }
+    private func answer<T: Decodable>(_ verb: String, _ args: [String], _ type: T.Type, stdin: Data? = nil,
+                                      version: @escaping (T) -> Int) async -> Result<T, LaterFault> {
+        await run(verb, args, stdin: stdin).flatMap { data in
+            Later.decode(type, data, version: version).mapError { .malformed(verb: verb, $0) }
         }
     }
 
     // MARK: One process
 
-    /// Run the CLI with `arguments`, feeding `stdin`; the stdout of a zero
+    /// Run `later` with `arguments`, feeding `stdin`; the stdout of a zero
     /// exit, or why there is none.
     func run(_ verb: String, _ arguments: [String], stdin: Data? = nil) async -> Result<Data, LaterFault> {
         guard FileManager.default.isExecutableFile(atPath: cli) else {
@@ -129,7 +132,7 @@ struct LaterInbox: Sendable {
         return result
     }
 
-    /// Owned by exactly one blocking call; the boxes let its reader threads
+    /// Owned by exactly one blocking call; the box lets its reader threads
     /// and its deadline hand results back.
     private final class Box: @unchecked Sendable {
         let process = Process()
@@ -145,10 +148,6 @@ struct LaterInbox: Sendable {
         p.executableURL = URL(fileURLWithPath: cli)
         p.arguments = arguments
         p.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
-        var env = ProcessInfo.processInfo.environment
-        env["NO_COLOR"] = "1"
-        env["BD_NON_INTERACTIVE"] = "1"
-        p.environment = env
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
@@ -184,8 +183,8 @@ struct LaterInbox: Sendable {
         }
         if box.timedOut { return .failure(.timedOut(verb: verb, seconds: Int(deadline))) }
         guard p.terminationStatus == 0 else {
-            let err = String(decoding: box.err, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var err = String(decoding: box.err, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if err.hasPrefix("later: ") { err.removeFirst("later: ".count) }
             return .failure(.exited(verb: verb, status: p.terminationStatus, stderr: String(err.suffix(600))))
         }
         return .success(box.out)

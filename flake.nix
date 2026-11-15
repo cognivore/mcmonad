@@ -116,9 +116,11 @@
           else
             self.packages.${system}.mcmonad;
 
-          mcmonad-app = import ./nix/app-bundle.nix {
-            inherit pkgs;
+          # Built without the later inbox; `mcmonad-app.override { later = …; }`
+          # (services.mcmonad.later in home-manager) builds it in.
+          mcmonad-app = pkgs.callPackage ./nix/app-bundle.nix {
             inherit mcmonad mcmonad-core mcmonad-ghc;
+            later = null;
           };
         };
 

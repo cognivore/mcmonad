@@ -101,12 +101,14 @@ final class ScreenIndex {
     private var inFlight = false
     private var openedSettings = false
     private var noticedReplacement = false
-    /// Consecutive cycles the preflight said "not granted". A deploy replaces
-    /// and re-signs the bundle under the still-running old daemon, whose
-    /// preflight then fails for a few seconds before the launcher kills it;
-    /// acting on one failed check turned every deploy into a system prompt.
-    private var deniedCycles = 0
-    private static let deniedCyclesBeforeAsking = 3
+    /// Since when the preflight has said "not granted", without a break. A
+    /// deploy replaces and re-signs the bundle under the still-running old
+    /// daemon, whose preflight then fails for a while before the launcher
+    /// kills it; acting on one failed check turned every deploy into a
+    /// system prompt. Cycles now come every few seconds, so the grace is a
+    /// time, not a count.
+    private var deniedSince: Date?
+    private static let deniedFor: TimeInterval = 90
 
     /// Fires after a cycle that changed at least one entry, and after every
     /// step of a forced pass so the launcher can show it moving.
@@ -245,31 +247,11 @@ final class ScreenIndex {
 
     private func cycle() async {
         guard isEnabled, !inFlight else { return }
-        // A deploy replaced the bundle under this process: TCC no longer
-        // recognises it and the launcher restarts it shortly. Nothing it
-        // could ask for now would be about a grant that was lost.
-        if PermissionAudit.executableReplaced {
-            if !noticedReplacement {
-                noticedReplacement = true
-                Self.logger.info("executable replaced on disk; index paused until the restart")
-            }
-            if forced { endPass(completed: false) }
-            return
-        }
-        guard CGPreflightScreenCaptureAccess() else {
-            deniedCycles += 1
-            if deniedCycles >= Self.deniedCyclesBeforeAsking { markDenied() }
-            if forced { endPass(completed: false) }
-            return
-        }
-        deniedCycles = 0
-        if availability == .denied { availability = .ready }
-        guard CGDisplayIsAsleep(CGMainDisplayID()) == 0 || forced else { return }
-
         let idle = Self.secondsSinceInput()
         let lastInput = Date(timeIntervalSinceNow: -idle)
+        let awake = CGDisplayIsAsleep(CGMainDisplayID()) == 0
         if forced, pass.isEmpty { endPass(); return }
-        if pass.isEmpty, !forced, idle >= Self.idleAfter,
+        if pass.isEmpty, !forced, awake, idle >= Self.idleAfter,
            passInputMark.map({ lastInput.timeIntervalSince($0) > 1 }) ?? true {
             // An idle pass starts once the user has been quiet for
             // `idleAfter` and has been back since the last pass began. The
@@ -282,14 +264,41 @@ final class ScreenIndex {
                 Self.logger.info("screen index: idle pass over \(self.pass.count, privacy: .public) windows")
             }
         }
-        if !pass.isEmpty, forced || idle >= Self.idleAfter {
-            await step(ids: pass, budget: Self.passBudget, limit: Self.readsPerStep, inPass: true)
+        // A pass goes on while the user stays away (or at once for "!");
+        // otherwise the window they work in, if it is due and no password
+        // is being typed into it.
+        let inPass = !pass.isEmpty && (forced || idle >= Self.idleAfter)
+        let due = inPass || !awake ? nil
+            : policy.due(at: Date(), preferring: focused, skip: IsSecureEventInputEnabled() ? focused : nil)
+        guard inPass || due != nil else { return }
+
+        // Only now, with something to read, ask whether reading is allowed.
+        // A deploy replaced the bundle under this process: TCC no longer
+        // recognises it and the launcher restarts it shortly. Nothing it
+        // could ask for now would be about a grant that was lost.
+        if PermissionAudit.executableReplaced {
+            if !noticedReplacement {
+                noticedReplacement = true
+                Self.logger.info("executable replaced on disk; index paused until the restart")
+            }
+            if forced { endPass(completed: false) }
             return
         }
-        // The user is at the keyboard: the window they work in, if it is due.
-        let secure = IsSecureEventInputEnabled()
-        guard let due = policy.due(at: Date(), preferring: focused, skip: secure ? focused : nil) else { return }
-        await step(ids: [due], budget: Self.glanceBudget, limit: 1, inPass: false)
+        guard CGPreflightScreenCaptureAccess() else {
+            let since = deniedSince ?? Date()
+            deniedSince = since
+            if Date().timeIntervalSince(since) >= Self.deniedFor { markDenied() }
+            if forced { endPass(completed: false) }
+            return
+        }
+        deniedSince = nil
+        if availability == .denied { availability = .ready }
+
+        if inPass {
+            await step(ids: pass, budget: Self.passBudget, limit: Self.readsPerStep, inPass: true)
+        } else if let due {
+            await step(ids: [due], budget: Self.glanceBudget, limit: 1, inPass: false)
+        }
     }
 
     /// Looks at `ids` in order until `limit` of them needed reading, and

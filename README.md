@@ -176,40 +176,91 @@ list on the clipboard; the same lines are logged as `PERMS:` at startup.
 commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.
 
+_AI-assisted update (the screen index's reading and history, and the routes to
+Claude, below): model claude-opus-5-5; reasoning effort unavailable (not
+exposed by the harness)._
+
 **Local window search can read inside windows.** mcmonad-core keeps an OCR index of
 every window it manages, displayed or parked on a hidden workspace: each is
 captured through ScreenCaptureKit (the window's own buffer, so a covered or
-parked window reads like a visible one) and read locally with Vision during
-an idle pass, only when its picture changed. A query that matches no title is then matched against
+parked window reads like a visible one) and read locally with Vision. A
+window's text is believed for as long as its pixels stay the same: a look
+compares hashes of the capture's pixel strips with the last look's, reads
+again only the rows that changed (whole lines, the window's width), and moves
+the lines a scroll carried instead of reading them again. Typing at a
+terminal prompt costs about 0.04 CPU-s, an unchanged window none. A query that matches no title is then matched against
 that text; such rows show the matching line beneath the title with the words
 highlighted. The index is **on by default** and needs the *Screen & System
 Audio Recording* permission for `MCMonadCore.app` — the first run lists the
 app in that pane and opens it; tick it and the index starts on the next cycle.
 Opt out with `ocrIndex = False` in `mcmonad.hs`.
 
-**The local index reads when you step away.** After three minutes without input it makes one pass over every window, displayed first and then parked, at most three recognitions per tick. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries. Window title changes update the launcher immediately, independently of OCR.
+**The local index reads when you step away, and now and then while you work.**
+After three minutes without input it makes one pass over every window,
+displayed first and then parked, three windows that changed at a time. While
+you type, click or scroll hard in a window (the HID system's event *counts*,
+sampled every five seconds; never which keys), that window is looked at, and
+again at most once every two minutes for as long as the input goes on —
+wherever the window is by then. Nothing is read while secure input is on (a
+password field) or the display sleeps. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries. Window title changes update the launcher immediately, independently of OCR.
+
+**It remembers a day.** Every distinct line read off a window, and every title
+it had, is kept with when it was first and last seen; a line typed longer is
+one line. Windows closed in the day stay in it, as closed, with the minutes
+you worked in each window. Everything older than a day is forgotten, and the
+history is capped (3,000 lines a window, 50,000 in all). It lives in
+mcmonad-core's memory only: a restart forgets it, and `ocrIndex = False` (or
+the brain turning the index off) empties it.
 
 The index keeps its readings in memory and does not write screenshots or OCR
 text to disk, logs or the Haskell socket. **Cloud features are a separate
 disclosure:** a confirmed search or opted-in monitoring sends window metadata
-and OCR excerpts through the installed Claude CLI. `--no-session-persistence`
+and OCR excerpts (for a search, also lines from the day's history) through the
+installed Claude CLI. `--no-session-persistence`
 requests no local Claude session history; it does not establish provider
-retention or control other CLI configuration. Ordinary window search stays local.
+retention. Ordinary window search stays local.
 
 **"where is …" asks Claude.** Type or say `where is the deploy terminal`
 (`where's`, `where are`, `where did I put` work too) in either mode and
 press Return, then confirm **Send this search**. Voice requests require the
 same confirmation. Cancel sends nothing. This approves one search and does
 not enable background monitoring. The launcher hands the question, together with every window
-(workspace, app, title, focus, and an excerpt of its recognised text) to the
-Claude Code CLI already installed on the Mac — `claude -p`, model
-`claude-fable-5-1` at low effort, no tools, session persistence off — and
-shows the whole exchange while it thinks: the exact command line, the prompt
-as sent, and the answer as it streams, over a muted spinner. The result is a
-list of windows with their workspace and the model's one-line reason, the
+(workspace, app, title, focus, an excerpt of its recognised text, and from the
+day's history the lines and titles it had *earlier*, each with when it was
+seen — those matching the question first — and when you last worked in it)
+and the windows closed in the day, to Claude, and shows the whole exchange
+while it thinks: the exact command line, the prompt as sent, and the answer as
+it streams, over a muted spinner. The model is told the evidence is snippets
+read rarely and mangled by OCR, and to reconstruct what each window was for
+before answering. The result is a list of windows with their workspace and
+the model's one-line reason, quoting fragments with their times, the
 question's words highlighted in it; Return focuses one, Esc goes back to the
-query. The CLI must be logged in; it is looked for in `~/.local/bin`,
-`/opt/homebrew/bin`, `/usr/local/bin` and `PATH`.
+query. A closed window that answers it shows when it was closed and where.
+
+The question goes by the **SDK route** first: the Claude Code CLI already on
+the Mac (`claude -p`, the Agent SDK's engine, model `claude-fable-5-1` at low
+effort) on your own Claude login, locked down the way laptop-pool runs its
+workers — an environment allowlist (an `ANTHROPIC_API_KEY` the daemon happens
+to carry is not passed on), no tools, no MCP servers, no settings, no CLAUDE.md
+or memory, nothing to ask, no session written, an empty working directory —
+and its answer is believed only if the session says it was exactly that.
+Every `@` in the prompt is escaped, so screen text cannot make the CLI attach
+a file. The CLI is looked for in `~/.local/bin`, `/opt/homebrew/bin`,
+`/usr/local/bin` and `PATH`. Only if that route cannot answer, and a key
+source is configured, the **Messages API** is asked the same question with
+the same model, effort and schema. Both are set in
+`~/.config/mcmonad/claude.json` (all optional; read at every question):
+
+```json
+{ "sdk": { "cli": "/Users/you/.local/bin/claude",
+           "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
+  "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] } }
+```
+
+`oauthTokenFile` and `keyFile` name owner-only files (`chmod 600`) instead of
+commands; a command runs with no input and its output must be one token. There
+is no API key in the environment or in the file itself, and without an `api`
+section there is no API route.
 
 **"What's up" monitoring is off by default.** The mcmonad menu bar has a
 **What's up monitoring: Off/On — sends to Claude** switch. Turning it on

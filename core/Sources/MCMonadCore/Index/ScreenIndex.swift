@@ -329,6 +329,11 @@ final class ScreenIndex {
                 Self.logger.error("screen index: recognition failed: \(fault.reason, privacy: .public)")
             }
         }
+        // A window looked for and not captured (gone from ScreenCaptureKit's
+        // list, excluded from capture, a failed query) waits its turn like
+        // one that was read: else it is due again every tick, and while it
+        // is focused no other owed window is ever looked at.
+        for id in (inPass ? Array(examined) : ids) where looked[id] == nil { policy.noteGlanced(id, at: now) }
         if !inPass, !looked.isEmpty { lastGlance = now }
         if inPass {
             // Nothing examined means the window list itself failed: end the

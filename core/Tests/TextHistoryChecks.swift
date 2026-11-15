@@ -406,6 +406,20 @@ enum TextHistoryChecks {
         let t1 = tight.windows[1]!.earlier
         precondition(t1.contains("09:00 Your invoices for October"), "\(t1)")
         precondition(t1.joined().count + t1.count <= 120 + tight.windows[2]!.earlier.count * 0 + 200)
+        // Thirty windows that each match once all get their match: the
+        // budget goes by what a window needs, not 6,000 characters each.
+        var many = TextHistory()
+        let ids = (1...30).map { UInt32($0) }
+        many.noteWindows(ids.map { ($0, "App", "", nil) }, at: t0)
+        for id in ids {
+            many.record(id, rows: ["window \(id) mentions the invoice once"], replaced: [], at: t0)
+            // Plenty seen since, so only the budget for matches can carry it.
+            many.record(id, rows: (0..<12).map { "later unrelated line number \($0) of window \(id)" }, replaced: [],
+                        at: t0.addingTimeInterval(600))
+        }
+        let spread = HistoryEvidence.select(many, windows: ids, onScreen: { _ in [] }, terms: ["invoice"], budget: 10_000, clock: clock)
+        precondition(ids.allSatisfy { id in spread.windows[id]!.earlier.contains { $0.contains("window \(id) mentions") } },
+                     "a matching window lost its match")
         // Spans and plurals.
         var s = TextHistory.Sighting(kind: .screen, text: "x", key: "x", firstSeen: t0, lastSeen: t0.addingTimeInterval(300), order: 1)
         precondition(HistoryEvidence.format(s, clock: clock) == "09:00–09:05 x")

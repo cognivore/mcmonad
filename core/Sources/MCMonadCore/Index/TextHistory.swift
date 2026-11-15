@@ -256,7 +256,7 @@ enum HistoryEvidence {
             .filter { $0.value.closedAt != nil && !ids.contains($0.key) }
             .sorted { $0.value.closedAt! > $1.value.closedAt! }
             .map(\.key)
-        var candidates: [(id: UInt32, earlier: [TextHistory.Sighting], hits: [Int: Int], score: Int)] = []
+        var candidates: [(id: UInt32, earlier: [TextHistory.Sighting], hits: [Int: Int], score: Int, need: Int)] = []
         for id in open + closedIds {
             guard let w = history.windows[id] else { continue }
             let visible = w.closedAt == nil ? onScreen(id) : []
@@ -268,7 +268,15 @@ enum HistoryEvidence {
                 let n = Set(needles.filter { s.key.contains($0.needle) }.map(\.term)).count
                 if n > 0 { hits[s.order] = n }
             }
-            candidates.append((id, earlier, hits, hits.values.max() ?? 0))
+            // What its matches and the lines read beside them would take.
+            let byOrder = earlier.sorted { $0.order < $1.order }
+            var wanted = Set<Int>()
+            for (i, s) in byOrder.enumerated() where hits[s.order] != nil {
+                wanted.insert(i)
+                for j in [i - 1, i + 1] where byOrder.indices.contains(j) && byOrder[j].kind == .screen { wanted.insert(j) }
+            }
+            let need = wanted.reduce(0) { $0 + format(byOrder[$1], clock: clock).count + 1 }
+            candidates.append((id, earlier, hits, hits.values.max() ?? 0, need))
         }
         // Closed windows are shown when they match, or are the most recent.
         let shownClosed = Set(candidates.filter { history.windows[$0.id]?.closedAt != nil }
@@ -279,8 +287,10 @@ enum HistoryEvidence {
         let recent = min(recentPerWindow, budget / (2 * count))
         var hitBudget = max(0, budget - recent * candidates.count)
         var quota: [UInt32: Int] = [:]
+        // Each matching window gets what its matches need (at most
+        // `hitsPerWindow`), best first, until the budget is gone.
         for c in candidates.sorted(by: { $0.score > $1.score }) where c.score > 0 {
-            let q = min(hitsPerWindow, hitBudget)
+            let q = min(hitsPerWindow, c.need, hitBudget)
             quota[c.id] = q
             hitBudget -= q
         }

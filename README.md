@@ -201,8 +201,9 @@ displayed first and then parked, three windows that changed at a time. While
 you type, click or scroll hard in a window (the HID system's event *counts*,
 sampled every five seconds; never which keys), that window is looked at, and
 again at most once every two minutes for as long as the input goes on —
-wherever the window is by then. Nothing is read while secure input is on (a
-password field) or the display sleeps. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries. Window title changes update the launcher immediately, independently of OCR.
+wherever the window is by then. No window of the app that holds secure input
+(a password field) is read, and nothing is read while the display sleeps
+unless a `!` query asks. Enabling local OCR does not enable cloud monitoring. With monitoring enabled, `! what's up` explicitly re-reads every window before refreshing summaries. Window title changes update the launcher immediately, independently of OCR.
 
 **It remembers a day.** Every distinct line read off a window, and every title
 it had, is kept with when it was first and last seen; a line typed longer is

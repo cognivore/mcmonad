@@ -39,7 +39,8 @@ import os
 ///     windows that changed at a time, then rest until the user has been
 ///     back and gone quiet again. A launcher query starting with "!" runs
 ///     a pass at once.
-/// Nothing is read while secure input is on (a password is being typed).
+/// No window of the app holding secure input (a password is being typed) is
+/// read, and nothing is read while the display sleeps unless asked with "!".
 @MainActor
 final class ScreenIndex {
     nonisolated private static let logger = Logger(subsystem: "com.mcmonad.core", category: "ScreenIndex")
@@ -87,6 +88,9 @@ final class ScreenIndex {
     /// Windows parked on hidden workspaces, per the same snapshot.
     private var hidden: [UInt32] = []
     private var focused: UInt32?
+    /// Each managed window's process, to know which belong to the app that
+    /// holds secure input.
+    private var pids: [UInt32: Int32] = [:]
     /// The running pass: windows not yet looked at, displayed first.
     private var pass: [UInt32] = []
     private var forced = false
@@ -142,6 +146,18 @@ final class ScreenIndex {
         CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
     }
 
+    /// Windows that may not be read now: those of the app holding secure
+    /// input (a password is being typed), as the session names it; every
+    /// window when secure input is on and no app is named.
+    private func guardedWindows() -> Set<UInt32> {
+        guard IsSecureEventInputEnabled() else { return [] }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        guard let pid = (session?["kCGSSessionSecureInputPID"] as? NSNumber)?.int32Value, pid > 0 else {
+            return Set(visible).union(hidden)
+        }
+        return Set(pids.filter { $0.value == pid }.keys)
+    }
+
     /// The HID system's running counts of keys, clicks and scroll steps.
     nonisolated static func inputCounts() -> InputPulse.Counts {
         func n(_ t: CGEventType) -> UInt32 { CGEventSource.counterForEventType(.hidSystemState, eventType: t) }
@@ -185,6 +201,8 @@ final class ScreenIndex {
         visible = snapshot.screens.flatMap { $0.windows.map(\.windowId) }
         hidden = snapshot.hiddenWorkspaces.flatMap { $0.windows.map(\.windowId) }
         focused = snapshot.screens.lazy.flatMap(\.windows).first { $0.isFocused }?.windowId
+        pids = Dictionary((snapshot.screens.flatMap(\.windows) + snapshot.hiddenWorkspaces.flatMap(\.windows))
+            .map { ($0.windowId, $0.pid) }, uniquingKeysWith: { a, _ in a })
         var present: [(id: UInt32, app: String, title: String, tag: String?)] = []
         for s in snapshot.screens { for w in s.windows { present.append((w.windowId, w.appName ?? "?", w.title ?? "", s.workspaceTag)) } }
         for ws in snapshot.hiddenWorkspaces { for w in ws.windows { present.append((w.windowId, w.appName ?? "?", w.title ?? "", ws.tag)) } }
@@ -264,12 +282,16 @@ final class ScreenIndex {
                 Self.logger.info("screen index: idle pass over \(self.pass.count, privacy: .public) windows")
             }
         }
-        // A pass goes on while the user stays away (or at once for "!");
-        // otherwise the window they work in, if it is due and no password
-        // is being typed into it.
-        let inPass = !pass.isEmpty && (forced || idle >= Self.idleAfter)
-        let due = inPass || !awake ? nil
-            : policy.due(at: Date(), preferring: focused, skip: IsSecureEventInputEnabled() ? focused : nil)
+        // A pass goes on while the user stays away and the display is awake
+        // (or at once for "!"); otherwise the window they work in, if it is
+        // due. No window of the app holding secure input is read either way.
+        let guarded = guardedWindows()
+        let inPass = !pass.isEmpty && (forced || (idle >= Self.idleAfter && awake))
+        if inPass, !guarded.isEmpty {
+            pass.removeAll { guarded.contains($0) }
+            if pass.isEmpty { endPass(); return }
+        }
+        let due = inPass || !awake ? nil : policy.due(at: Date(), preferring: focused, skip: guarded)
         guard inPass || due != nil else { return }
 
         // Only now, with something to read, ask whether reading is allowed.

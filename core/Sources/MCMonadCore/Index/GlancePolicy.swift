@@ -64,10 +64,11 @@ struct GlancePolicy: Sendable {
 
     /// The window to look at now, if any: an owed window whose last look is
     /// `every` old — `preferring` first (the focused one), then the one owed
-    /// longest. `skip` is a window that may not be read now (secure input).
-    func due(at date: Date, preferring: UInt32?, skip: UInt32? = nil) -> UInt32? {
+    /// longest. `skip` are windows that may not be read now (the app that
+    /// holds secure input); they stay owed.
+    func due(at date: Date, preferring: UInt32?, skip: Set<UInt32> = []) -> UInt32? {
         let ready = owed.filter { id, _ in
-            id != skip && lastGlance[id].map { date.timeIntervalSince($0) >= Self.every } ?? true
+            !skip.contains(id) && lastGlance[id].map { date.timeIntervalSince($0) >= Self.every } ?? true
         }
         if let p = preferring, ready[p] != nil { return p }
         return ready.min { ($0.value, $0.key) < ($1.value, $1.key) }?.key

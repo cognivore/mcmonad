@@ -138,7 +138,6 @@ in
         mcmonad-app is.
       '';
     };
-    };
   };
 
   config = lib.mkIf cfg.enable {

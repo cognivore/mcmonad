@@ -13,6 +13,15 @@ enum Ask {
     static let model = "claude-fable-5-1"
     static let effort = "low"
 
+    /// The ceilings every question runs under, as a laptop-pool profile
+    /// sets them: turns (a structured answer takes one or two) and output
+    /// tokens per turn. A question that reaches one ends failed and says
+    /// which, instead of running on. No dollar ceiling: on the SDK route the
+    /// subscription carries the cost, and an API call is one turn whose
+    /// output `max_tokens` already bounds.
+    static let maxTurns = 4
+    static let maxOutputTokens = 16_000
+
     /// Arguments after the executable. Print mode with structured output and
     /// a streamed transcript; locked down the way laptop-pool runs the Agent
     /// SDK: no tools, no MCP server, no settings, nothing to ask, and no
@@ -23,6 +32,7 @@ enum Ask {
             "-p",
             "--model", model,
             "--effort", effort,
+            "--max-turns", String(maxTurns),
             "--no-session-persistence",
             "--tools", "",
             "--permission-mode", "dontAsk",
@@ -265,6 +275,7 @@ enum Ask {
         case "assistant", "user":
             return .note("\(type) message")
         case "result":
+            if let limit = stoppedBy(obj["subtype"] as? String) { return .final(limit) }
             if obj["is_error"] as? Bool == true {
                 let why = (obj["result"] as? String)
                     ?? (obj["api_error_status"].map { "\($0)" })
@@ -279,6 +290,18 @@ enum Ask {
             return .final(.malformed(shown))
         default:
             return .note(type)
+        }
+    }
+
+    /// A result line whose subtype says the session was stopped, as the
+    /// outcome that names why; nil for a finished session.
+    static func stoppedBy(_ subtype: String?) -> Outcome? {
+        switch subtype {
+        case nil, "success": return nil
+        case "error_max_turns": return .failed("stopped at the limit of \(maxTurns) turns")
+        case "error_max_structured_output_retries": return .malformed("gave up fitting the answer to the schema")
+        case "error_during_execution": return .failed("the session failed while running")
+        case let other?: return .failed("the session ended as \(other)")
         }
     }
 }

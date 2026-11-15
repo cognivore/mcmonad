@@ -144,6 +144,9 @@ enum LauncherLogicChecks {
         precondition(WhereIs.arguments.contains(WhereIs.systemPrompt))
         let tools = WhereIs.arguments.firstIndex(of: "--tools")!, mode = WhereIs.arguments.firstIndex(of: "--permission-mode")!
         precondition(WhereIs.arguments[tools + 1] == "" && WhereIs.arguments[mode + 1] == "dontAsk")
+        // A laptop-pool profile's turn ceiling; no dollar one on a subscription.
+        let turns = WhereIs.arguments.firstIndex(of: "--max-turns")!
+        precondition(WhereIs.arguments[turns + 1] == "4" && !WhereIs.arguments.contains("--max-budget-usd"))
         precondition(WhereIs.systemPrompt.contains("snippets") && WhereIs.systemPrompt.contains("Reconstruct"))
         precondition(Ask.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
                      == ["/h/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
@@ -212,6 +215,7 @@ enum LauncherLogicChecks {
         precondition(env["ANTHROPIC_API_KEY"] == nil && env["AWS_SECRET_ACCESS_KEY"] == nil)
         precondition(env["CLAUDE_CODE_OAUTH_TOKEN"] == token && env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == "1"
                      && env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" && env["LANG"] == "en_GB.UTF-8" && env["USER"] == "u")
+        precondition(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "16000")
         precondition(env["PATH"]!.hasPrefix("/h/.local/bin:") && env["PATH"]!.hasSuffix(":/custom/bin"))
         precondition(ClaudeAccess.cliEnvironment(inherited: [:], home: "/h", user: "u", token: nil)["CLAUDE_CODE_OAUTH_TOKEN"] == nil)
         // The init line must show a locked-down session.
@@ -272,6 +276,15 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine(failed, known: known) == .final(.failed("Not logged in")))
         let malformed = #"{"type":"result","is_error":false,"result":"plain prose"}"#
         precondition(WhereIs.parseLine(malformed, known: known) == .final(.malformed("plain prose")))
+        // A session stopped by a ceiling says which, whatever else it printed.
+        let turnsOut = #"{"type":"result","subtype":"error_max_turns","is_error":true}"#
+        precondition(WhereIs.parseLine(turnsOut, known: known) == .final(.failed("stopped at the limit of 4 turns")))
+        let stopped = #"{"type":"result","subtype":"error_during_execution","is_error":false,"structured_output":{"matches":[]}}"#
+        precondition(WhereIs.parseLine(stopped, known: known) == .final(.failed("the session failed while running")))
+        let shapeless = #"{"type":"result","subtype":"error_max_structured_output_retries","is_error":true}"#
+        guard case .final(.malformed) = WhereIs.parseLine(shapeless, known: known) else { preconditionFailure("retries") }
+        let odd = #"{"type":"result","subtype":"error_new_kind","is_error":true}"#
+        precondition(WhereIs.parseLine(odd, known: known) == .final(.failed("the session ended as error_new_kind")))
     }
 
     static func checkTitleEvent() {

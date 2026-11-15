@@ -144,6 +144,7 @@ enum ClaudeAccess {
             "USER": user,
             "LOGNAME": user,
             "PATH": searchPath(home: home, user: user, inherited: env["PATH"]),
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": String(Ask.maxOutputTokens),
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
@@ -185,7 +186,7 @@ enum ClaudeAccess {
         guard let schema = try? JSONSerialization.jsonObject(with: Data(request.schema.utf8)) else { return nil }
         let body: [String: Any] = [
             "model": Ask.model,
-            "max_tokens": 16_000,
+            "max_tokens": Ask.maxOutputTokens,
             "system": request.systemPrompt,
             "messages": [["role": "user", "content": request.prompt]],
             "output_config": ["effort": Ask.effort, "format": ["type": "json_schema", "schema": schema]],

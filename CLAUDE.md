@@ -279,10 +279,10 @@ collapsed every workspace after a rollback. So:
   one-off search or explicit menu-bar opt-in to What's up monitoring (off by
   default). Opting out cancels queued/in-flight monitoring and clears cached
   summaries; it cannot recall data already sent. Claude's local session
-  persistence flag is not a provider-retention guarantee. Questions go to the
-  locked-down `claude -p` first and to the Messages API only as its fallback,
-  with a key from a command or an owner-only file named in
-  `~/.config/mcmonad/claude.json`, never an environment variable
+  persistence flag is not a provider-retention guarantee. Questions go only to the
+  locked-down `claude -p` on the user's Claude login (an OAuth token may come
+  from a command or an owner-only file named in
+  `~/.config/mcmonad/claude.json`); there is no Messages API route
   (`Launcher/ClaudeAccess.swift`). What is kept of a question afterwards is a
   receipt with no text field (`Launcher/AskReceipts.swift`): in memory, and
   one `ASK:` log line unless claude.json's `retention.receipts` is

@@ -6,17 +6,16 @@ import Foundation
 /// how long: its own ledger, kept the way laptop-pool keeps job receipts
 /// but under a local retention policy.
 ///
-/// A receipt says which feature asked, which routes ran and how each ended,
-/// how long it took, how many turns and tokens it used, and how many
-/// windows or workspaces the answer named. It has no field for text: not
-/// the question, the screen text sent, the answer, or an error's words
-/// (which can quote any of them). The only strings are closed vocabularies:
-/// the CLI's result subtype, the API's HTTP status, a route's own short
-/// reason. So whatever a receipt is written to learns nothing of the screen.
+/// A receipt says which feature asked, how the CLI run ended, how long it
+/// took, how many turns and tokens it used, and how many windows or
+/// workspaces the answer named. It has no field for text: not the question,
+/// the screen text sent, the answer, or an error's words (which can quote
+/// any of them). The only strings are closed vocabularies: the CLI's result
+/// subtype, or the runner's own short reason. So whatever a receipt is
+/// written to learns nothing of the screen.
 ///
-/// Dollars are not counted. On the SDK route the subscription carries the
-/// cost, and the CLI's own `total_cost_usd` is a list-price estimate, not
-/// a charge.
+/// Dollars are not counted. The subscription carries the cost, and the
+/// CLI's own `total_cost_usd` is a list-price estimate, not a charge.
 extension Ask {
     /// Which launcher feature asked.
     enum Kind: String, Sendable {
@@ -24,12 +23,7 @@ extension Ask {
         case whatsUp = "whats-up"
     }
 
-    enum Route: String, Sendable {
-        case sdk
-        case api
-    }
-
-    /// How one route, or a whole question, ended.
+    /// How the CLI run, or a whole question, ended.
     enum End: String, Sendable {
         case answered
         case unavailable
@@ -48,8 +42,7 @@ extension Ask {
         }
     }
 
-    /// Tokens one call used, as the CLI's result line or the API's reply
-    /// counts them.
+    /// Tokens one call used, as the CLI's result line counts them.
     struct Usage: Equatable, Sendable {
         var input = 0
         var output = 0
@@ -77,10 +70,10 @@ extension Ask {
         }
     }
 
-    /// What a route's own report adds to its outcome.
+    /// What the CLI's own report adds to its outcome.
     struct Facts: Equatable, Sendable {
         /// A short reason from a closed vocabulary: the CLI's result
-        /// subtype, "http-429", "no-cli"… Never words from the call.
+        /// subtype, "exit-3", "no-cli"… Never words from the call.
         var detail: String?
         var usage: Usage?
         var turns: Int?
@@ -107,9 +100,8 @@ extension Ask {
         }
     }
 
-    /// One route's part in a question.
-    struct Leg: Equatable, Sendable {
-        let route: Route
+    /// The CLI's part in a question.
+    struct CLIRun: Equatable, Sendable {
         let seconds: Double
         let end: End
         let facts: Facts
@@ -121,7 +113,9 @@ extension Ask {
         let model: String
         let effort: String
         let started: Date
-        var legs: [Leg] = []
+        /// Absent when the question ended before the CLI's route reported
+        /// (settings that cannot be read, a cancel).
+        var run: CLIRun?
         var end: End = .cancelled
         var seconds: Double = 0
         /// How many windows or workspaces the answer named, and how many
@@ -137,7 +131,7 @@ extension Ask {
             self.started = started
         }
 
-        var tokens: Int { legs.reduce(0) { $0 + ($1.facts.usage?.total ?? 0) } }
+        var tokens: Int { run?.facts.usage?.total ?? 0 }
 
         /// Ends the receipt with `outcome` (or `end`, for a deadline or a
         /// cancel), `seconds` after it started.
@@ -157,12 +151,12 @@ extension Ask {
                 + " seconds=\(Self.decimal(seconds))"
             if let named { line += " named=\(named)" }
             if let dropped { line += " dropped=\(dropped)" }
-            for leg in legs {
-                line += " \(leg.route.rawValue)=\(leg.end.rawValue)"
-                if let d = leg.facts.detail { line += "/\(d)" }
-                line += ",\(Self.decimal(leg.seconds))s"
-                if let t = leg.facts.turns { line += ",turns=\(t)" }
-                if let u = leg.facts.usage {
+            if let run {
+                line += " cli=\(run.end.rawValue)"
+                if let d = run.facts.detail { line += "/\(d)" }
+                line += ",\(Self.decimal(run.seconds))s"
+                if let t = run.facts.turns { line += ",turns=\(t)" }
+                if let u = run.facts.usage {
                     line += ",tokens=\(u.input)+\(u.output),cache=\(u.cacheRead)+\(u.cacheWrite)"
                 }
             }
@@ -170,10 +164,9 @@ extension Ask {
         }
 
         /// One row of the menu bar's list: "21:40  where-is  answered in
-        /// 6.3 s via sdk · 1.5k tokens · 2 named".
+        /// 6.3 s · 1.5k tokens · 2 named".
         func menuLine(clock: (Date) -> String) -> String {
-            var parts = ["\(end.rawValue) in \(Self.decimal(seconds)) s"
-                         + (legs.isEmpty ? "" : " via " + legs.map(\.route.rawValue).joined(separator: "→"))]
+            var parts = ["\(end.rawValue) in \(Self.decimal(seconds)) s"]
             if tokens > 0 { parts.append(tokens >= 1000 ? "\(Self.decimal(Double(tokens) / 1000))k tokens" : "\(tokens) tokens") }
             if let named { parts.append("\(named) named") }
             return "\(clock(started))  \(kind.rawValue)  " + parts.joined(separator: " · ")

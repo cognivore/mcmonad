@@ -1,8 +1,8 @@
 import Foundation
 
-// AI-assisted update (history in the manifold; the SDK and API routes; turn
-// ceilings and the request's kind): model claude-opus-5-5; reasoning effort
-// unavailable (not exposed by the harness).
+// AI-assisted update (history in the manifold; the locked-down SDK route;
+// turn ceilings and the request's kind): model claude-opus-5-5; reasoning
+// effort unavailable (not exposed by the harness).
 
 /// What every launcher question to the model shares — "where is …" and
 /// "what's up": describing every window to it (the manifold), calling the
@@ -17,9 +17,8 @@ enum Ask {
     /// The ceilings every question runs under, as a laptop-pool profile
     /// sets them: turns (a structured answer takes one or two) and output
     /// tokens per turn. A question that reaches one ends failed and says
-    /// which, instead of running on. No dollar ceiling: on the SDK route the
-    /// subscription carries the cost, and an API call is one turn whose
-    /// output `max_tokens` already bounds.
+    /// which, instead of running on. No dollar ceiling: the subscription
+    /// carries the cost.
     static let maxTurns = 4
     static let maxOutputTokens = 16_000
 

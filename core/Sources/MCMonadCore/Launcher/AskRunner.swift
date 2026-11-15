@@ -1,15 +1,15 @@
 import Foundation
 
-// AI-assisted update (SDK route first, locked down like laptop-pool's workers;
-// the Messages API only as its fallback; a receipt per question in the
-// ledger): model claude-opus-5-5; reasoning effort unavailable (not exposed
-// by the harness).
+// AI-assisted update (the SDK route, locked down like laptop-pool's workers;
+// a receipt per question in the ledger; no API route): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 
 /// Runs one launcher question to the model and ends in exactly one
-/// `Ask.Outcome`. The SDK route first — Claude Code headless (`claude -p`)
-/// on the user's own login, streaming its transcript back; the Messages API
-/// only when that route could not answer and a key source is configured
-/// (`ClaudeAccess`). The prompt goes in on stdin and no local session is
+/// `Ask.Outcome`, by the one route there is: Claude Code headless
+/// (`claude -p`, the Agent SDK's engine) on the user's own Claude login,
+/// streaming its transcript back (`ClaudeAccess`). There is no Messages API
+/// route: its tokens cost money the subscription already covers. The
+/// prompt goes in on stdin and no local session is
 /// persisted. This does not control the provider's retention. Every
 /// question, answered or not, leaves a receipt in the `AskLedger`, which
 /// has no field for text.
@@ -38,22 +38,19 @@ final class AskRunner: AskRunning {
     private var receipt: Ask.Receipt?
     private var retention: Ask.Retention?
 
-    /// The longest the SDK route may take before the API route is tried;
-    /// the launcher gives a whole question 120 s.
-    static let sdkDeadline: TimeInterval = 75
+    /// The longest the CLI may run: just under the 120 s the launcher
+    /// gives a whole question, so the reason shown is the CLI's own.
+    static let sdkDeadline: TimeInterval = 115
 
-    /// Where receipts go, where the settings come from and how the API is
-    /// called: the real ones, or a check's.
+    /// Where receipts go and where the settings come from: the real ones,
+    /// or a check's.
     private let ledger: AskLedger
     private let loadSettings: () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem>
-    private let callAPI: (Ask.Request, String) async -> (Ask.Outcome, Ask.Facts)
 
     init(ledger: AskLedger,
-         loadSettings: @escaping () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> = ClaudeRoutes.loadSettings,
-         callAPI: @escaping (Ask.Request, String) async -> (Ask.Outcome, Ask.Facts) = { await ClaudeRoutes.callAPI($0, key: $1) }) {
+         loadSettings: @escaping () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> = ClaudeRoutes.loadSettings) {
         self.ledger = ledger
         self.loadSettings = loadSettings
-        self.callAPI = callAPI
     }
 
     /// A byte buffer one reader thread appends to; boxed so the sendable
@@ -70,8 +67,8 @@ final class AskRunner: AskRunning {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    /// The longest a whole question may take, both routes and fetching
-    /// their credentials. "What's up" has no clock of its own.
+    /// The longest a whole question may take, fetching the OAuth token
+    /// included. "What's up" has no clock of its own.
     static let deadline: TimeInterval = 180
 
     func start(_ request: Ask.Request) {
@@ -100,48 +97,9 @@ final class AskRunner: AskRunning {
             self.retention = settings.retention
             let sdkStarted = Date()
             guard let sdk = await self.runSDK(request, settings: settings, runID: runID), self.runID == runID else { return }
-            self.receipt?.legs.append(Ask.Leg(route: .sdk, seconds: Date().timeIntervalSince(sdkStarted),
-                                              end: sdk.timedOut ? .timedOut : Ask.End(sdk.outcome), facts: sdk.facts))
-            switch sdk.outcome {
-            case .answered, .malformed:
-                // An answer, or one in the wrong shape: the model was
-                // reached, and asking again elsewhere would pay twice.
-                self.finish(sdk.outcome, runID: runID)
-                return
-            case .unavailable(let why), .failed(let why):
-                guard let key = settings.apiKey else {
-                    self.finish(sdk.outcome, runID: runID)
-                    return
-                }
-                self.onNote?("SDK route did not answer (\(why.split(separator: "\n").first ?? "")); asking the API")
-                let apiStarted = Date()
-                let api: Ask.Outcome, facts: Ask.Facts
-                switch await ClaudeRoutes.fetch(key) {
-                case .failure(let problem): (api, facts) = (.unavailable("API key: \(problem.why)"), Ask.Facts(detail: "key"))
-                case .success(let key): (api, facts) = await self.callAPI(request, key)
-                }
-                guard self.runID == runID else { return }
-                self.receipt?.legs.append(Ask.Leg(route: .api, seconds: Date().timeIntervalSince(apiStarted),
-                                                  end: Ask.End(api), facts: facts))
-                self.finish(Self.both(sdk: sdk.outcome, api: api), runID: runID)
-            }
-        }
-    }
-
-    /// When both routes failed, both reasons.
-    private static func both(sdk: Ask.Outcome, api: Ask.Outcome) -> Ask.Outcome {
-        func why(_ o: Ask.Outcome) -> String? {
-            switch o {
-            case .unavailable(let w), .failed(let w), .malformed(let w): return w
-            case .answered: return nil
-            }
-        }
-        guard let a = why(api), let s = why(sdk) else { return api }
-        let text = "SDK: \(s)\nAPI: \(a)"
-        switch api {
-        case .unavailable: return .unavailable(text)
-        case .malformed: return .malformed(text)
-        default: return .failed(text)
+            self.receipt?.run = Ask.CLIRun(seconds: Date().timeIntervalSince(sdkStarted),
+                                           end: sdk.timedOut ? .timedOut : Ask.End(sdk.outcome), facts: sdk.facts)
+            self.finish(sdk.outcome, runID: runID)
         }
     }
 

@@ -2,13 +2,13 @@ import Foundation
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 
-/// The effects behind `ClaudeAccess`: reading the settings file, fetching a
-/// secret from the command or file it names, and one Messages API call.
+/// The effects behind `ClaudeAccess`: reading the settings file, and
+/// fetching the OAuth token from the command or file it names.
 /// Secrets live only in these functions' locals and the child's
 /// environment; nothing here logs or keeps one.
 enum ClaudeRoutes {
     /// The settings, or why they are unusable. No file: the defaults (the
-    /// CLI's own login, no API route).
+    /// CLI's own login, receipts logged for a day).
     static func loadSettings() -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> {
         let path = ClaudeAccess.settingsPath(home: NSHomeDirectory())
         guard let data = FileManager.default.contents(atPath: path) else {
@@ -118,26 +118,6 @@ enum ClaudeRoutes {
             guard !done else { return }
             done = true
             body()
-        }
-    }
-
-    static let apiDeadline: TimeInterval = 60
-
-    /// One Messages API call for `request`, keyed by `key`: its outcome,
-    /// and what its receipt keeps of it.
-    static func callAPI(_ request: Ask.Request, key: String, session: URLSession = .shared) async -> (Ask.Outcome, Ask.Facts) {
-        guard let body = ClaudeAccess.apiBody(request) else { return (.malformed("the schema is not JSON"), Ask.Facts(detail: "schema")) }
-        var http = URLRequest(url: ClaudeAccess.apiURL, timeoutInterval: apiDeadline)
-        http.httpMethod = "POST"
-        for (name, value) in ClaudeAccess.apiHeaders(key: key) { http.setValue(value, forHTTPHeaderField: name) }
-        http.httpBody = body
-        do {
-            let (data, response) = try await session.data(for: http)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return (ClaudeAccess.apiOutcome(status: status, data: data, request: request),
-                    ClaudeAccess.apiFacts(status: status, data: data))
-        } catch {
-            return (.failed("API call failed: \(error.localizedDescription)"), Ask.Facts(detail: "transport"))
         }
     }
 }

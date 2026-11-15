@@ -196,12 +196,13 @@ enum LauncherLogicChecks {
     static func checkClaudeAccess() {
         func parse(_ json: String) -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> { ClaudeAccess.parse(Data(json.utf8)) }
         precondition(parse("{}") == .success(ClaudeAccess.Settings()))
-        precondition(parse(#"{"sdk":{"cli":"/x/claude","oauthTokenCommand":["rageveil","show","a/b"]},"api":{"keyFile":"~/.config/k"}}"#)
-                     == .success(ClaudeAccess.Settings(cli: "/x/claude", oauthToken: .command(["rageveil", "show", "a/b"]),
-                                                       apiKey: .file("~/.config/k"))))
-        for bad in ["[]", #"{"apiKey":"sk-ant-x"}"#, #"{"api":{}}"#, #"{"api":{"key":"sk-ant-naked"}}"#,
-                    #"{"api":{"keyCommand":["a"],"keyFile":"/k"}}"#, #"{"sdk":{"cli":"claude"}}"#,
-                    #"{"api":{"keyCommand":[]}}"#, #"{"api":{"keyFile":"relative"}}"#] {
+        precondition(parse(#"{"sdk":{"cli":"/x/claude","oauthTokenCommand":["rageveil","show","a/b"]}}"#)
+                     == .success(ClaudeAccess.Settings(cli: "/x/claude", oauthToken: .command(["rageveil", "show", "a/b"]))))
+        precondition(parse(#"{"sdk":{"oauthTokenFile":"~/.config/t"}}"#) == .success(ClaudeAccess.Settings(oauthToken: .file("~/.config/t"))))
+        // There is no API route, so no place for a key.
+        for bad in ["[]", #"{"apiKey":"sk-ant-x"}"#, #"{"api":{"keyFile":"~/.config/k"}}"#, #"{"sdk":{"key":"sk-ant-naked"}}"#,
+                    #"{"sdk":{"oauthTokenCommand":["a"],"oauthTokenFile":"/k"}}"#, #"{"sdk":{"cli":"claude"}}"#,
+                    #"{"sdk":{"oauthTokenCommand":[]}}"#, #"{"sdk":{"oauthTokenFile":"relative"}}"#] {
             guard case .failure = parse(bad) else { preconditionFailure("accepted \(bad)") }
         }
         let token = String(repeating: "t", count: 40)
@@ -228,26 +229,6 @@ enum LauncherLogicChecks {
         guard case .final(.failed) = WhereIs.parseLine(initLine, known: []) else { preconditionFailure("a session with tools was believed") }
         let goodInit = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk","apiKeySource":"none"}"#
         precondition(WhereIs.parseLine(goodInit, known: []) == .session("system init model=m key=none"))
-        // The API route: same model, effort, schema; refusals and errors kept apart.
-        let request = Ask.Request(kind: .whereIs, systemPrompt: "sys", schema: WhereIs.schemaJSON, prompt: "q",
-                                  answer: { WhereIs.answer(from: $0, known: [7]) })
-        let body = try! JSONSerialization.jsonObject(with: ClaudeAccess.apiBody(request)!) as! [String: Any]
-        precondition(body["model"] as? String == Ask.model && body["system"] as? String == "sys" && body["fallbacks"] as? String == "default")
-        let config = body["output_config"] as! [String: Any]
-        precondition(config["effort"] as? String == Ask.effort && (config["format"] as! [String: Any])["type"] as? String == "json_schema")
-        precondition(body["thinking"] == nil && body["temperature"] == nil)
-        let headers = ClaudeAccess.apiHeaders(key: token)
-        precondition(headers["x-api-key"] == token && headers["anthropic-version"] == "2026-10-21")
-        func reply(_ json: String, _ status: Int = 200) -> Ask.Outcome {
-            ClaudeAccess.apiOutcome(status: status, data: Data(json.utf8), request: request)
-        }
-        precondition(reply(#"{"stop_reason":"end_turn","content":[{"type":"thinking","thinking":""},{"type":"text","text":"{\"matches\":[{\"id\":7,\"reason\":\"r\"}]}"}]}"#)
-                     == .answered(.windows(matches: [.init(windowId: 7, reason: "r")], droppedUnknownIds: 0)))
-        guard case .failed = reply(#"{"stop_reason":"refusal","content":[],"stop_details":{"category":"cyber"}}"#),
-              case .failed(let why) = reply(#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#, 401),
-              case .malformed = reply(#"{"stop_reason":"end_turn","content":[{"type":"text","text":"prose"}]}"#)
-        else { preconditionFailure("API outcomes") }
-        precondition(why.contains("401") && why.contains("authentication_error") && !why.contains(token))
     }
 
     static func checkStream() {
@@ -533,12 +514,10 @@ enum LauncherLogicChecks {
                                   answer: { WhereIs.answer(from: $0, known: [7]) })
         let answered = Ask.Outcome.answered(.windows(matches: [.init(windowId: 7, reason: "SECRET-REASON")], droppedUnknownIds: 0))
         let token = String(repeating: "k", count: 40)
-        var apiKeys: [String] = []
         var logged: [String] = []
         let ledger = AskLedger(write: { logged.append($0) })
         func run(_ settings: ClaudeAccess.Settings) async -> Ask.Outcome {
-            let runner = AskRunner(ledger: ledger, loadSettings: { .success(settings) },
-                                   callAPI: { _, key in apiKeys.append(key); return (answered, Ask.Facts(detail: "end_turn", turns: 1)) })
+            let runner = AskRunner(ledger: ledger, loadSettings: { .success(settings) })
             return await withCheckedContinuation { done in
                 runner.onFinished = { done.resume(returning: $0) }
                 runner.start(request)
@@ -550,32 +529,24 @@ enum LauncherLogicChecks {
         // windows the answer named.
         let receipt = ledger.recent()[0]
         precondition(receipt.kind == .whereIs && receipt.end == .answered && receipt.named == 1 && receipt.dropped == 0)
-        precondition(receipt.legs.count == 1 && receipt.legs[0].route == .sdk && receipt.legs[0].end == .answered)
-        precondition(receipt.legs[0].facts == Ask.Facts(detail: "success", usage: Ask.Usage(input: 1300, output: 200, cacheRead: 5), turns: 2))
+        precondition(receipt.run?.end == .answered)
+        precondition(receipt.run?.facts == Ask.Facts(detail: "success", usage: Ask.Usage(input: 1300, output: 200, cacheRead: 5), turns: 2))
         precondition(logged.count == 1 && logged[0].hasPrefix("ASK: id=\(receipt.id) kind=where-is model=\(Ask.model)")
-                     && logged[0].contains(" end=answered ") && logged[0].contains(" sdk=answered/success,")
+                     && logged[0].contains(" end=answered ") && logged[0].contains(" cli=answered/success,")
                      && logged[0].contains(",turns=2,tokens=1300+200,cache=5+0"), logged[0])
         guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: silent)), why.contains("not believed") else {
             preconditionFailure("an answer from a session that never described itself was believed")
         }
-        precondition(apiKeys.isEmpty, "no API route without a key source")
-        // The SDK route fails; the API answers, with the key the command printed.
-        let fellBack = await run(ClaudeAccess.Settings(cli: broken, apiKey: .command(["/bin/echo", token])))
-        precondition(fellBack == answered, "\(fellBack)")
-        precondition(apiKeys == [token])
-        let both = ledger.recent()[0].legs
-        precondition(both.map(\.route) == [.sdk, .api] && both.map(\.end) == [.failed, .answered]
-                     && both[0].facts.detail == "exit-3" && both[1].facts.detail == "end_turn", "\(both)")
-        // An answer in the wrong shape is not asked again elsewhere.
+        // A CLI that fails says why, on screen; its receipt says only how.
+        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: broken)),
+              why.contains("status 3"), why.contains("SECRET-STDERR") else { preconditionFailure("a failed CLI") }
+        precondition(ledger.recent()[0].run?.end == .failed && ledger.recent()[0].run?.facts.detail == "exit-3")
+        // An answer in the wrong shape.
         let prose = fake("prose", "echo '\(initLine)'\necho '{\"type\":\"result\",\"is_error\":false,\"result\":\"prose\"}'\n")
-        guard case .malformed = await run(ClaudeAccess.Settings(cli: prose, apiKey: .command(["/bin/echo", token]))) else {
-            preconditionFailure("malformed")
-        }
-        precondition(apiKeys.count == 1)
+        guard case .malformed = await run(ClaudeAccess.Settings(cli: prose)) else { preconditionFailure("malformed") }
         // A cancelled run reports nothing, and a key command that fails says so.
         let slow = fake("slow", "sleep 30\n")
-        let runner = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: slow)) },
-                               callAPI: { _, _ in (answered, Ask.Facts()) })
+        let runner = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: slow)) })
         var reported = 0
         runner.onFinished = { _ in reported += 1 }
         runner.start(request)
@@ -587,8 +558,7 @@ enum LauncherLogicChecks {
         // A CLI that ignores SIGTERM is killed: it holds the prompt.
         let pidFile = dir.appendingPathComponent("stubborn.pid").path
         let stubborn = fake("stubborn", "trap '' TERM\necho $$ > '\(pidFile)'\nwhile :; do sleep 1; done\n")
-        let holder = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: stubborn)) },
-                               callAPI: { _, _ in (answered, Ask.Facts()) })
+        let holder = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: stubborn)) })
         holder.onFinished = { _ in reported += 1 }
         holder.start(request)
         try? await Task.sleep(for: .milliseconds(500))
@@ -603,16 +573,16 @@ enum LauncherLogicChecks {
         // Cancelled in the same turn it started: no CLI is launched at all.
         let marker = dir.appendingPathComponent("launched").path
         let witness = fake("witness", "touch '\(marker)'\n")
-        let eager = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: witness)) },
-                              callAPI: { _, _ in (answered, Ask.Facts()) })
+        let eager = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: witness)) })
         eager.onFinished = { _ in reported += 1 }
         eager.start(request)
         eager.cancel()
         try? await Task.sleep(for: .milliseconds(500))
         precondition(reported == 0 && !FileManager.default.fileExists(atPath: marker), "a run cancelled before it began still ran")
-        guard case .unavailable(let reasons) = await run(ClaudeAccess.Settings(cli: broken, apiKey: .command(["/usr/bin/false"]))),
-              reasons.contains("SDK:"), reasons.contains("API key:"), reasons.contains("SECRET-STDERR") else { preconditionFailure("both reasons") }
-        precondition(ledger.recent()[0].legs.map(\.facts.detail) == ["exit-3", "key"])
+        // A token command that fails: no CLI is started, and the receipt says why.
+        guard case .unavailable(let reasons) = await run(ClaudeAccess.Settings(cli: good, oauthToken: .command(["/usr/bin/false"]))),
+              reasons.contains("OAuth token:") else { preconditionFailure("token command") }
+        precondition(ledger.recent()[0].run?.facts.detail == "token")
         // What reached the screen stays off the log.
         precondition(!logged.isEmpty && !logged.contains { $0.contains("SECRET") }, "\(logged)")
         // Kept in memory only: still in the ledger, no longer in the log.
@@ -646,13 +616,12 @@ enum LauncherLogicChecks {
         // A receipt closes with counts, and renders without words.
         let t0 = Date(timeIntervalSince1970: 1_800_000_000)
         var r = Ask.Receipt(id: "abcd1234", kind: .whatsUp, model: "m", effort: "low", started: t0)
-        r.legs = [Ask.Leg(route: .sdk, seconds: 1.25, end: .timedOut, facts: Ask.Facts()),
-                  Ask.Leg(route: .api, seconds: 2, end: .answered, facts: Ask.Facts(detail: "end_turn", usage: Ask.Usage(input: 1500, output: 100), turns: 1))]
+        r.run = Ask.CLIRun(seconds: 3.25, end: .answered, facts: Ask.Facts(detail: "success", usage: Ask.Usage(input: 1500, output: 100), turns: 2))
         r.close(.answered(.workspaces(summaries: [.init(tag: "3", summary: "SECRET", reason: "r")], droppedUnknownTags: 2)), at: t0.addingTimeInterval(3.5))
         precondition(r.end == .answered && r.named == 1 && r.dropped == 2 && r.tokens == 1600 && r.seconds == 3.5)
         precondition(r.logLine == "ASK: id=abcd1234 kind=whats-up model=m effort=low end=answered seconds=3.5 named=1 dropped=2"
-                     + " sdk=timed-out,1.2s api=answered/end_turn,2.0s,turns=1,tokens=1500+100,cache=0+0", r.logLine)
-        precondition(r.menuLine(clock: { _ in "21:40" }) == "21:40  whats-up  answered in 3.5 s via sdk→api · 1.6k tokens · 1 named",
+                     + " cli=answered/success,3.2s,turns=2,tokens=1500+100,cache=0+0", r.logLine)
+        precondition(r.menuLine(clock: { _ in "21:40" }) == "21:40  whats-up  answered in 3.5 s · 1.6k tokens · 1 named",
                      r.menuLine(clock: { _ in "21:40" }))
         var timedOut = Ask.Receipt(id: "x", kind: .whereIs, model: "m", effort: "low", started: t0)
         timedOut.close(.failed("no answer"), end: .timedOut, at: t0)

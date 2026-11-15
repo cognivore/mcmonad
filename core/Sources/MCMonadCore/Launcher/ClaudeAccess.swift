@@ -2,42 +2,33 @@ import Foundation
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 
-/// How a launcher question reaches Claude, and with which credentials. The
-/// pure half: reading the settings, the locked-down CLI's arguments and
-/// environment, and the Messages API request and answer. The effects are
-/// `ClaudeRoutes` and `AskRunner`.
+/// How a launcher question reaches Claude, and with which login. The pure
+/// half: reading the settings, and the locked-down CLI's arguments and
+/// environment. The effects are `ClaudeRoutes` and `AskRunner`.
 ///
-/// Two routes, tried in order, the way laptop-pool runs its workers:
-///
-///  1. **SDK** — Claude Code headless (`claude -p`, the Agent SDK's
-///     engine), on the user's own Claude login. Its child gets an
-///     environment allowlist (an `ANTHROPIC_API_KEY` the daemon happens to
-///     carry is not passed on), no tools, no MCP servers, no settings, no
-///     CLAUDE.md or auto-memory, no session written. Its `init` line is
-///     checked for exactly that before any answer is believed. An OAuth
-///     token can be named (a command that prints it, or an owner-only
-///     file) when the CLI's own login discovery is not enough.
-///  2. **API** — the Messages API, only when the SDK route could not answer
-///     (no CLI, a failed run) and a key source is configured: a command
-///     that prints the key (`rageveil show …`, `security
-///     find-generic-password -w …`) or an owner-only file. Never a bare
-///     environment variable.
+/// One route, the way laptop-pool runs its workers: Claude Code headless
+/// (`claude -p`, the Agent SDK's engine) on the user's own Claude login.
+/// Its child gets an environment allowlist (an `ANTHROPIC_API_KEY` the
+/// daemon happens to carry is not passed on), no tools, no MCP servers, no
+/// settings, no CLAUDE.md or auto-memory, no session written. Its `init`
+/// line is checked for exactly that before any answer is believed. An
+/// OAuth token can be named (a command that prints it, or an owner-only
+/// file) when the CLI's own login discovery is not enough. There is no
+/// Messages API route: its tokens cost money the subscription covers.
 ///
 /// Settings: `~/.config/mcmonad/claude.json`, read at every question, all
 /// of it optional:
 ///
 ///     { "sdk": { "cli": "/abs/path/claude",
 ///                "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
-///       "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] },
 ///       "retention": { "receipts": "log", "hours": 24 } }
 ///
-/// (`oauthTokenFile` / `keyFile` name owner-only files instead.) Without
-/// the file the SDK route uses the CLI's own login and there is no API
-/// route; a file that is not this shape is an error, never ignored.
-/// `retention` is what is kept of questions once they are over
-/// (`Ask.Retention`): receipts in memory for `hours` (1 to 168), and with
-/// `"log"` also one line each in mcmonad-core.log; `"memory"` keeps them
-/// out of the log.
+/// (`oauthTokenFile` names an owner-only file instead.) Without the file
+/// the CLI uses its own login; a file that is not this shape is an error,
+/// never ignored. `retention` is what is kept of questions once they are
+/// over (`Ask.Retention`): receipts in memory for `hours` (1 to 168), and
+/// with `"log"` also one line each in mcmonad-core.log; `"memory"` keeps
+/// them out of the log.
 enum ClaudeAccess {
     /// Why a route or a secret is not usable, in words for the transcript.
     /// Never carries a secret's text.
@@ -57,7 +48,6 @@ enum ClaudeAccess {
     struct Settings: Equatable, Sendable {
         var cli: String?
         var oauthToken: Secret?
-        var apiKey: Secret?
         var retention = Ask.Retention()
     }
 
@@ -68,7 +58,7 @@ enum ClaudeAccess {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .failure(Problem("not a JSON object"))
         }
-        for key in root.keys where !["sdk", "api", "retention"].contains(key) { return .failure(Problem("unknown key \"\(key)\"")) }
+        for key in root.keys where !["sdk", "retention"].contains(key) { return .failure(Problem("unknown key \"\(key)\"")) }
         var settings = Settings()
         if let sdk = root["sdk"] {
             guard let sdk = sdk as? [String: Any] else { return .failure(Problem("\"sdk\" is not an object")) }
@@ -82,18 +72,6 @@ enum ClaudeAccess {
             switch secret(sdk, command: "oauthTokenCommand", file: "oauthTokenFile", in: "sdk") {
             case .failure(let problem): return .failure(problem)
             case .success(let s): settings.oauthToken = s
-            }
-        }
-        if let api = root["api"] {
-            guard let api = api as? [String: Any] else { return .failure(Problem("\"api\" is not an object")) }
-            for key in api.keys where !["keyCommand", "keyFile"].contains(key) {
-                return .failure(Problem("unknown key \"api.\(key)\""))
-            }
-            switch secret(api, command: "keyCommand", file: "keyFile", in: "api") {
-            case .failure(let problem): return .failure(problem)
-            case .success(let s):
-                guard let s else { return .failure(Problem("\"api\" names neither keyCommand nor keyFile")) }
-                settings.apiKey = s
             }
         }
         if let retention = root["retention"] {
@@ -200,64 +178,5 @@ enum ClaudeAccess {
             return "the session's permission mode is \(initLine["permissionMode"].map { "\($0)" } ?? "unstated")"
         }
         return nil
-    }
-
-    // MARK: - The API route
-
-    static let apiURL = URL(string: "https://api.anthropic.com/v1/messages")!
-    static let apiVersion = "2026-10-21"
-    /// Server-side refusal fallbacks: a declined request is re-run on the
-    /// model Anthropic recommends for its category, inside the same call.
-    static let apiBeta = "server-side-fallback-2026-07-01"
-
-    static func apiHeaders(key: String) -> [String: String] {
-        ["content-type": "application/json", "x-api-key": key,
-         "anthropic-version": apiVersion, "anthropic-beta": apiBeta]
-    }
-
-    /// The request body: the same model, effort, system prompt and schema
-    /// as the SDK route, the prompt as the one user turn.
-    static func apiBody(_ request: Ask.Request) -> Data? {
-        guard let schema = try? JSONSerialization.jsonObject(with: Data(request.schema.utf8)) else { return nil }
-        let body: [String: Any] = [
-            "model": Ask.model,
-            "max_tokens": Ask.maxOutputTokens,
-            "system": request.systemPrompt,
-            "messages": [["role": "user", "content": request.prompt]],
-            "output_config": ["effort": Ask.effort, "format": ["type": "json_schema", "schema": schema]],
-            "fallbacks": "default",
-        ]
-        return try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-    }
-
-    /// What the API's reply says beyond its outcome: the HTTP status when
-    /// it is not 200, else why the model stopped, and the tokens it used.
-    static func apiFacts(status: Int, data: Data) -> Ask.Facts {
-        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        guard status == 200 else { return Ask.Facts(detail: "http-\(status)") }
-        return Ask.Facts(detail: obj?["stop_reason"] as? String, usage: Ask.Usage(obj?["usage"]), turns: 1)
-    }
-
-    /// The API's reply as an outcome. Only the kind of an error is kept:
-    /// its type and message, which are about the request, not its content.
-    static func apiOutcome(status: Int, data: Data, request: Ask.Request) -> Ask.Outcome {
-        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        guard status == 200 else {
-            let error = obj?["error"] as? [String: Any]
-            let kind = (error?["type"] as? String) ?? "error"
-            let message = (error?["message"] as? String).map { ": \($0)" } ?? ""
-            return .failed("API returned HTTP \(status) (\(kind)\(message))")
-        }
-        guard let obj else { return .malformed("API answer is not JSON") }
-        if obj["stop_reason"] as? String == "refusal" {
-            let category = ((obj["stop_details"] as? [String: Any])?["category"] as? String).map { " (\($0))" } ?? ""
-            return .failed("the model declined the request\(category)")
-        }
-        let texts = ((obj["content"] as? [[String: Any]]) ?? []).filter { $0["type"] as? String == "text" }
-        guard let text = texts.compactMap({ $0["text"] as? String }).last,
-              let structured = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],
-              let answer = request.answer(structured)
-        else { return .malformed("API answer is not in the schema (stop_reason \(obj["stop_reason"] as? String ?? "unstated"))") }
-        return .answered(answer)
     }
 }

@@ -238,10 +238,9 @@ the model's one-line reason, quoting fragments with their times, the
 question's words highlighted in it; Return focuses one, Esc goes back to the
 query. A closed window that answers it shows when it was closed and where.
 
-The question goes by the **SDK route** first: the Claude Code CLI already on
-the Mac (`claude -p`, the Agent SDK's engine, model `claude-fable-5-1` at low
-effort) on your own Claude login, locked down the way laptop-pool runs its
-workers — an environment allowlist (an `ANTHROPIC_API_KEY` the daemon happens
+The question goes to the Claude Code CLI already on the Mac (`claude -p`, the
+Agent SDK's engine, model `claude-fable-5-1` at low effort) on your own Claude
+login, locked down the way laptop-pool runs its workers — an environment allowlist (an `ANTHROPIC_API_KEY` the daemon happens
 to carry is not passed on), no tools, no MCP servers, no settings, no CLAUDE.md
 or memory, nothing to ask, no session written, an empty working directory,
 at most 4 turns and 16,000 output tokens a turn —
@@ -250,40 +249,38 @@ CLI still running when its question is answered, cancelled or out of time
 gets SIGTERM, then SIGKILL two seconds later: it holds the prompt.
 Every `@` in the prompt is escaped, so screen text cannot make the CLI attach
 a file. The CLI is looked for in `~/.local/bin`, `/opt/homebrew/bin`,
-`/usr/local/bin` and `PATH`. Only if that route cannot answer, and a key
-source is configured, the **Messages API** is asked the same question with
-the same model, effort and schema. Both are set in
-`~/.config/mcmonad/claude.json` (all optional; read at every question):
+`/usr/local/bin` and `PATH`. There is no Messages API route: its tokens cost
+money the subscription already covers. The CLI, its login and what is kept of
+questions are set in `~/.config/mcmonad/claude.json` (all optional; read at
+every question):
 
 ```json
 { "sdk": { "cli": "/Users/you/.local/bin/claude",
            "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
-  "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] },
   "retention": { "receipts": "log", "hours": 24 } }
 ```
 
-`oauthTokenFile` and `keyFile` name owner-only files (`chmod 600`) instead of
-commands; a command runs with no input and its output must be one token. There
-is no API key in the environment or in the file itself, and without an `api`
-section there is no API route.
+`oauthTokenFile` names an owner-only file (`chmod 600`) instead of a command;
+the command runs with no input and its output must be one token. Without the
+file the CLI uses its own login.
 
 **What is kept of a question once it is over** is a receipt, in
 mcmonad-core's memory, for `retention.hours` (1 to 168; 24 by default): which
-feature asked, which routes ran and how each ended (the CLI's result subtype,
-the API's HTTP status), how long it took, turns and tokens, and how many
+feature asked, how the CLI run ended (its result subtype, or a reason such as
+`exit-3` or `no-cli`), how long it took, turns and tokens, and how many
 windows or workspaces the answer named. A receipt has no field for text: not
 the question, the screen text, the answer, or an error's words. The menu
 bar's **Questions to Claude** lists them. With `"receipts": "log"` (the
 default) each is also one line of `~/Library/Logs/mcmonad-core.log`:
 
 ```
-ASK: id=3f2a91c0 kind=where-is model=claude-fable-5-1 effort=low end=answered seconds=6.3 named=2 dropped=0 sdk=answered/success,6.2s,turns=2,tokens=1312+208,cache=0+0
+ASK: id=3f2a91c0 kind=where-is model=claude-fable-5-1 effort=low end=answered seconds=6.3 named=2 dropped=0 cli=answered/success,6.2s,turns=2,tokens=1312+208,cache=0+0
 ```
 
 `"receipts": "memory"` keeps them out of the log. The question's text itself
 is held only for the call and, after it, only where the launcher shows it; no
-setting writes it anywhere. Dollars are not counted: on the SDK route the
-subscription carries the cost, so there is no dollar ceiling either.
+setting writes it anywhere. Dollars are not counted: the subscription
+carries the cost, so there is no dollar ceiling either.
 
 **"What's up" monitoring is off by default.** The mcmonad menu bar has a
 **What's up monitoring: Off/On — sends to Claude** switch. Turning it on

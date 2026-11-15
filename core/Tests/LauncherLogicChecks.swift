@@ -565,6 +565,21 @@ enum LauncherLogicChecks {
         runner.cancel()
         try? await Task.sleep(for: .milliseconds(300))
         precondition(reported == 0, "a cancelled run reported an outcome")
+        // A CLI that ignores SIGTERM is killed: it holds the prompt.
+        let pidFile = dir.appendingPathComponent("stubborn.pid").path
+        let stubborn = fake("stubborn", "trap '' TERM\necho $$ > '\(pidFile)'\nwhile :; do sleep 1; done\n")
+        let holder = AskRunner(loadSettings: { .success(ClaudeAccess.Settings(cli: stubborn)) }, callAPI: { _, _ in answered })
+        holder.onFinished = { _ in reported += 1 }
+        holder.start(request)
+        try? await Task.sleep(for: .milliseconds(500))
+        guard let text = try? String(contentsOfFile: pidFile, encoding: .utf8),
+              let stubbornPid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            preconditionFailure("the stubborn CLI did not start")
+        }
+        holder.cancel()
+        try? await Task.sleep(for: .milliseconds(Int(AskRunner.killGrace * 1000) + 1000))
+        precondition(kill(stubbornPid, 0) != 0, "a CLI that ignored SIGTERM outlived its question")
+        precondition(reported == 0)
         // Cancelled in the same turn it started: no CLI is launched at all.
         let marker = dir.appendingPathComponent("launched").path
         let witness = fake("witness", "touch '\(marker)'\n")

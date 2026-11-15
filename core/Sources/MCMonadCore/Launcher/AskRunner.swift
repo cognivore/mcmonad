@@ -299,7 +299,12 @@ final class AskRunner: AskRunning {
         resolveSDK(nil)   // a cancelled run ends without an outcome
     }
 
-    /// Detach from the child process and terminate it.
+    /// How long a stopped CLI has to exit on SIGTERM before SIGKILL. It
+    /// holds the prompt, screen text, for as long as it lives.
+    static let killGrace: TimeInterval = 2
+
+    /// Detach from the child process and terminate it; kill it if it is
+    /// still there after `killGrace`.
     private func stopProcess() {
         guard let p = process else { return }
         process = nil
@@ -308,6 +313,18 @@ final class AskRunner: AskRunning {
         (p.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         try? (p.standardInput as? Pipe)?.fileHandleForWriting.close()
         p.terminate()
+        let child = Child(p)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.killGrace) { child.kill() }
+    }
+
+    /// A stopped child, handed to the queue that makes sure it is gone.
+    private final class Child: @unchecked Sendable {
+        private let process: Process
+        init(_ process: Process) { self.process = process }
+        func kill() {
+            // Still running means not yet reaped, so the pid is still its own.
+            if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+        }
     }
 
     private func finish(_ outcome: Ask.Outcome, runID: UUID) {

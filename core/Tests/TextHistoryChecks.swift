@@ -21,6 +21,7 @@ enum TextHistoryChecks {
         checkScrollReadsOnlyWhatScrolledIn()
         checkBudgetCarriesUnread()
         checkResizeStartsOver()
+        checkRegrowthCarriesOver()
         checkGeneratedHistories()
         checkHistoryKeysAndRecords()
         checkHistoryPrune()
@@ -207,6 +208,44 @@ enum TextHistoryChecks {
         var wider = Canvas(width: 900, rows: 10)
         wider.lines = [Drawn(row: 2, text: "after the resize")]
         precondition(page.observe(wider.tiles(), at: t0) == nil && page.lines.isEmpty && page.unread == [wider.tiles().bounds])
+    }
+
+    /// A change lower than the line it is in (no line known there) cuts the
+    /// line at the read's top; the part regrows. When the grown part does
+    /// not fit what is left of the look, what was read is kept and the grown
+    /// part is read next time, not thrown away and read again for ever.
+    static func checkRegrowthCarriesOver() {
+        let width = 1000, height = 400
+        func tiles(_ changed: ClosedRange<Int>?) -> PixelTiles {
+            let columns = PixelTiles.columns(for: width)
+            var hashes = [UInt32](repeating: 0, count: columns * height)
+            if let changed { for y in changed { for c in 0..<columns { hashes[y * columns + c] = 1 } } }
+            return PixelTiles(width: width, height: height, columns: columns, hashes: hashes)
+        }
+        let line = PixelRect(x: 20, y: 100, w: 600, h: 24)
+        var shown = false
+        let engine: (PixelRect) -> Result<[FoundLine], ReadFault> = { sample in
+            guard shown, let inside = line.clipped(to: sample) else { return .success([]) }
+            let local = PixelRect(x: inside.x - sample.x, y: inside.y - sample.y, w: inside.w, h: inside.h)
+            return .success([FoundLine(rect: local, text: inside == line ? "the whole line" : "#cut#", confidence: 1)])
+        }
+        var page = WindowPage()
+        page.observe(tiles(nil), at: t0)
+        _ = page.read(budget: 1_000_000, at: t0, engine: engine)
+        precondition(page.isFullyRead && page.lines.isEmpty)
+        shown = true
+        page.observe(tiles(122...123), at: t0)   // only the line's lowest rows changed
+        let first = page.read(budget: 60_000, at: t0, engine: engine)
+        precondition(first.reads == 1 && !page.isFullyRead, "\(first)")
+        precondition(page.unread.contains { $0.y <= line.y && $0.bottom >= line.bottom }, "the grown part is unread: \(page.unread)")
+        var looks = 1
+        while !page.isFullyRead {
+            page.observe(tiles(122...123), at: t0)
+            _ = page.read(budget: 60_000, at: t0, engine: engine)
+            looks += 1
+            precondition(looks < 6, "the line was never read whole: \(page.unread)")
+        }
+        precondition(page.rows == ["the whole line"], "\(page.rows)")
     }
 
     /// A small deterministic generator, so a failing history can be replayed.

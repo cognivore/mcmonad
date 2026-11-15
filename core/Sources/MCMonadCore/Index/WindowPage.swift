@@ -183,10 +183,16 @@ struct WindowPage: Sendable {
                                     text: f.text, confidence: f.confidence, readAt: date)
                 }
                 let banded = sample.bottom < whole.bottom
+                var later: PixelRect?
                 if !banded, regrown < 2, let bigger = Self.regrow(part, cut: read, sample: sample, field: field) {
-                    part = bigger
-                    regrown += 1
-                    continue
+                    if bigger.grown(Self.pad, within: field).area <= left {
+                        part = bigger
+                        regrown += 1
+                        continue
+                    }
+                    // It does not fit what is left of this look: keep what
+                    // this read found, and read the grown part next time.
+                    later = bigger
                 }
                 let whole_ = read.filter { !Self.cut($0.rect, sample: sample, field: field) }
                 // In a band, what its lower edge cut is read with the rest:
@@ -208,6 +214,7 @@ struct WindowPage: Sendable {
                 if done.h < part.h {
                     unread.append(PixelRect(x: part.x, y: done.bottom, w: part.w, h: part.h - done.h))
                 }
+                if let later { unread.append(later) }
                 break
             }
         }

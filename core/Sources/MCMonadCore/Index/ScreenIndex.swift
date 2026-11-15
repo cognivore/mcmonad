@@ -71,9 +71,10 @@ final class ScreenIndex {
     /// 0.16 CPU-µs a pixel on this class of Mac (a 3000 × 1800 window, all
     /// of it, is 0.87 CPU-s; one changed line about 30 ms). A pass reads a
     /// window whole if it must; a look while the user works reads at most a
-    /// third of a CPU-second and leaves the rest for its next look.
-    static let passBudget = 24_000_000
-    static let glanceBudget = 2_000_000
+    /// third of a CPU-second and leaves the rest for its next look — except
+    /// a window it has never read or that was resized, which it reads whole.
+    nonisolated static let passBudget = 24_000_000
+    nonisolated static let glanceBudget = 2_000_000
     /// How often the history forgets what is more than a day old.
     static let pruneEvery: TimeInterval = 300
 
@@ -428,8 +429,13 @@ final class ScreenIndex {
             }
             guard let tiles = VisionReader.tiles(of: image) else { continue }
             var page = pages[id] ?? WindowPage()
-            page.observe(tiles, at: Date())
-            let work = page.read(budget: budget, at: Date()) { sample in VisionReader.recognise(image, in: sample) }
+            // A first look, or a window resized (every re-tile does that), has
+            // no lines to go on from: it is read whole, once, or its text
+            // would be a third of itself until two more looks.
+            let fresh = page.observe(tiles, at: Date()) == nil
+            let work = page.read(budget: fresh ? max(budget, passBudget) : budget, at: Date()) { sample in
+                VisionReader.recognise(image, in: sample)
+            }
             if work.reads > 0 { readCount += 1 }
             out[id] = (page, work)
         }

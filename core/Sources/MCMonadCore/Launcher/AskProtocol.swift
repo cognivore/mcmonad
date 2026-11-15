@@ -1,6 +1,6 @@
 import Foundation
 
-// AI-assisted update (the SDK and API routes, @ escaping): model
+// AI-assisted update (history in the manifold; the SDK and API routes): model
 // claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 
 /// What every launcher question to the model shares — "where is …" and
@@ -70,6 +70,39 @@ enum Ask {
         let title: String
         let focused: Bool
         let text: String?
+        /// Lines that were on the window earlier and are gone now, and its
+        /// earlier titles, each with when it was seen ("13:02–13:40 …").
+        var earlier: [String]? = nil
+        /// When the user last worked in it ("HH:MM"), and for how many
+        /// minutes over the last day.
+        var lastActive: String? = nil
+        var activeMinutes: Int? = nil
+
+        enum CodingKeys: String, CodingKey {
+            case id, app, title, focused, text, earlier
+            case lastActive = "last_active", activeMinutes = "active_minutes"
+        }
+    }
+
+    /// A window closed within the last day, with what it said.
+    struct ManifoldClosedWindow: Codable, Equatable {
+        let id: UInt32
+        let app: String
+        let title: String
+        let workspace: String?
+        let closedAt: String
+        let earlier: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case id, app, title, workspace, earlier, closedAt = "closed_at"
+        }
+    }
+
+    /// What the history adds to one window.
+    struct WindowHistory: Equatable {
+        let earlier: [String]
+        let lastActive: String?
+        let activeMinutes: Int
     }
 
     struct ManifoldWorkspace: Codable, Equatable {
@@ -86,24 +119,29 @@ enum Ask {
         let question: String
         let currentWorkspace: String?
         let workspaces: [ManifoldWorkspace]
+        var closedWindows: [ManifoldClosedWindow]? = nil
 
         enum CodingKeys: String, CodingKey {
-            case question, currentWorkspace = "current_workspace", workspaces
+            case question, currentWorkspace = "current_workspace", workspaces, closedWindows = "closed_windows"
         }
 
         var windowIds: Set<UInt32> { Set(workspaces.flatMap { $0.windows.map(\.id) }) }
+        var closedIds: Set<UInt32> { Set((closedWindows ?? []).map(\.id)) }
         var tags: Set<String> { Set(workspaces.map(\.tag)) }
     }
 
     /// Every non-empty workspace (or just those in `only`), on-screen ones
-    /// first, each window with an excerpt of its recognised text. `budget`
-    /// caps the total excerpt characters across all windows so the prompt
-    /// stays one call's worth; the per-window cap is the budget spread
-    /// evenly, at most `perWindow`.
+    /// first, each window with an excerpt of its recognised text and, when
+    /// `history` has any, what it said earlier. `budget` caps the total
+    /// excerpt characters across all windows so the prompt stays one call's
+    /// worth; the per-window cap is the budget spread evenly, at most
+    /// `perWindow`. (`history` brings its own budget: `HistoryEvidence`.)
     static func manifold(
         question: String,
         snapshot: OverlaySnapshot,
         text: (UInt32) -> String?,
+        history: (UInt32) -> WindowHistory? = { _ in nil },
+        closed: [ManifoldClosedWindow] = [],
         only: Set<String>? = nil,
         budget: Int = 80_000,
         perWindow: Int = 1_500
@@ -119,18 +157,25 @@ enum Ask {
         let cap = count == 0 ? perWindow : min(perWindow, budget / count)
         let workspaces = pending.map { tag, onScreen, entries in
             ManifoldWorkspace(tag: tag, onScreen: onScreen, windows: entries.map { w in
-                ManifoldWindow(
+                let past = history(w.windowId)
+                return ManifoldWindow(
                     id: w.windowId,
                     app: w.appName ?? "?",
                     title: w.title ?? "",
                     focused: w.isFocused,
-                    text: text(w.windowId).map { TextSearch.excerpt($0, limit: cap, terms: TextSearch.terms(question)) }
+                    text: text(w.windowId).map { TextSearch.excerpt($0, limit: cap, terms: TextSearch.terms(question)) },
+                    earlier: past.flatMap { $0.earlier.isEmpty ? nil : $0.earlier },
+                    lastActive: past?.lastActive,
+                    activeMinutes: past.flatMap { $0.activeMinutes > 0 ? $0.activeMinutes : nil }
                 )
             })
         }
         let current = snapshot.screens.first { $0.windows.contains { $0.isFocused } }?.workspaceTag
             ?? snapshot.screens.first?.workspaceTag
-        return Manifold(question: question, currentWorkspace: current, workspaces: workspaces)
+        let open = Set(workspaces.flatMap { $0.windows.map(\.id) })
+        let gone = closed.filter { !open.contains($0.id) }
+        return Manifold(question: question, currentWorkspace: current, workspaces: workspaces,
+                        closedWindows: gone.isEmpty ? nil : gone)
     }
 
     /// The question, then the manifold. Every "@" is escaped: the CLI reads

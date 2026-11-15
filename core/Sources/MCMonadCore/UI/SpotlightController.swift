@@ -168,6 +168,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// highlighting) and the manifold it was asked about (for row order).
     private var askTerms: [String] = []
     private var askQuestion = ""
+    /// Windows closed within the day that the question was asked about: an
+    /// answer may name one, shown as a row that says when it was closed.
+    private var askClosed: [UInt32: Ask.ManifoldClosedWindow] = [:]
+    /// What the history may add to a "where is" manifold, in characters.
+    private static let historyBudget = 40_000
     /// The answered rows are the "what's up" cache; re-render on its updates.
     private var showingWhatsUp = false
     /// While asking: when the call started, and a 1 s tick for the hint and
@@ -958,7 +963,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func askWhereIs(_ query: WhereIsQuery) {
-        beginAsk(question: query.question, terms: query.terms, request: WhereIs.request(for:))
+        beginAsk(question: query.question, terms: query.terms, withHistory: true, request: WhereIs.request(for:))
     }
 
     /// Cached rows, with when they were made. Nothing is asked unless the
@@ -1053,9 +1058,10 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// Send the question and the manifold of every window to the model, and
     /// show the exchange while it thinks. The request is built once the
     /// manifold exists, so the answer can be checked against what was asked
-    /// about.
+    /// about. `withHistory` adds what each window said earlier in the day,
+    /// and the windows closed in it.
     private func beginAsk(
-        question: String, terms: [String],
+        question: String, terms: [String], withHistory: Bool,
         request makeRequest: (Ask.Manifold) -> Ask.Request
     ) {
         leaveWhereIs()
@@ -1079,19 +1085,39 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             finishAsk(.unavailable("The brain has not sent a window snapshot yet."))
             return
         }
+        var history: [UInt32: Ask.WindowHistory] = [:]
+        var closed: [Ask.ManifoldClosedWindow] = []
+        if withHistory, let index = screenIndex, index.isEnabled {
+            let ids = snap.screens.flatMap { $0.windows.map(\.windowId) } + snap.hiddenWorkspaces.flatMap { $0.windows.map(\.windowId) }
+            let found = index.evidence(windows: ids, terms: terms, budget: Self.historyBudget)
+            for (id, e) in found.windows {
+                history[id] = Ask.WindowHistory(earlier: e.earlier, lastActive: e.lastActive.map(ScreenIndex.hhmm),
+                                                activeMinutes: e.activeMinutes)
+            }
+            closed = found.closed.map {
+                Ask.ManifoldClosedWindow(id: $0.id, app: $0.app, title: $0.title, workspace: $0.tag,
+                                         closedAt: ScreenIndex.hhmm($0.closedAt), earlier: $0.earlier)
+            }
+        }
         let manifold = Ask.manifold(
             question: question,
             snapshot: snap,
-            text: { [weak self] wid in self?.screenIndex?.entry(for: wid)?.text }
+            text: { [weak self] wid in self?.screenIndex?.entry(for: wid)?.text },
+            history: { history[$0] },
+            closed: closed,
+            budget: withHistory ? 40_000 : 80_000,
+            perWindow: withHistory ? 1_200 : 1_500
         )
+        askClosed = Dictionary(uniqueKeysWithValues: (manifold.closedWindows ?? []).map { ($0.id, $0) })
         let request = makeRequest(manifold)
         let cli = AskRunner.locateCLI() ?? "claude"
         let windows = manifold.workspaces.reduce(0) { $0 + $1.windows.count }
         let withText = manifold.workspaces.flatMap(\.windows).filter { !($0.text ?? "").isEmpty }.count
-        Self.logger.info("ask evidence: \(windows, privacy: .public) windows, \(withText, privacy: .public) with screen text")
+        let withEarlier = manifold.workspaces.flatMap(\.windows).filter { !($0.earlier ?? []).isEmpty }.count
+        Self.logger.info("ask evidence: \(windows, privacy: .public) windows, \(withText, privacy: .public) with screen text, \(withEarlier, privacy: .public) with history, \(manifold.closedWindows?.count ?? 0, privacy: .public) closed")
         appendTranscript("→ SDK route: \(cli) " + request.arguments.map(Self.shellQuoted).joined(separator: " ")
                          + "\n  (the Messages API answers only if this cannot, and only with a key source in ~/.config/mcmonad/claude.json)\n\n")
-        appendTranscript("→ stdin (\(request.prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces):\n\(request.prompt)\n\n← ")
+        appendTranscript("→ stdin (\(request.prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces, \(withEarlier) with earlier text, \(manifold.closedWindows?.count ?? 0) closed):\n\(request.prompt)\n\n← ")
         askRunner.start(request)
     }
 
@@ -1125,6 +1151,16 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 for ws in snap.hiddenWorkspaces { for w in ws.windows { byId[w.windowId] = (w, ws.tag) } }
             }
             filtered = matches.compactMap { m -> Item? in
+                if byId[m.windowId] == nil, let gone = askClosed[m.windowId] {
+                    // Closed in the day: nothing to focus, but where it was.
+                    let body = gone.title.isEmpty ? gone.app : "\(gone.app) — \(gone.title)"
+                    return Item(
+                        title: "\(body)   ·  closed \(gone.closedAt)" + (gone.workspace.map { " (was on \($0))" } ?? ""),
+                        kind: .hint,
+                        haystack: "",
+                        subtitle: Self.highlighted(m.reason, ranges: TextSearch.ranges(of: askTerms, in: m.reason))
+                    )
+                }
                 guard let (w, tag) = byId[m.windowId] else { return nil }
                 let app = w.appName ?? "?"
                 let title = w.title ?? ""

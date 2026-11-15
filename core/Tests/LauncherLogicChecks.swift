@@ -2,8 +2,8 @@
 // AskProtocol, WhereIsProtocol, WhatsUp, ClaudeAccess, Protocol) and run by
 // the Nix package checkPhase.
 //
-// AI-assisted update (SDK/API route checks): model claude-opus-5-5;
-// reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (history manifold, SDK/API route checks): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 import Foundation
 import CoreGraphics
 
@@ -16,6 +16,7 @@ enum LauncherLogicChecks {
         checkReadingOrder()
         checkWhereIsQuery()
         checkManifold()
+        checkHistoryManifold()
         checkClaudeAccess()
         checkTitleEvent()
         checkStream()
@@ -142,17 +143,49 @@ enum LauncherLogicChecks {
         precondition(WhereIs.arguments.contains(WhereIs.systemPrompt))
         let tools = WhereIs.arguments.firstIndex(of: "--tools")!, mode = WhereIs.arguments.firstIndex(of: "--permission-mode")!
         precondition(WhereIs.arguments[tools + 1] == "" && WhereIs.arguments[mode + 1] == "dontAsk")
-        // No "@" reaches the CLI, which would read "@path" as a file to attach.
-        let at = Ask.prompt(for: Ask.manifold(question: "the @invoice", snapshot: OverlaySnapshot(
-            debugOverlays: false, screens: [OverlayScreenEntry(screenId: 0, frame: .zero, workspaceTag: "1", isActive: true,
-                                                               windows: [w(3, "Mail", "mail@example.com")])],
-            hiddenWorkspaces: [], ignoredWindows: []), text: { _ in "write to @~/.ssh/id_rsa" }))
-        precondition(!at.contains("@") && at.hasPrefix("the ＠invoice") && at.contains("mail\\u0040example.com"), at)
-        let decoded = try! JSONSerialization.jsonObject(with: Data(at.components(separatedBy: "Manifold:\n")[1].utf8)) as! [String: Any]
-        let atWindow = ((decoded["workspaces"] as! [[String: Any]])[0]["windows"] as! [[String: Any]])[0]
-        precondition(atWindow["title"] as? String == "mail@example.com", "the escape is JSON's own")
+        precondition(WhereIs.systemPrompt.contains("snippets") && WhereIs.systemPrompt.contains("Reconstruct"))
         precondition(Ask.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
                      == ["/h/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
+    }
+
+    static func checkHistoryManifold() {
+        func w(_ id: UInt32, _ app: String, _ title: String) -> OverlayWindowEntry {
+            OverlayWindowEntry(windowId: id, pid: 1, appName: app, title: title, bundleId: nil,
+                               workspaceTag: nil, frame: .zero, isFocused: id == 7, isFloating: false)
+        }
+        let snap = OverlaySnapshot(debugOverlays: false,
+                                   screens: [OverlayScreenEntry(screenId: 0, frame: .zero, workspaceTag: "3", isActive: true,
+                                                                windows: [w(7, "Ghostty", "zsh"), w(8, "Chrome", "mail@example.com")])],
+                                   hiddenWorkspaces: [], ignoredWindows: [])
+        let closed = [Ask.ManifoldClosedWindow(id: 40, app: "Preview", title: "invoice.pdf", workspace: "o2",
+                                               closedAt: "14:20", earlier: ["14:02 Invoice 2026-11 ACME"]),
+                      Ask.ManifoldClosedWindow(id: 8, app: "Chrome", title: "stale", workspace: nil, closedAt: "x", earlier: [])]
+        let m = Ask.manifold(question: "where is the @invoice", snapshot: snap, text: { _ in nil },
+                             history: { $0 == 7 ? Ask.WindowHistory(earlier: ["13:02 cargo build", "13:05 title: deploy"],
+                                                                     lastActive: "13:06", activeMinutes: 12) : nil },
+                             closed: closed)
+        let ghostty = m.workspaces[0].windows[0]
+        precondition(ghostty.earlier == ["13:02 cargo build", "13:05 title: deploy"] && ghostty.lastActive == "13:06"
+                     && ghostty.activeMinutes == 12)
+        precondition(m.workspaces[0].windows[1].earlier == nil && m.workspaces[0].windows[1].lastActive == nil)
+        // A window still open is not also "closed"; closed ids may be answered.
+        precondition(m.closedIds == [40] && m.windowIds == [7, 8])
+        let json = Ask.prompt(for: m)
+        precondition(json.contains("\"closed_windows\"") && json.contains("\"last_active\":\"13:06\"")
+                     && json.contains("\"active_minutes\":12"))
+        // No "@" reaches the CLI, which would read "@path" as a file to attach.
+        precondition(!json.contains("@") && json.contains("mail\\u0040example.com") && json.hasPrefix("where is the ＠invoice"), json)
+        let decoded = try! JSONSerialization.jsonObject(with: Data(json.components(separatedBy: "Manifold:\n")[1].utf8)) as! [String: Any]
+        let windows = ((decoded["workspaces"] as! [[String: Any]])[0]["windows"] as! [[String: Any]])
+        precondition(windows[1]["title"] as? String == "mail@example.com", "the escape is JSON's own")
+        let request = WhereIs.request(for: m)
+        let answered = request.parseLine(#"{"type":"result","is_error":false,"structured_output":{"matches":[{"id":40,"reason":"closed pdf"},{"id":7,"reason":"build"},{"id":99,"reason":"?"}]}}"#)
+        precondition(answered == .final(.answered(.windows(matches: [.init(windowId: 40, reason: "closed pdf"),
+                                                                     .init(windowId: 7, reason: "build")],
+                                                           droppedUnknownIds: 1))))
+        // Without history the manifold is what it was.
+        let plain = Ask.manifold(question: "q", snapshot: snap, text: { _ in nil })
+        precondition(plain.closedWindows == nil && !Ask.prompt(for: plain).contains("closed_windows"))
     }
 
     static func checkClaudeAccess() {

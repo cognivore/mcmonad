@@ -1,7 +1,8 @@
 import Foundation
 
-// AI-assisted update (one request for either route): model claude-opus-5-5;
-// reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (the prompt says the evidence is snippets to reconstruct
+// from; closed windows): model claude-opus-5-5; reasoning effort unavailable
+// (not exposed by the harness).
 
 /// The pure half of "where is …": recognising the question and sorting the
 /// model's answer into windows we have. The shared machinery is in `Ask`.
@@ -37,10 +38,22 @@ enum WhereIs {
     You locate windows for a tiling window manager on macOS. The user asks where something is. \
     You receive a JSON manifold: every workspace (its tag, whether it is on screen right now) and \
     every window on it (numeric id, app, title, whether it is focused, and — when available — text \
-    recognised from the window's pixels). Answer with the windows that best answer the question, \
-    most likely first, at most 8. For each give a one-sentence reason that quotes the evidence you \
-    used: the title words or the fragment of recognised text. Only use ids that appear in the \
-    manifold. Treat the question as an informal description, not an exact phrase or a requirement \
+    recognised from the window's pixels), and windows the user closed in the last day.
+    The evidence is snippets, not a record. The screen is read rarely, to save energy: a window the \
+    user types, clicks or scrolls in is read at most once every few minutes, and every window once \
+    after the user steps away. So most of what was ever on screen was never read. `text` is what was \
+    read on a window most recently. `earlier` lists lines that were on it before and are gone now, \
+    and titles it had before ("title: …"), each with the local time it was seen ("13:02", or \
+    "13:02–13:40" when it stayed a while), oldest first; lines read at the same time sit together. \
+    Lines are fragments: OCR confuses l/1/I and O/0, splits and merges lines, and drops words. \
+    `last_active` is when the user last worked in a window and `active_minutes` how many minutes \
+    they did over the last day. Reconstruct from these fragments, the titles, the apps and the times \
+    what each window was used for, then answer from that reconstruction, not from single words.
+    Answer with the windows that best answer the question, most likely first, at most 8. For each \
+    give a one-sentence reason that quotes the evidence you used — the title words or the fragments, \
+    with their times when they came from `earlier`. Only use ids that appear in the manifold. A \
+    window in `closed_windows` can be named when the thing is no longer open; say when it was \
+    closed. Treat the question as an informal description, not an exact phrase or a requirement \
     that every word appear: "claude HMRC tax thingie" should match a Ghostty window titled \
     "HMRC tax filing system in Rust" even if its title does not say Claude. Prefer distinctive \
     project/topic words over generic words like "thingie" or an assumed app. If nothing fits, \
@@ -86,10 +99,10 @@ enum WhereIs {
         Ask.parseLine(line) { answer(from: $0, known: known) }
     }
 
-    /// The question about `manifold`: its windows are the ids an answer
-    /// may name.
+    /// The question about `manifold`: its open and its closed windows are
+    /// the ids an answer may name.
     static func request(for manifold: Ask.Manifold) -> Ask.Request {
-        let known = manifold.windowIds
+        let known = manifold.windowIds.union(manifold.closedIds)
         return Ask.Request(systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
                            answer: { answer(from: $0, known: known) })
     }

@@ -330,8 +330,8 @@ final class ScreenIndex {
         inFlight = true
         defer { inFlight = false }
         let started = Date()
-        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        let (looked, examined) = await Self.look(ids: ids, pages: pages, scale: scale, budget: budget, limit: limit)
+        let (looked, examined) = await Self.look(ids: ids, pages: pages, displays: Self.attachedDisplays(),
+                                                 budget: budget, limit: limit)
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
         let now = Date()
         let known = Set(visible).union(hidden)
@@ -394,7 +394,7 @@ final class ScreenIndex {
     /// updated, and what reading it cost. Windows are looked at in order
     /// until `limit` of them needed reading; `examined` is every id looked
     /// at (a window that cannot be captured counts as examined).
-    private nonisolated static func look(ids: [UInt32], pages: [UInt32: WindowPage], scale: CGFloat,
+    private nonisolated static func look(ids: [UInt32], pages: [UInt32: WindowPage], displays: [Later.Display],
                                          budget: Int, limit: Int) async
         -> ([UInt32: (WindowPage, GlanceWork)], Set<UInt32>) {
         let content: SCShareableContent
@@ -413,6 +413,10 @@ final class ScreenIndex {
             if readCount >= limit { break }
             examined.insert(id)
             guard let window = byId[id], window.frame.width >= 8, window.frame.height >= 8 else { continue }
+            // At the scale of the display holding most of the window: asked
+            // for more, ScreenCaptureKit pads a 1× window instead of
+            // enlarging it, and Vision finds nothing in the padding.
+            let scale = Later.scale(for: window.frame, displays: displays)
             let cfg = SCStreamConfiguration()
             cfg.width = Int(window.frame.width * scale)
             cfg.height = Int(window.frame.height * scale)
@@ -458,6 +462,15 @@ final class ScreenIndex {
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                 NSWorkspace.shared.open(url)
             }
+        }
+    }
+
+    /// The attached displays, with where they are and their backing scale,
+    /// read on the main actor the way `LaterController` reads them.
+    private static func attachedDisplays() -> [Later.Display] {
+        NSScreen.screens.compactMap { screen -> Later.Display? in
+            guard let n = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+            return Later.Display(bounds: CGDisplayBounds(n.uint32Value), scale: screen.backingScaleFactor)
         }
     }
 

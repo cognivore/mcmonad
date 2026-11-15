@@ -29,8 +29,10 @@ enum VisionReader {
     }
 
     /// Vision's lines in `sample` of `image`, in the sample's own pixels
-    /// (top-left origin). Accurate recognition at retina scale: at 1× it
-    /// lost a third of a page's words; here it kept 95–99%.
+    /// (top-left origin). Accurate recognition: on a 2× page it kept
+    /// 95–99% of the words, and the same page shrunk to 1× lost a third. A
+    /// window on a 1× display is still read at 1×, as it is drawn there:
+    /// ScreenCaptureKit pads rather than enlarges it.
     static func recognise(_ image: CGImage, in sample: PixelRect) -> Result<[FoundLine], ReadFault> {
         guard let crop = image.cropping(to: CGRect(x: sample.x, y: sample.y, width: sample.w, height: sample.h)) else {
             return .failure(ReadFault(reason: "could not crop the capture"))

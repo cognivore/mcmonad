@@ -49,7 +49,8 @@ struct GlanceWork: Equatable, Sendable {
 /// Pure: the engine is a closure, and no pixel is kept.
 struct WindowPage: Sendable {
     /// Pixels read around what changed: an engine reads a glyph badly when
-    /// the image ends at its edge. Captures are at retina scale.
+    /// the image ends at its edge. Sized for a 2× capture; a 1× one simply
+    /// gets twice the margin.
     static let pad = 12
     /// A line this near the edge of what was read may have been cut by it,
     /// unless that edge is the window's own.

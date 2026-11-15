@@ -271,9 +271,22 @@ collapsed every workspace after a rollback. So:
   ScreenCaptureKit query lists MCMonadCore.app in the pane, unticked, and the
   daemon opens the pane once. Whatever the index reads off the framebuffer
   is indexed in mcmonad-core's memory: never written by the index to disk,
-  logged, or put on the Haskell socket. Cloud disclosure requires a confirmed
+  logged, or put on the Haskell socket. That includes the day of text history
+  the index keeps (`Index/TextHistory.swift`); it reads a window being worked
+  in at most every two minutes and every window after the user steps away,
+  and only the pixel rows that changed (`Index/WindowPage.swift`, after
+  ocr-predictor). Cloud disclosure requires a confirmed
   one-off search or explicit menu-bar opt-in to What's up monitoring (off by
   default). Opting out cancels queued/in-flight monitoring and clears cached
   summaries; it cannot recall data already sent. Claude's local session
-  persistence flag is not a provider-retention guarantee.
+  persistence flag is not a provider-retention guarantee. Questions go only to the
+  locked-down `claude -p` on the user's Claude login (an OAuth token may come
+  from a command or an owner-only file named in
+  `~/.config/mcmonad/claude.json`); there is no Messages API route
+  (`Launcher/ClaudeAccess.swift`). What is kept of a question afterwards is a
+  receipt with no text field (`Launcher/AskReceipts.swift`): in memory, and
+  one `ASK:` log line unless claude.json's `retention.receipts` is
+  `"memory"`.
+  (AI-assisted update of this paragraph: model claude-opus-5-5; reasoning
+  effort unavailable, not exposed by the harness.)
 - No other explicit permissions needed.

@@ -1,28 +1,46 @@
 import AppKit
+import Carbon
 import ScreenCaptureKit
-import Vision
 import os
+
+// AI-assisted update (text history: reading only what changed, looks while the
+// user works, the day's history): model claude-opus-5-5; reasoning effort
+// unavailable (not exposed by the harness).
 
 /// An in-memory index of the text on every window the WM manages — the
 /// displayed ones and the ones parked on hidden workspaces — read off their
 /// pixels with Vision, so the launcher can search inside windows and the
-/// "where is" / "what's up" questions can cite their contents.
+/// "where is" / "what's up" questions can cite their contents, and of what
+/// they said over the last day (`TextHistory`).
 ///
-/// Captures are `CGImage`s that die with the cycle; this index keeps text
-/// only in memory and never logs it, persists it or sends it over IPC.
-/// Cloud disclosure is separate: an explicitly confirmed launcher search,
-/// or explicitly enabled What's up monitoring, may send excerpts to Claude.
+/// Captures are `CGImage`s that die with the cycle; the index keeps text,
+/// and per window only hashes of its last capture's pixel strips, in
+/// memory, and never logs, persists or sends them over IPC. Cloud
+/// disclosure is separate: an explicitly confirmed launcher search, or
+/// explicitly enabled What's up monitoring, may send excerpts to Claude.
 /// The brain only ever says whether local indexing is on or off.
 ///
 /// Capture is ScreenCaptureKit's per-window screenshot (the window's own
 /// buffer, so a covered or parked window reads just like a visible one),
-/// never the `screencapture` tool (which writes a file). Recognition is
-/// understudy's Vision setup: accurate level, language correction, reading
-/// order by line. A window is re-read only when its picture changed by more
-/// than a cursor blink (a coarse grey thumbnail, compared cell by cell), so a
-/// quiet desktop costs nothing between cycles. Reading happens in passes:
-/// after the user has been away for `idleAfter`, or at once for a launcher
-/// query starting with "!", never while they are typing.
+/// never the `screencapture` tool (which writes a file). A window is read
+/// the way ocr-predictor reads a screen (`WindowPage`): its text is
+/// believed while its pixels stay the same, and only the lines whose pixels
+/// changed are read again; a scroll moves the lines it carried. A look at a
+/// window that did not change costs a capture and a hash, no recognition.
+///
+/// Windows are looked at in two ways, never more often than the user's
+/// work warrants:
+///   * while the user works: when the input to the focused window is
+///     intense (`InputPulse`), that window is looked at, and again at most
+///     once every `GlancePolicy.every` while it keeps getting it — wherever
+///     it is by then;
+///   * when the user steps away: after `idleAfter` without input, one pass
+///     over every window (displayed first, then parked), `readsPerStep`
+///     windows that changed at a time, then rest until the user has been
+///     back and gone quiet again. A launcher query starting with "!" runs
+///     a pass at once.
+/// No window of the app holding secure input (a password is being typed) is
+/// read, and nothing is read while the display sleeps unless asked with "!".
 @MainActor
 final class ScreenIndex {
     nonisolated private static let logger = Logger(subsystem: "com.mcmonad.core", category: "ScreenIndex")
@@ -35,39 +53,45 @@ final class ScreenIndex {
         case ready
     }
 
-    /// One window's last reading.
+    /// One window's current reading.
     struct Entry {
         let text: String
         /// `text.lowercased()`, kept because it is the hot path of search.
         let lower: String
         /// Changes when the words change; the "what's up" cache keys on it.
         let textHash: Int
-        /// The coarse grey thumbnail the text was read from.
-        fileprivate let thumb: [UInt8]
     }
 
-    /// When the index works. Nothing is captured while the user is busy:
-    /// after `idleAfter` without keyboard or mouse input it makes one pass
-    /// over every window (displayed first, then parked), `readsPerTick`
-    /// recognitions at a time, then rests until the user has been back and
-    /// gone quiet again — the recap is wanted after stepping away. A
-    /// launcher query starting with "!" runs a pass at once. One accurate
-    /// read of a big window costs about three CPU-seconds; read every six
-    /// seconds, two busy terminals were a third of a core.
     static let idleAfter: TimeInterval = 180
-    static let tick: TimeInterval = 30
-    static let readsPerTick = 3
-    /// Thumbnail side, and how much of it must differ before a re-read: a
-    /// blinking cursor or a clock digit is a cell or two of 1024.
-    nonisolated static let thumbSide = 32
-    nonisolated static let changedFraction = 0.01
+    /// How often the input counters are sampled and due looks are taken.
+    static let tick: TimeInterval = 5
+    /// Windows that needed reading, per step of a pass.
+    static let readsPerStep = 3
+    /// Pixels one look may hand to Vision. Accurate recognition costs about
+    /// 0.16 CPU-µs a pixel on this class of Mac (a 3000 × 1800 window, all
+    /// of it, is 0.87 CPU-s; one changed line about 30 ms). A pass reads a
+    /// window whole if it must; a look while the user works reads at most a
+    /// third of a CPU-second and leaves the rest for its next look — except
+    /// a window it has never read or that was resized, which it reads whole.
+    nonisolated static let passBudget = 24_000_000
+    nonisolated static let glanceBudget = 2_000_000
+    /// How often the history forgets what is more than a day old.
+    static let pruneEvery: TimeInterval = 300
 
     private(set) var availability: Availability = .disabled
+    private var pages: [UInt32: WindowPage] = [:]
     private var entries: [UInt32: Entry] = [:]
+    private(set) var history = TextHistory()
+    private var pulse = InputPulse()
+    private var policy = GlancePolicy()
     /// Windows on displayed workspaces, per the brain's latest snapshot.
     private var visible: [UInt32] = []
     /// Windows parked on hidden workspaces, per the same snapshot.
     private var hidden: [UInt32] = []
+    private var focused: UInt32?
+    /// Each managed window's process, to know which belong to the app that
+    /// holds secure input.
+    private var pids: [UInt32: Int32] = [:]
     /// The running pass: windows not yet looked at, displayed first.
     private var pass: [UInt32] = []
     private var forced = false
@@ -75,17 +99,21 @@ final class ScreenIndex {
     /// pass waits for input after it.
     private var passInputMark: Date?
     private(set) var lastPassEnded: Date?
+    private(set) var lastGlance: Date?
+    private var lastPrune = Date.distantPast
     private var periodic: Timer?
     private var scheduled = false
     private var inFlight = false
     private var openedSettings = false
     private var noticedReplacement = false
-    /// Consecutive cycles the preflight said "not granted". A deploy replaces
-    /// and re-signs the bundle under the still-running old daemon, whose
-    /// preflight then fails for a few seconds before the launcher kills it;
-    /// acting on one failed check turned every deploy into a system prompt.
-    private var deniedCycles = 0
-    private static let deniedCyclesBeforeAsking = 3
+    /// Since when the preflight has said "not granted", without a break. A
+    /// deploy replaces and re-signs the bundle under the still-running old
+    /// daemon, whose preflight then fails for a while before the launcher
+    /// kills it; acting on one failed check turned every deploy into a
+    /// system prompt. Cycles now come every few seconds, so the grace is a
+    /// time, not a count.
+    private var deniedSince: Date?
+    private static let deniedFor: TimeInterval = 90
 
     /// Fires after a cycle that changed at least one entry, and after every
     /// step of a forced pass so the launcher can show it moving.
@@ -105,8 +133,8 @@ final class ScreenIndex {
         case .disabled: return "off"
         case .denied: return "needs Screen Recording"
         case .ready:
-            let last = lastPassEnded.map { "last read \(Self.hhmm($0))" } ?? "nothing read yet"
-            return "\(entries.count) windows · \(last) · reads after \(Int(Self.idleAfter / 60)) min without input, or for “where is”"
+            let last = [lastGlance, lastPassEnded].compactMap { $0 }.max().map { "last read \(Self.hhmm($0))" } ?? "nothing read yet"
+            return "\(entries.count) windows · \(history.lineCount) lines from the last day · \(last) · reads a window you work in at most every \(Int(GlancePolicy.every / 60)) min, all after \(Int(Self.idleAfter / 60)) min without input"
         }
     }
 
@@ -119,6 +147,26 @@ final class ScreenIndex {
         CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
     }
 
+    /// Windows that may not be read now: those of the app holding secure
+    /// input (a password is being typed), as the session names it; every
+    /// window when secure input is on and no app is named.
+    private func guardedWindows() -> Set<UInt32> {
+        guard IsSecureEventInputEnabled() else { return [] }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        guard let pid = (session?["kCGSSessionSecureInputPID"] as? NSNumber)?.int32Value, pid > 0 else {
+            return Set(visible).union(hidden)
+        }
+        return Set(pids.filter { $0.value == pid }.keys)
+    }
+
+    /// The HID system's running counts of keys, clicks and scroll steps.
+    nonisolated static func inputCounts() -> InputPulse.Counts {
+        func n(_ t: CGEventType) -> UInt32 { CGEventSource.counterForEventType(.hidSystemState, eventType: t) }
+        return InputPulse.Counts(keys: n(.keyDown),
+                                 clicks: n(.leftMouseDown) &+ n(.rightMouseDown) &+ n(.otherMouseDown),
+                                 scrolls: n(.scrollWheel))
+    }
+
     // MARK: - Control (from the brain and the launcher)
 
     func setEnabled(_ on: Bool) {
@@ -126,7 +174,7 @@ final class ScreenIndex {
             guard availability == .disabled else { return }
             availability = .ready
             periodic = Timer.scheduledTimer(withTimeInterval: Self.tick, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.requestSoon(after: 0) }
+                MainActor.assumeIsolated { self?.tickInput() }
             }
             Self.logger.info("screen index enabled")
             requestSoon(after: 0.5)
@@ -135,23 +183,35 @@ final class ScreenIndex {
             availability = .disabled
             periodic?.invalidate()
             periodic = nil
+            pages.removeAll()
             entries.removeAll()
+            history.removeAll()
+            policy = GlancePolicy()
+            pulse = InputPulse()
             pass.removeAll()
             forced = false
             Self.logger.info("screen index disabled; memory cleared")
         }
     }
 
-    /// The brain's view of every window it manages. Entries for windows
-    /// that are gone from every workspace are dropped; the rest stay until
-    /// re-read. Nothing is captured for a layout change: the next pass
-    /// sees it.
+    /// The brain's view of every window it manages. Pages for windows gone
+    /// from every workspace are dropped (their history stays, as closed, for
+    /// a day); the rest stay until re-read. Titles go into the history.
     func noteSnapshot(_ snapshot: OverlaySnapshot) {
         guard isEnabled else { return }
         visible = snapshot.screens.flatMap { $0.windows.map(\.windowId) }
         hidden = snapshot.hiddenWorkspaces.flatMap { $0.windows.map(\.windowId) }
+        focused = snapshot.screens.lazy.flatMap(\.windows).first { $0.isFocused }?.windowId
+        pids = Dictionary((snapshot.screens.flatMap(\.windows) + snapshot.hiddenWorkspaces.flatMap(\.windows))
+            .map { ($0.windowId, $0.pid) }, uniquingKeysWith: { a, _ in a })
+        var present: [(id: UInt32, app: String, title: String, tag: String?)] = []
+        for s in snapshot.screens { for w in s.windows { present.append((w.windowId, w.appName ?? "?", w.title ?? "", s.workspaceTag)) } }
+        for ws in snapshot.hiddenWorkspaces { for w in ws.windows { present.append((w.windowId, w.appName ?? "?", w.title ?? "", ws.tag)) } }
+        history.noteWindows(present, at: Date())
         let all = Set(visible).union(hidden)
+        for id in pages.keys where !all.contains(id) { pages.removeValue(forKey: id) }
         for id in entries.keys where !all.contains(id) { entries.removeValue(forKey: id) }
+        policy.keep(only: all)
         pass.removeAll { !all.contains($0) }
     }
 
@@ -176,10 +236,66 @@ final class ScreenIndex {
         }
     }
 
-    // MARK: - One step of a pass
+    /// Every `tick`: how hard the user is working, and in which window.
+    /// Counts only; then a cycle, which looks at whatever is due.
+    private func tickInput() {
+        guard isEnabled else { return }
+        let now = Date()
+        let score = pulse.note(Self.inputCounts(), at: now)
+        if let f = focused {
+            if Self.secondsSinceInput() < Self.tick { history.noteInput(f, at: now) }
+            if InputPulse.isIntense(score) { policy.noteIntense(f, at: now) }
+        }
+        if now.timeIntervalSince(lastPrune) >= Self.pruneEvery {
+            lastPrune = now
+            history.prune(now: now)
+        }
+        requestSoon(after: 0)
+    }
+
+    /// What the history says about `windows` for a question with `terms`.
+    func evidence(windows: [UInt32], terms: [String], budget: Int) -> (windows: [UInt32: HistoryEvidence.ForWindow], closed: [HistoryEvidence.Closed]) {
+        let onScreen: (UInt32) -> Set<String> = { [pages] id in
+            Set((pages[id]?.rows ?? []).map(TextHistory.key))
+        }
+        return HistoryEvidence.select(history, windows: windows, onScreen: onScreen, terms: terms,
+                                      budget: budget, clock: Self.hhmm)
+    }
+
+    // MARK: - One step
 
     private func cycle() async {
         guard isEnabled, !inFlight else { return }
+        let idle = Self.secondsSinceInput()
+        let lastInput = Date(timeIntervalSinceNow: -idle)
+        let awake = CGDisplayIsAsleep(CGMainDisplayID()) == 0
+        if forced, pass.isEmpty { endPass(); return }
+        if pass.isEmpty, !forced, awake, idle >= Self.idleAfter,
+           passInputMark.map({ lastInput.timeIntervalSince($0) > 1 }) ?? true {
+            // An idle pass starts once the user has been quiet for
+            // `idleAfter` and has been back since the last pass began. The
+            // last-input instant is recomputed each tick from a running
+            // idle counter, so it drifts by milliseconds; a second's
+            // tolerance keeps that drift from counting as a return.
+            passInputMark = lastInput
+            pass = visible + hidden.filter { !visible.contains($0) }
+            if !pass.isEmpty {
+                Self.logger.info("screen index: idle pass over \(self.pass.count, privacy: .public) windows")
+            }
+        }
+        // A pass goes on while the user stays away and the display is awake
+        // (or at once for "!"); otherwise the window they work in, if it is
+        // due. No window of the app holding secure input is read either way.
+        let guarded = guardedWindows()
+        let inPass = !pass.isEmpty && (forced || (idle >= Self.idleAfter && awake))
+        if inPass, !guarded.isEmpty {
+            pass.removeAll { guarded.contains($0) }
+            if pass.isEmpty { endPass(); return }
+        }
+        let due = inPass || !awake ? nil : policy.due(at: Date(), preferring: focused, skip: guarded)
+        guard inPass || due != nil else { return }
+
+        // Only now, with something to read, ask whether reading is allowed.
         // A deploy replaced the bundle under this process: TCC no longer
         // recognises it and the launcher restarts it shortly. Nothing it
         // could ask for now would be about a grant that was lost.
@@ -192,54 +308,68 @@ final class ScreenIndex {
             return
         }
         guard CGPreflightScreenCaptureAccess() else {
-            deniedCycles += 1
-            if deniedCycles >= Self.deniedCyclesBeforeAsking { markDenied() }
+            let since = deniedSince ?? Date()
+            deniedSince = since
+            if Date().timeIntervalSince(since) >= Self.deniedFor { markDenied() }
             if forced { endPass(completed: false) }
             return
         }
-        deniedCycles = 0
+        deniedSince = nil
         if availability == .denied { availability = .ready }
 
-        let idle = Self.secondsSinceInput()
-        let lastInput = Date(timeIntervalSinceNow: -idle)
-        if forced, pass.isEmpty { endPass(); return }
-        if pass.isEmpty {
-            // An idle pass starts once the user has been quiet for
-            // `idleAfter` and has been back since the last pass began. The
-            // last-input instant is recomputed each tick from a running
-            // idle counter, so it drifts by milliseconds; a second's
-            // tolerance keeps that drift from counting as a return.
-            guard !forced, idle >= Self.idleAfter, CGDisplayIsAsleep(CGMainDisplayID()) == 0,
-                  passInputMark.map({ lastInput.timeIntervalSince($0) > 1 }) ?? true
-            else { return }
-            passInputMark = lastInput
-            pass = visible + hidden.filter { !visible.contains($0) }
-            guard !pass.isEmpty else { return }
-            Self.logger.info("screen index: idle pass over \(self.pass.count, privacy: .public) windows")
-        } else if !forced, idle < Self.idleAfter {
-            return   // the user is back: the pass waits for the next quiet spell
+        if inPass {
+            await step(ids: pass, budget: Self.passBudget, limit: Self.readsPerStep, inPass: true)
+        } else if let due {
+            await step(ids: [due], budget: Self.glanceBudget, limit: 1, inPass: false)
         }
+    }
+
+    /// Looks at `ids` in order until `limit` of them needed reading, and
+    /// folds what was read into the pages, the entries and the history.
+    private func step(ids: [UInt32], budget: Int, limit: Int, inPass: Bool) async {
         inFlight = true
         defer { inFlight = false }
-
         let started = Date()
-        let known = entries.mapValues(\.thumb)
         let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-        let (readings, examined) = await Self.read(ids: pass, knownThumbs: known, scale: scale, limit: Self.readsPerTick)
+        let (looked, examined) = await Self.look(ids: ids, pages: pages, scale: scale, budget: budget, limit: limit)
         guard isEnabled else { return }   // disabled mid-cycle: drop what was read
-        // Nothing examined means the window list itself failed: end the
-        // pass rather than spin on it.
-        if examined.isEmpty { endPass(completed: false); return }
-        pass.removeAll { examined.contains($0) }
-        for (id, r) in readings {
-            entries[id] = Entry(text: r.text, lower: r.text.lowercased(), textHash: r.text.hashValue, thumb: r.thumb)
+        let now = Date()
+        let known = Set(visible).union(hidden)
+        var changed = 0, read = 0, pixels = 0
+        for (id, result) in looked where known.contains(id) {
+            let (page, work) = result
+            pages[id] = page
+            policy.noteGlanced(id, at: now)
+            if work.reads > 0 { read += 1; pixels += work.readPixels }
+            history.record(id, rows: work.newRows, replaced: work.replacedRows, at: now)
+            history.touch(id, rows: page.rows, at: now)
+            let text = page.text
+            if entries[id]?.text != text {
+                entries[id] = Entry(text: text, lower: text.lowercased(), textHash: text.hashValue)
+                changed += 1
+            }
+            if let fault = work.fault {
+                Self.logger.error("screen index: recognition failed: \(fault.reason, privacy: .public)")
+            }
         }
-        if !readings.isEmpty {
-            let hiddenRead = readings.keys.filter { !visible.contains($0) }.count
-            let ms = Int(Date().timeIntervalSince(started) * 1000)
-            Self.logger.info("screen index: re-read \(readings.count, privacy: .public) window(s) (\(readings.count - hiddenRead, privacy: .public) of \(self.visible.count, privacy: .public) displayed, \(hiddenRead, privacy: .public) of \(self.hidden.count, privacy: .public) hidden) in \(ms, privacy: .public) ms, \(self.pass.count, privacy: .public) left")
+        // A window looked for and not captured (gone from ScreenCaptureKit's
+        // list, excluded from capture, a failed query) waits its turn like
+        // one that was read: else it is due again every tick, and while it
+        // is focused no other owed window is ever looked at.
+        for id in (inPass ? Array(examined) : ids) where looked[id] == nil { policy.noteGlanced(id, at: now) }
+        if !inPass, !looked.isEmpty { lastGlance = now }
+        if inPass {
+            // Nothing examined means the window list itself failed: end the
+            // pass rather than spin on it.
+            if examined.isEmpty { endPass(completed: false); return }
+            pass.removeAll { examined.contains($0) }
         }
-        if !readings.isEmpty || forced { onUpdated?() }
+        if read > 0 {
+            let ms = Int(now.timeIntervalSince(started) * 1000)
+            Self.logger.info("screen index: \(inPass ? "pass" : "look", privacy: .public) read \(read, privacy: .public) of \(looked.count, privacy: .public) window(s), \(pixels, privacy: .public) px in \(ms, privacy: .public) ms, \(self.pass.count, privacy: .public) left in pass")
+        }
+        if changed > 0 || (inPass && forced) { onUpdated?() }
+        guard inPass else { return }
         if pass.isEmpty {
             endPass()
         } else {
@@ -256,19 +386,17 @@ final class ScreenIndex {
         onPassEnded?(wasForced)
     }
 
-    /// One window's pixels, reduced to what may leave the reading thread.
-    private struct Reading: Sendable {
-        let thumb: [UInt8]
-        let text: String
-    }
+    // MARK: - Pixels → text (off the main actor)
 
     /// Off the main actor end to end. ScreenCaptureKit's content and
     /// windows, the captured image and Vision's observations are not
-    /// Sendable, so none of them come back; only readings for windows
-    /// whose picture differs from `knownThumbs` do — at most `limit` of them,
-    /// in the order given — plus the set of ids that were examined before
-    /// the cap stopped the pass (a window not capturable counts as examined).
-    private nonisolated static func read(ids: [UInt32], knownThumbs: [UInt32: [UInt8]], scale: CGFloat, limit: Int) async -> ([UInt32: Reading], Set<UInt32>) {
+    /// Sendable, so none of them come back: each looked-at window's page,
+    /// updated, and what reading it cost. Windows are looked at in order
+    /// until `limit` of them needed reading; `examined` is every id looked
+    /// at (a window that cannot be captured counts as examined).
+    private nonisolated static func look(ids: [UInt32], pages: [UInt32: WindowPage], scale: CGFloat,
+                                         budget: Int, limit: Int) async
+        -> ([UInt32: (WindowPage, GlanceWork)], Set<UInt32>) {
         let content: SCShareableContent
         do {
             // Parked windows sit 1 px on screen; ask for everything anyway.
@@ -278,10 +406,11 @@ final class ScreenIndex {
             return ([:], [])
         }
         let byId = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { a, _ in a })
-        var out: [UInt32: Reading] = [:]
+        var out: [UInt32: (WindowPage, GlanceWork)] = [:]
         var examined = Set<UInt32>()
+        var readCount = 0
         for id in ids {
-            if out.count >= limit { return (out, examined) }
+            if readCount >= limit { break }
             examined.insert(id)
             guard let window = byId[id], window.frame.width >= 8, window.frame.height >= 8 else { continue }
             let cfg = SCStreamConfiguration()
@@ -298,9 +427,17 @@ final class ScreenIndex {
                 logger.debug("capture wid=\(id) failed: \(error.localizedDescription, privacy: .public)")
                 continue
             }
-            let thumb = thumbprint(image)
-            if let old = knownThumbs[id], !changed(old, thumb) { continue }
-            out[id] = Reading(thumb: thumb, text: recognise(image).joined(separator: "\n"))
+            guard let tiles = VisionReader.tiles(of: image) else { continue }
+            var page = pages[id] ?? WindowPage()
+            // A first look, or a window resized (every re-tile does that), has
+            // no lines to go on from: it is read whole, once, or its text
+            // would be a third of itself until two more looks.
+            let fresh = page.observe(tiles, at: Date()) == nil
+            let work = page.read(budget: fresh ? max(budget, passBudget) : budget, at: Date()) { sample in
+                VisionReader.recognise(image, in: sample)
+            }
+            if work.reads > 0 { readCount += 1 }
+            out[id] = (page, work)
         }
         return (out, examined)
     }
@@ -329,48 +466,20 @@ final class ScreenIndex {
         _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
     }
 
-    // MARK: - Pixels → text (off the main actor)
+    // MARK: - A whole picture's text
 
-    /// Also reads a window saved for later (`LaterCapture`).
+    /// Every line Vision reads off `image`, in reading order. The index
+    /// itself reads only what changed (`WindowPage`); this reads a window
+    /// saved for later (`LaterCapture`) whole.
     nonisolated static func recognise(_ image: CGImage) -> [String] {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
-        request.recognitionLanguages = ["en-US"]
-        request.minimumTextHeight = 0
-        do {
-            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-        } catch {
-            return []
-        }
-        let observations = (request.results ?? []).compactMap { o -> (CGRect, String)? in
-            o.topCandidates(1).first.map { (o.boundingBox, $0.string) }
-        }
-        return TextSearch.readingOrder(observations)
-    }
-
-    /// The window as a `thumbSide`² grey thumbnail: cheap to make, and
-    /// coarse enough that a cursor or a clock does not count as a repaint.
-    private nonisolated static func thumbprint(_ image: CGImage) -> [UInt8] {
-        let side = thumbSide
-        var pixels = [UInt8](repeating: 0, count: side * side)
-        pixels.withUnsafeMutableBytes { buf in
-            guard let ctx = CGContext(
-                data: buf.baseAddress, width: side, height: side, bitsPerComponent: 8,
-                bytesPerRow: side, space: CGColorSpaceCreateDeviceGray(),
-                bitmapInfo: CGImageAlphaInfo.none.rawValue
-            ) else { return }
-            ctx.interpolationQuality = .low
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
-        }
-        return pixels
-    }
-
-    /// True when more than `changedFraction` of the cells moved noticeably.
-    private nonisolated static func changed(_ a: [UInt8], _ b: [UInt8]) -> Bool {
-        guard a.count == b.count, !a.isEmpty else { return true }
-        var moved = 0
-        for i in a.indices where abs(Int(a[i]) - Int(b[i])) > 24 { moved += 1 }
-        return Double(moved) / Double(a.count) > changedFraction
+        let whole = PixelRect(x: 0, y: 0, w: image.width, h: image.height)
+        guard case .success(let lines) = VisionReader.recognise(image, in: whole) else { return [] }
+        let w = Double(image.width), h = Double(image.height)
+        // Back to Vision's normalised bottom-left boxes, which the reading
+        // order is defined on.
+        return TextSearch.readingOrder(lines.map { line in
+            (CGRect(x: Double(line.rect.x) / w, y: 1 - Double(line.rect.bottom) / h,
+                    width: Double(line.rect.w) / w, height: Double(line.rect.h) / h), line.text)
+        })
     }
 }

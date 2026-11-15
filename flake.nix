@@ -69,14 +69,26 @@
                 Sources/MCMonadCore/Display/ScreenRoleMap.swift \
                 Sources/MCMonadCore/Index/TextSearch.swift \
                 Sources/MCMonadCore/Launcher/RecentUse.swift \
+                Sources/MCMonadCore/LogTimestamp.swift \
                 Sources/MCMonadCore/Launcher/AskProtocol.swift \
+                Sources/MCMonadCore/Launcher/AskReceipts.swift \
                 Sources/MCMonadCore/Launcher/WhereIsProtocol.swift \
                 Sources/MCMonadCore/Launcher/WhatsUp.swift \
+                Sources/MCMonadCore/Launcher/ClaudeAccess.swift \
+                Sources/MCMonadCore/Launcher/ClaudeRoutes.swift \
                 Sources/MCMonadCore/Launcher/AskRunner.swift \
                 Sources/MCMonadCore/Launcher/WhatsUpCache.swift \
                 Tests/LauncherLogicChecks.swift \
                 -o .build/launcher-logic-checks
               .build/launcher-logic-checks
+              /usr/bin/swiftc -swift-version 6 -O \
+                Sources/MCMonadCore/Index/PixelTiles.swift \
+                Sources/MCMonadCore/Index/WindowPage.swift \
+                Sources/MCMonadCore/Index/TextHistory.swift \
+                Sources/MCMonadCore/Index/GlancePolicy.swift \
+                Tests/TextHistoryChecks.swift \
+                -o .build/text-history-checks
+              .build/text-history-checks
               /usr/bin/swiftc -swift-version 6 \
                 Sources/MCMonadCore/Display/ScreenRoleMap.swift \
                 Tests/ScreenRoleMapChecks.swift \

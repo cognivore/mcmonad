@@ -1,5 +1,9 @@
 import Foundation
 
+// AI-assisted update (history in the manifold; the locked-down SDK route;
+// turn ceilings and the request's kind): model claude-opus-5-5; reasoning
+// effort unavailable (not exposed by the harness).
+
 /// What every launcher question to the model shares — "where is …" and
 /// "what's up": describing every window to it (the manifold), calling the
 /// Claude Code CLI already on this Mac, and reading its stream back into one
@@ -10,17 +14,31 @@ enum Ask {
     static let model = "claude-fable-5-1"
     static let effort = "low"
 
+    /// The ceilings every question runs under, as a laptop-pool profile
+    /// sets them: turns (a structured answer takes one or two) and output
+    /// tokens per turn. A question that reaches one ends failed and says
+    /// which, instead of running on. No dollar ceiling: the subscription
+    /// carries the cost.
+    static let maxTurns = 4
+    static let maxOutputTokens = 16_000
+
     /// Arguments after the executable. Print mode with structured output and
-    /// a streamed transcript; no tools; request no local session history.
-    /// The prompt carries screen text; this flag does not control retention
-    /// at the provider or other logging configured in the user's CLI.
+    /// a streamed transcript; locked down the way laptop-pool runs the Agent
+    /// SDK: no tools, no MCP server, no settings, nothing to ask, and no
+    /// local session history. The prompt carries screen text; these flags do
+    /// not control retention at the provider.
     static func arguments(schema: String, systemPrompt: String) -> [String] {
         [
             "-p",
             "--model", model,
             "--effort", effort,
+            "--max-turns", String(maxTurns),
             "--no-session-persistence",
             "--tools", "",
+            "--permission-mode", "dontAsk",
+            "--strict-mcp-config",
+            "--mcp-config", #"{"mcpServers":{}}"#,
+            "--setting-sources", "",
             "--exclude-dynamic-system-prompt-sections",
             "--output-format", "stream-json",
             "--verbose",
@@ -30,8 +48,24 @@ enum Ask {
         ]
     }
 
-    /// Where the Claude Code CLI may live when the daemon's own PATH (a
-    /// launchd agent's, so nearly empty) does not name it.
+    /// One question for the model, whichever route takes it: the prompt,
+    /// the system prompt and schema it is asked under, and how its
+    /// structured answer is read back.
+    struct Request: Sendable {
+        /// Which feature asks: named in the question's receipt.
+        let kind: Kind
+        let systemPrompt: String
+        let schema: String
+        let prompt: String
+        let answer: @Sendable ([String: Any]) -> Answer?
+
+        var arguments: [String] { Ask.arguments(schema: schema, systemPrompt: systemPrompt) }
+        func parseLine(_ line: String) -> StreamItem { Ask.parseLine(line, answer: answer) }
+    }
+
+    /// Where the Claude Code CLI may live when the settings do not name it
+    /// and the daemon's own PATH (a launchd agent's, so nearly empty) does
+    /// not either.
     static func candidates(home: String, path: String?) -> [String] {
         var dirs = [home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
         for dir in (path ?? "").split(separator: ":").map(String.init) where !dirs.contains(dir) {
@@ -48,6 +82,39 @@ enum Ask {
         let title: String
         let focused: Bool
         let text: String?
+        /// Lines that were on the window earlier and are gone now, and its
+        /// earlier titles, each with when it was seen ("13:02–13:40 …").
+        var earlier: [String]? = nil
+        /// When the user last worked in it ("HH:MM"), and for how many
+        /// minutes over the last day.
+        var lastActive: String? = nil
+        var activeMinutes: Int? = nil
+
+        enum CodingKeys: String, CodingKey {
+            case id, app, title, focused, text, earlier
+            case lastActive = "last_active", activeMinutes = "active_minutes"
+        }
+    }
+
+    /// A window closed within the last day, with what it said.
+    struct ManifoldClosedWindow: Codable, Equatable {
+        let id: UInt32
+        let app: String
+        let title: String
+        let workspace: String?
+        let closedAt: String
+        let earlier: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case id, app, title, workspace, earlier, closedAt = "closed_at"
+        }
+    }
+
+    /// What the history adds to one window.
+    struct WindowHistory: Equatable {
+        let earlier: [String]
+        let lastActive: String?
+        let activeMinutes: Int
     }
 
     struct ManifoldWorkspace: Codable, Equatable {
@@ -64,24 +131,29 @@ enum Ask {
         let question: String
         let currentWorkspace: String?
         let workspaces: [ManifoldWorkspace]
+        var closedWindows: [ManifoldClosedWindow]? = nil
 
         enum CodingKeys: String, CodingKey {
-            case question, currentWorkspace = "current_workspace", workspaces
+            case question, currentWorkspace = "current_workspace", workspaces, closedWindows = "closed_windows"
         }
 
         var windowIds: Set<UInt32> { Set(workspaces.flatMap { $0.windows.map(\.id) }) }
+        var closedIds: Set<UInt32> { Set((closedWindows ?? []).map(\.id)) }
         var tags: Set<String> { Set(workspaces.map(\.tag)) }
     }
 
     /// Every non-empty workspace (or just those in `only`), on-screen ones
-    /// first, each window with an excerpt of its recognised text. `budget`
-    /// caps the total excerpt characters across all windows so the prompt
-    /// stays one call's worth; the per-window cap is the budget spread
-    /// evenly, at most `perWindow`.
+    /// first, each window with an excerpt of its recognised text and, when
+    /// `history` has any, what it said earlier. `budget` caps the total
+    /// excerpt characters across all windows so the prompt stays one call's
+    /// worth; the per-window cap is the budget spread evenly, at most
+    /// `perWindow`. (`history` brings its own budget: `HistoryEvidence`.)
     static func manifold(
         question: String,
         snapshot: OverlaySnapshot,
         text: (UInt32) -> String?,
+        history: (UInt32) -> WindowHistory? = { _ in nil },
+        closed: [ManifoldClosedWindow] = [],
         only: Set<String>? = nil,
         budget: Int = 80_000,
         perWindow: Int = 1_500
@@ -97,25 +169,37 @@ enum Ask {
         let cap = count == 0 ? perWindow : min(perWindow, budget / count)
         let workspaces = pending.map { tag, onScreen, entries in
             ManifoldWorkspace(tag: tag, onScreen: onScreen, windows: entries.map { w in
-                ManifoldWindow(
+                let past = history(w.windowId)
+                return ManifoldWindow(
                     id: w.windowId,
                     app: w.appName ?? "?",
                     title: w.title ?? "",
                     focused: w.isFocused,
-                    text: text(w.windowId).map { TextSearch.excerpt($0, limit: cap, terms: TextSearch.terms(question)) }
+                    text: text(w.windowId).map { TextSearch.excerpt($0, limit: cap, terms: TextSearch.terms(question)) },
+                    earlier: past.flatMap { $0.earlier.isEmpty ? nil : $0.earlier },
+                    lastActive: past?.lastActive,
+                    activeMinutes: past.flatMap { $0.activeMinutes > 0 ? $0.activeMinutes : nil }
                 )
             })
         }
         let current = snapshot.screens.first { $0.windows.contains { $0.isFocused } }?.workspaceTag
             ?? snapshot.screens.first?.workspaceTag
-        return Manifold(question: question, currentWorkspace: current, workspaces: workspaces)
+        let open = Set(workspaces.flatMap { $0.windows.map(\.id) })
+        let gone = closed.filter { !open.contains($0.id) }
+        return Manifold(question: question, currentWorkspace: current, workspaces: workspaces,
+                        closedWindows: gone.isEmpty ? nil : gone)
     }
 
+    /// The question, then the manifold. Every "@" is escaped: the CLI reads
+    /// "@path" in a prompt as a file to attach, and a window title or a line
+    /// of screen text could name one. (In the JSON it is the escape \\u0040;
+    /// in the question line, a full-width ＠.)
     static func prompt(for manifold: Manifold) -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let json = (try? encoder.encode(manifold)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        return "\(manifold.question)\n\nManifold:\n\(json)"
+        let question = manifold.question.replacingOccurrences(of: "@", with: "＠")
+        return "\(question)\n\nManifold:\n" + json.replacingOccurrences(of: "@", with: "\\u0040")
     }
 
     // MARK: - Answer (what the model tells us)
@@ -149,6 +233,9 @@ enum Ask {
         /// A protocol event that is not content: shown as one dim line so a
         /// slow call is visibly alive (init, rate limit, message boundaries).
         case note(String)
+        /// The session's `init` line, checked to be the locked-down session
+        /// asked for; shown like a note. An answer is believed only after it.
+        case session(String)
         /// The final result line.
         case final(Outcome)
         /// A line that is not JSON.
@@ -175,9 +262,14 @@ enum Ask {
             return .note(eventType)
         case "system":
             let subtype = (obj["subtype"] as? String) ?? ""
+            if subtype == "init", let why = ClaudeAccess.lockedDown(obj) {
+                return .final(.failed("refused to use the answer: \(why)"))
+            }
             let model = (obj["model"] as? String).map { " model=\($0)" } ?? ""
             let status = (obj["status"] as? String).map { " \($0)" } ?? ""
-            return .note("system \(subtype)\(model)\(status)")
+            let source = (obj["apiKeySource"] as? String).map { " key=\($0)" } ?? ""
+            let text = "system \(subtype)\(model)\(status)\(source)"
+            return subtype == "init" ? .session(text) : .note(text)
         case "rate_limit_event":
             let status = ((obj["rate_limit_info"] as? [String: Any])?["status"] as? String)
                 ?? (obj["status"] as? String) ?? ""
@@ -185,6 +277,7 @@ enum Ask {
         case "assistant", "user":
             return .note("\(type) message")
         case "result":
+            if let limit = stoppedBy(obj["subtype"] as? String) { return .final(limit) }
             if obj["is_error"] as? Bool == true {
                 let why = (obj["result"] as? String)
                     ?? (obj["api_error_status"].map { "\($0)" })
@@ -199,6 +292,18 @@ enum Ask {
             return .final(.malformed(shown))
         default:
             return .note(type)
+        }
+    }
+
+    /// A result line whose subtype says the session was stopped, as the
+    /// outcome that names why; nil for a finished session.
+    static func stoppedBy(_ subtype: String?) -> Outcome? {
+        switch subtype {
+        case nil, "success": return nil
+        case "error_max_turns": return .failed("stopped at the limit of \(maxTurns) turns")
+        case "error_max_structured_output_retries": return .malformed("gave up fitting the answer to the schema")
+        case "error_during_execution": return .failed("the session failed while running")
+        case let other?: return .failed("the session ended as \(other)")
         }
     }
 }

@@ -1,6 +1,9 @@
 // Compiled with the launcher's pure files (TextSearch, RecentUse,
-// AskProtocol, WhereIsProtocol, WhatsUp, Protocol) and run by the Nix
-// package checkPhase.
+// AskProtocol, WhereIsProtocol, WhatsUp, ClaudeAccess, Protocol) and run by
+// the Nix package checkPhase.
+//
+// AI-assisted update (history manifold, SDK/API route checks): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 import Foundation
 import CoreGraphics
 
@@ -13,11 +16,15 @@ enum LauncherLogicChecks {
         checkReadingOrder()
         checkWhereIsQuery()
         checkManifold()
+        checkHistoryManifold()
+        checkClaudeAccess()
         checkTitleEvent()
         checkStream()
         checkWhatsUp()
         checkWhatsUpCache()
         await checkMonitoringPrivacy()
+        await checkAskRunner()
+        checkAskReceipts()
         checkRecency()
         checkOverlayScreenWire()
         checkWorkspaceWindowLookup()
@@ -130,11 +137,98 @@ enum LauncherLogicChecks {
         let prompt = Ask.prompt(for: m)
         precondition(prompt.hasPrefix("Where is: the deploy\n\nManifold:\n{\"current_workspace\":\"3\""), prompt)
         precondition(prompt.contains("\"on_screen\":true"))
-        precondition(WhereIs.arguments.contains("--no-session-persistence"))
-        precondition(WhereIs.arguments.contains("--json-schema"))
+        let request = WhereIs.request(for: m)
+        precondition(request.prompt == prompt && request.arguments == WhereIs.arguments)
+        for flag in ["--no-session-persistence", "--json-schema", "--strict-mcp-config", "--setting-sources"] {
+            precondition(WhereIs.arguments.contains(flag), flag)
+        }
         precondition(WhereIs.arguments.contains(WhereIs.systemPrompt))
+        let tools = WhereIs.arguments.firstIndex(of: "--tools")!, mode = WhereIs.arguments.firstIndex(of: "--permission-mode")!
+        precondition(WhereIs.arguments[tools + 1] == "" && WhereIs.arguments[mode + 1] == "dontAsk")
+        // A laptop-pool profile's turn ceiling; no dollar one on a subscription.
+        let turns = WhereIs.arguments.firstIndex(of: "--max-turns")!
+        precondition(WhereIs.arguments[turns + 1] == "4" && !WhereIs.arguments.contains("--max-budget-usd"))
+        precondition(WhereIs.systemPrompt.contains("snippets") && WhereIs.systemPrompt.contains("Reconstruct"))
         precondition(Ask.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
                      == ["/h/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
+    }
+
+    static func checkHistoryManifold() {
+        func w(_ id: UInt32, _ app: String, _ title: String) -> OverlayWindowEntry {
+            OverlayWindowEntry(windowId: id, pid: 1, appName: app, title: title, bundleId: nil,
+                               workspaceTag: nil, frame: .zero, isFocused: id == 7, isFloating: false)
+        }
+        let snap = OverlaySnapshot(debugOverlays: false,
+                                   screens: [OverlayScreenEntry(screenId: 0, frame: .zero, workspaceTag: "3", isActive: true,
+                                                                windows: [w(7, "Ghostty", "zsh"), w(8, "Chrome", "mail@example.com")])],
+                                   hiddenWorkspaces: [], ignoredWindows: [])
+        let closed = [Ask.ManifoldClosedWindow(id: 40, app: "Preview", title: "invoice.pdf", workspace: "o2",
+                                               closedAt: "14:20", earlier: ["14:02 Invoice 2026-11 ACME"]),
+                      Ask.ManifoldClosedWindow(id: 8, app: "Chrome", title: "stale", workspace: nil, closedAt: "x", earlier: [])]
+        let m = Ask.manifold(question: "where is the @invoice", snapshot: snap, text: { _ in nil },
+                             history: { $0 == 7 ? Ask.WindowHistory(earlier: ["13:02 cargo build", "13:05 title: deploy"],
+                                                                     lastActive: "13:06", activeMinutes: 12) : nil },
+                             closed: closed)
+        let ghostty = m.workspaces[0].windows[0]
+        precondition(ghostty.earlier == ["13:02 cargo build", "13:05 title: deploy"] && ghostty.lastActive == "13:06"
+                     && ghostty.activeMinutes == 12)
+        precondition(m.workspaces[0].windows[1].earlier == nil && m.workspaces[0].windows[1].lastActive == nil)
+        // A window still open is not also "closed"; closed ids may be answered.
+        precondition(m.closedIds == [40] && m.windowIds == [7, 8])
+        let json = Ask.prompt(for: m)
+        precondition(json.contains("\"closed_windows\"") && json.contains("\"last_active\":\"13:06\"")
+                     && json.contains("\"active_minutes\":12"))
+        // No "@" reaches the CLI, which would read "@path" as a file to attach.
+        precondition(!json.contains("@") && json.contains("mail\\u0040example.com") && json.hasPrefix("where is the ＠invoice"), json)
+        let decoded = try! JSONSerialization.jsonObject(with: Data(json.components(separatedBy: "Manifold:\n")[1].utf8)) as! [String: Any]
+        let windows = ((decoded["workspaces"] as! [[String: Any]])[0]["windows"] as! [[String: Any]])
+        precondition(windows[1]["title"] as? String == "mail@example.com", "the escape is JSON's own")
+        let request = WhereIs.request(for: m)
+        let answered = request.parseLine(#"{"type":"result","is_error":false,"structured_output":{"matches":[{"id":40,"reason":"closed pdf"},{"id":7,"reason":"build"},{"id":99,"reason":"?"}]}}"#)
+        precondition(answered == .final(.answered(.windows(matches: [.init(windowId: 40, reason: "closed pdf"),
+                                                                     .init(windowId: 7, reason: "build")],
+                                                           droppedUnknownIds: 1))))
+        // Without history the manifold is what it was.
+        let plain = Ask.manifold(question: "q", snapshot: snap, text: { _ in nil })
+        precondition(plain.closedWindows == nil && !Ask.prompt(for: plain).contains("closed_windows"))
+    }
+
+    static func checkClaudeAccess() {
+        func parse(_ json: String) -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> { ClaudeAccess.parse(Data(json.utf8)) }
+        precondition(parse("{}") == .success(ClaudeAccess.Settings()))
+        precondition(parse(#"{"sdk":{"cli":"/x/claude","oauthTokenCommand":["rageveil","show","a/b"]}}"#)
+                     == .success(ClaudeAccess.Settings(cli: "/x/claude", oauthToken: .command(["rageveil", "show", "a/b"]))))
+        precondition(parse(#"{"sdk":{"oauthTokenFile":"~/.config/t"}}"#) == .success(ClaudeAccess.Settings(oauthToken: .file("~/.config/t"))))
+        // There is no API route, so no place for a key.
+        for bad in ["[]", #"{"apiKey":"sk-ant-x"}"#, #"{"api":{"keyFile":"~/.config/k"}}"#, #"{"sdk":{"key":"sk-ant-naked"}}"#,
+                    #"{"sdk":{"oauthTokenCommand":["a"],"oauthTokenFile":"/k"}}"#, #"{"sdk":{"cli":"claude"}}"#,
+                    #"{"sdk":{"oauthTokenCommand":[]}}"#, #"{"sdk":{"oauthTokenFile":"relative"}}"#] {
+            guard case .failure = parse(bad) else { preconditionFailure("accepted \(bad)") }
+        }
+        let token = String(repeating: "t", count: 40)
+        precondition(ClaudeAccess.credential(token + "\n") == .success(token))
+        precondition(ClaudeAccess.credential("short") != .success("short"))
+        precondition(ClaudeAccess.credential("a b" + token) != .success("a b" + token))
+        precondition(ClaudeAccess.ownerOnly(0o600) && ClaudeAccess.ownerOnly(0o400) && !ClaudeAccess.ownerOnly(0o640))
+        // The CLI child gets an allowlist: a stray API key is not passed on.
+        let env = ClaudeAccess.cliEnvironment(inherited: ["ANTHROPIC_API_KEY": "sk-naked", "PATH": "/custom/bin", "LANG": "en_GB.UTF-8",
+                                                          "AWS_SECRET_ACCESS_KEY": "x"],
+                                              home: "/h", user: "u", token: token)
+        precondition(env["ANTHROPIC_API_KEY"] == nil && env["AWS_SECRET_ACCESS_KEY"] == nil)
+        precondition(env["CLAUDE_CODE_OAUTH_TOKEN"] == token && env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == "1"
+                     && env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" && env["LANG"] == "en_GB.UTF-8" && env["USER"] == "u")
+        precondition(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "16000")
+        precondition(env["PATH"]!.hasPrefix("/h/.local/bin:") && env["PATH"]!.hasSuffix(":/custom/bin"))
+        precondition(ClaudeAccess.cliEnvironment(inherited: [:], home: "/h", user: "u", token: nil)["CLAUDE_CODE_OAUTH_TOKEN"] == nil)
+        // The init line must show a locked-down session.
+        precondition(ClaudeAccess.lockedDown(["tools": ["StructuredOutput"], "mcp_servers": [], "permissionMode": "dontAsk"]) == nil)
+        precondition(ClaudeAccess.lockedDown(["tools": ["Bash"], "mcp_servers": [], "permissionMode": "dontAsk"]) != nil)
+        precondition(ClaudeAccess.lockedDown(["tools": [], "mcp_servers": [["name": "x"]], "permissionMode": "dontAsk"]) != nil)
+        precondition(ClaudeAccess.lockedDown(["tools": [], "mcp_servers": [], "permissionMode": "default"]) != nil)
+        let initLine = #"{"type":"system","subtype":"init","model":"m","tools":["Read"],"mcp_servers":[],"permissionMode":"dontAsk"}"#
+        guard case .final(.failed) = WhereIs.parseLine(initLine, known: []) else { preconditionFailure("a session with tools was believed") }
+        let goodInit = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk","apiKeySource":"none"}"#
+        precondition(WhereIs.parseLine(goodInit, known: []) == .session("system init model=m key=none"))
     }
 
     static func checkStream() {
@@ -143,7 +237,11 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine(delta, known: known) == .delta("{\"matches\":["))
         let textDelta = #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#
         precondition(WhereIs.parseLine(textDelta, known: known) == .delta("hi"))
-        precondition(WhereIs.parseLine(#"{"type":"system","subtype":"init","model":"m"}"#, known: known) == .note("system init model=m"))
+        // An init line that does not say what the session has is not believed.
+        guard case .final(.failed) = WhereIs.parseLine(#"{"type":"system","subtype":"init","model":"m"}"#, known: known) else {
+            preconditionFailure("an init line without tools, servers or mode was believed")
+        }
+        precondition(WhereIs.parseLine(#"{"type":"system","subtype":"status","status":"ok"}"#, known: known) == .note("system status ok"))
         precondition(WhereIs.parseLine(#"{"type":"stream_event","event":{"type":"message_start"}}"#, known: known) == .note("message_start"))
         precondition(WhereIs.parseLine(#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#, known: known) == .note("rate_limit allowed"))
         precondition(WhereIs.parseLine(#"{"type":"assistant","message":{}}"#, known: known) == .note("assistant message"))
@@ -160,6 +258,15 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine(failed, known: known) == .final(.failed("Not logged in")))
         let malformed = #"{"type":"result","is_error":false,"result":"plain prose"}"#
         precondition(WhereIs.parseLine(malformed, known: known) == .final(.malformed("plain prose")))
+        // A session stopped by a ceiling says which, whatever else it printed.
+        let turnsOut = #"{"type":"result","subtype":"error_max_turns","is_error":true}"#
+        precondition(WhereIs.parseLine(turnsOut, known: known) == .final(.failed("stopped at the limit of 4 turns")))
+        let stopped = #"{"type":"result","subtype":"error_during_execution","is_error":false,"structured_output":{"matches":[]}}"#
+        precondition(WhereIs.parseLine(stopped, known: known) == .final(.failed("the session failed while running")))
+        let shapeless = #"{"type":"result","subtype":"error_max_structured_output_retries","is_error":true}"#
+        guard case .final(.malformed) = WhereIs.parseLine(shapeless, known: known) else { preconditionFailure("retries") }
+        let odd = #"{"type":"result","subtype":"error_new_kind","is_error":true}"#
+        precondition(WhereIs.parseLine(odd, known: known) == .final(.failed("the session ended as error_new_kind")))
     }
 
     static func checkTitleEvent() {
@@ -262,8 +369,8 @@ enum LauncherLogicChecks {
         var completions: [(Ask.Outcome) -> Void] = []
         var running = false
 
-        func start(prompt: String, arguments: [String], parse: @escaping @Sendable (String) -> Ask.StreamItem) {
-            prompts.append(prompt)
+        func start(_ request: Ask.Request) {
+            prompts.append(request.prompt)
             completions.append(onFinished!)
             running = true
         }
@@ -383,6 +490,172 @@ enum LauncherLogicChecks {
     }
 
     // MARK: RecentUse
+
+    /// The real runner against a fake `claude`: a shell script that prints
+    /// stream-json lines. No network, no real CLI.
+    @MainActor static func checkAskRunner() async {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mcmonad-ask-checks-\(UUID())")
+        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func fake(_ name: String, _ body: String) -> String {
+            let path = dir.appendingPathComponent(name).path
+            try! ("#!/bin/sh\ncat > /dev/null\n" + body).write(toFile: path, atomically: true, encoding: .utf8)
+            try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+            return path
+        }
+        let initLine = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk"}"#
+        let result = #"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"usage":{"input_tokens":1300,"output_tokens":200,"cache_read_input_tokens":5},"structured_output":{"matches":[{"id":7,"reason":"SECRET-REASON"}]}}"#
+        let good = fake("good", "echo '\(initLine)'\necho '\(result)'\n")
+        let silent = fake("silent", "echo '\(result)'\n")
+        let broken = fake("broken", "echo SECRET-STDERR >&2\nexit 3\n")
+        // Screen text in the prompt, the model's words in the answer, an
+        // error's words on stderr: none of them may reach a log line.
+        let request = Ask.Request(kind: .whereIs, systemPrompt: "s", schema: WhereIs.schemaJSON, prompt: "SECRET-SCREEN-TEXT",
+                                  answer: { WhereIs.answer(from: $0, known: [7]) })
+        let answered = Ask.Outcome.answered(.windows(matches: [.init(windowId: 7, reason: "SECRET-REASON")], droppedUnknownIds: 0))
+        let token = String(repeating: "k", count: 40)
+        var logged: [String] = []
+        let ledger = AskLedger(write: { logged.append($0) })
+        func run(_ settings: ClaudeAccess.Settings) async -> Ask.Outcome {
+            let runner = AskRunner(ledger: ledger, loadSettings: { .success(settings) })
+            return await withCheckedContinuation { done in
+                runner.onFinished = { done.resume(returning: $0) }
+                runner.start(request)
+            }
+        }
+        let first = await run(ClaudeAccess.Settings(cli: good))
+        precondition(first == answered, "\(first)")
+        // Its receipt: the route, how it ended, turns and tokens, how many
+        // windows the answer named.
+        let receipt = ledger.recent()[0]
+        precondition(receipt.kind == .whereIs && receipt.end == .answered && receipt.named == 1 && receipt.dropped == 0)
+        precondition(receipt.run?.end == .answered)
+        precondition(receipt.run?.facts == Ask.Facts(detail: "success", usage: Ask.Usage(input: 1300, output: 200, cacheRead: 5), turns: 2))
+        precondition(logged.count == 1 && logged[0].hasPrefix("ASK: id=\(receipt.id) kind=where-is model=\(Ask.model)")
+                     && logged[0].contains(" end=answered ") && logged[0].contains(" cli=answered/success,")
+                     && logged[0].contains(",turns=2,tokens=1300+200,cache=5+0"), logged[0])
+        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: silent)), why.contains("not believed") else {
+            preconditionFailure("an answer from a session that never described itself was believed")
+        }
+        // A CLI that fails says why, on screen; its receipt says only how.
+        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: broken)),
+              why.contains("status 3"), why.contains("SECRET-STDERR") else { preconditionFailure("a failed CLI") }
+        precondition(ledger.recent()[0].run?.end == .failed && ledger.recent()[0].run?.facts.detail == "exit-3")
+        // An answer in the wrong shape.
+        let prose = fake("prose", "echo '\(initLine)'\necho '{\"type\":\"result\",\"is_error\":false,\"result\":\"prose\"}'\n")
+        guard case .malformed = await run(ClaudeAccess.Settings(cli: prose)) else { preconditionFailure("malformed") }
+        // A cancelled run reports nothing, and a key command that fails says so.
+        let slow = fake("slow", "sleep 30\n")
+        let runner = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: slow)) })
+        var reported = 0
+        runner.onFinished = { _ in reported += 1 }
+        runner.start(request)
+        try? await Task.sleep(for: .milliseconds(300))
+        runner.cancel()
+        try? await Task.sleep(for: .milliseconds(300))
+        precondition(reported == 0, "a cancelled run reported an outcome")
+        precondition(ledger.recent()[0].end == .cancelled, "a cancelled run left no receipt")
+        // A CLI that ignores SIGTERM is killed: it holds the prompt.
+        let pidFile = dir.appendingPathComponent("stubborn.pid").path
+        let stubborn = fake("stubborn", "trap '' TERM\necho $$ > '\(pidFile)'\nwhile :; do sleep 1; done\n")
+        let holder = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: stubborn)) })
+        holder.onFinished = { _ in reported += 1 }
+        holder.start(request)
+        try? await Task.sleep(for: .milliseconds(500))
+        guard let text = try? String(contentsOfFile: pidFile, encoding: .utf8),
+              let stubbornPid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            preconditionFailure("the stubborn CLI did not start")
+        }
+        holder.cancel()
+        try? await Task.sleep(for: .milliseconds(Int(AskRunner.killGrace * 1000) + 1000))
+        precondition(kill(stubbornPid, 0) != 0, "a CLI that ignored SIGTERM outlived its question")
+        precondition(reported == 0)
+        // Cancelled in the same turn it started: no CLI is launched at all.
+        let marker = dir.appendingPathComponent("launched").path
+        let witness = fake("witness", "touch '\(marker)'\n")
+        let eager = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: witness)) })
+        eager.onFinished = { _ in reported += 1 }
+        eager.start(request)
+        eager.cancel()
+        try? await Task.sleep(for: .milliseconds(500))
+        precondition(reported == 0 && !FileManager.default.fileExists(atPath: marker), "a run cancelled before it began still ran")
+        // A token command that fails: no CLI is started, and the receipt says why.
+        guard case .unavailable(let reasons) = await run(ClaudeAccess.Settings(cli: good, oauthToken: .command(["/usr/bin/false"]))),
+              reasons.contains("OAuth token:") else { preconditionFailure("token command") }
+        precondition(ledger.recent()[0].run?.facts.detail == "token")
+        // What reached the screen stays off the log.
+        precondition(!logged.isEmpty && !logged.contains { $0.contains("SECRET") }, "\(logged)")
+        // Kept in memory only: still in the ledger, no longer in the log.
+        let quiet = logged.count
+        var memoryOnly = ClaudeAccess.Settings(cli: good)
+        memoryOnly.retention.receipts = .memory
+        _ = await run(memoryOnly)
+        precondition(logged.count == quiet && ledger.recent()[0].end == .answered && ledger.retention.receipts == .memory)
+        // A key command that exits but leaves a child holding its output
+        // open does not hang the question: the deadline answers.
+        let started = Date()
+        guard case .failure = await ClaudeRoutes.fetch(.command(["/bin/sh", "-c", "sleep 5 & echo \(token)"]), deadline: 1) else {
+            preconditionFailure("a held-open pipe was believed")
+        }
+        precondition(Date().timeIntervalSince(started) < 3, "the deadline did not answer")
+        guard case .success(token) = await ClaudeRoutes.fetch(.command(["/bin/echo", token])),
+              case .failure = await ClaudeRoutes.fetch(.command(["/nonexistent/key-command"])) else {
+            preconditionFailure("key commands")
+        }
+    }
+
+    /// Receipts, the ledger and its retention, and the settings that name it.
+    @MainActor static func checkAskReceipts() {
+        // Only the result line has facts; a detail that could carry words carries nothing.
+        precondition(Ask.Facts.ofResultLine(#"{"type":"assistant"}"#) == nil && Ask.Facts.ofResultLine("x") == nil)
+        let facts = Ask.Facts.ofResultLine(#"{"type":"result","subtype":"error_max_turns","num_turns":4,"usage":{"input_tokens":9,"output_tokens":1}}"#)
+        precondition(facts == Ask.Facts(detail: "error_max_turns", usage: Ask.Usage(input: 9, output: 1), turns: 4), "\(String(describing: facts))")
+        precondition(Ask.Facts(detail: "Not logged in").detail == nil && Ask.Facts(detail: "http-529").detail == "http-529")
+        precondition(Ask.Facts(detail: String(repeating: "a", count: 41)).detail == nil)
+        precondition(Ask.Usage(["input_tokens": 1]) == nil && Ask.Usage(nil) == nil)
+        // A receipt closes with counts, and renders without words.
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        var r = Ask.Receipt(id: "abcd1234", kind: .whatsUp, model: "m", effort: "low", started: t0)
+        r.run = Ask.CLIRun(seconds: 3.25, end: .answered, facts: Ask.Facts(detail: "success", usage: Ask.Usage(input: 1500, output: 100), turns: 2))
+        r.close(.answered(.workspaces(summaries: [.init(tag: "3", summary: "SECRET", reason: "r")], droppedUnknownTags: 2)), at: t0.addingTimeInterval(3.5))
+        precondition(r.end == .answered && r.named == 1 && r.dropped == 2 && r.tokens == 1600 && r.seconds == 3.5)
+        precondition(r.logLine == "ASK: id=abcd1234 kind=whats-up model=m effort=low end=answered seconds=3.5 named=1 dropped=2"
+                     + " cli=answered/success,3.2s,turns=2,tokens=1500+100,cache=0+0", r.logLine)
+        precondition(r.menuLine(clock: { _ in "21:40" }) == "21:40  whats-up  answered in 3.5 s · 1.6k tokens · 1 named",
+                     r.menuLine(clock: { _ in "21:40" }))
+        var timedOut = Ask.Receipt(id: "x", kind: .whereIs, model: "m", effort: "low", started: t0)
+        timedOut.close(.failed("no answer"), end: .timedOut, at: t0)
+        precondition(timedOut.end == .timedOut && timedOut.named == nil)
+        // The ledger keeps receipts for the policy's hours, at most `cap`, newest first.
+        var lines: [String] = []
+        let ledger = AskLedger(write: { lines.append($0) })
+        func receipt(_ id: String, _ at: Date) -> Ask.Receipt { Ask.Receipt(id: id, kind: .whereIs, model: "m", effort: "e", started: at) }
+        ledger.record(receipt("old", t0), under: nil, at: t0)
+        ledger.record(receipt("new", t0.addingTimeInterval(3600)), under: Ask.Retention(receipts: .log, hours: 1), at: t0.addingTimeInterval(3600))
+        precondition(ledger.recent(at: t0.addingTimeInterval(3600)).map(\.id) == ["new", "old"])
+        precondition(ledger.recent(at: t0.addingTimeInterval(3601)).map(\.id) == ["new"], "an hour's policy keeps an hour")
+        precondition(lines.count == 2)
+        ledger.record(receipt("hushed", t0.addingTimeInterval(3700)), under: Ask.Retention(receipts: .memory, hours: 1), at: t0.addingTimeInterval(3700))
+        precondition(lines.count == 2 && ledger.recent(at: t0.addingTimeInterval(3700)).first?.id == "hushed")
+        // Unreadable settings keep the last policy.
+        ledger.record(receipt("kept", t0.addingTimeInterval(3800)), under: nil, at: t0.addingTimeInterval(3800))
+        precondition(lines.count == 2 && ledger.retention.receipts == .memory)
+        for i in 0..<(AskLedger.cap + 10) { ledger.record(receipt("r\(i)", t0.addingTimeInterval(3900)), under: nil, at: t0.addingTimeInterval(3900)) }
+        precondition(ledger.recent(at: t0.addingTimeInterval(3900)).count == AskLedger.cap)
+        // claude.json's retention section: strict, like the rest of the file.
+        func parse(_ json: String) -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> { ClaudeAccess.parse(Data(json.utf8)) }
+        guard case .success(let none) = parse("{}"), none.retention == Ask.Retention(receipts: .log, hours: 24),
+              case .success(let mem) = parse(#"{"retention":{"receipts":"memory","hours":6}}"#),
+              mem.retention == Ask.Retention(receipts: .memory, hours: 6),
+              case .success(let half) = parse(#"{"retention":{"hours":168}}"#), half.retention.receipts == .log else {
+            preconditionFailure("retention settings")
+        }
+        for bad in [#"{"retention":{"receipts":"disk"}}"#, #"{"retention":{"hours":0}}"#, #"{"retention":{"hours":169}}"#,
+                    #"{"retention":{"hours":2.5}}"#, #"{"retention":{"hours":true}}"#, #"{"retention":{"keep":"all"}}"#,
+                    #"{"retention":"memory"}"#] {
+            guard case .failure = parse(bad) else { preconditionFailure("accepted \(bad)") }
+        }
+    }
 
     static func checkRecency() {
         let stamps: [String: UInt64] = ["b": 5, "d": 9]

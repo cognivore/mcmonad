@@ -1,6 +1,9 @@
 import AppKit
 import os
 
+// AI-assisted update (the "Questions to Claude" submenu, addAsks): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+
 /// The mcmonad-core menubar item.
 ///
 /// Displays:
@@ -29,6 +32,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     var snapshotProvider: (() -> OverlaySnapshot?)?
     /// The screen index's one-line status, read fresh on every open.
     var screenIndexStatus: (() -> String)?
+    /// The receipts of recent questions to Claude, newest first, and the
+    /// policy they are kept under.
+    var recentAsks: (() -> ([Ask.Receipt], Ask.Retention))?
     var whatsUpMonitoringEnabled: (() -> Bool)?
     var onSetWhatsUpMonitoring: ((Bool) -> Void)?
 
@@ -213,6 +219,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             row.isEnabled = false
             menu.addItem(row)
         }
+        if let (receipts, retention) = recentAsks?() {
+            addAsks(receipts, retention: retention, to: menu)
+        }
         menu.addItem(NSMenuItem.separator())
 
         // Fuzzy window search — opens the keyboard-driven dropdown.
@@ -281,6 +290,38 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     /// The daemon's own view of its grants and identity, read fresh every
     /// time the menu opens. Nothing in it prompts.
+    /// "Questions to Claude", with a row per receipt kept: when, which
+    /// feature, how it ended, how long, by which route, tokens, how many
+    /// windows or workspaces the answer named. Never what was asked.
+    private func addAsks(_ receipts: [Ask.Receipt], retention: Ask.Retention, to menu: NSMenu) {
+        let tokens = receipts.reduce(0) { $0 + $1.tokens }
+        let title = receipts.isEmpty
+            ? "Questions to Claude: none in \(retention.hours) h"
+            : "Questions to Claude: \(receipts.count) in \(retention.hours) h · \(tokens) tokens"
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        for receipt in receipts.prefix(40) {
+            let row = NSMenuItem(title: receipt.menuLine(clock: clock.string(from:)), action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            sub.addItem(row)
+        }
+        if receipts.count > 40 {
+            let more = NSMenuItem(title: "… \(receipts.count - 40) earlier", action: nil, keyEquivalent: "")
+            more.isEnabled = false
+            sub.addItem(more)
+        }
+        sub.addItem(NSMenuItem.separator())
+        let kept = NSMenuItem(title: retention.receipts == .log
+                                ? "Kept in memory and in mcmonad-core.log (ASK: lines)"
+                                : "Kept in memory only", action: nil, keyEquivalent: "")
+        kept.isEnabled = false
+        sub.addItem(kept)
+        item.submenu = sub
+        menu.addItem(item)
+    }
+
     private func addPermissions(to menu: NSMenu) {
         let lines = PermissionAudit.take()
         let missing = lines.contains { $0.ok == false }

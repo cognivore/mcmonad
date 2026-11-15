@@ -518,8 +518,15 @@ struct MCMonadCoreApp {
         let statusBar = StatusBarController()
         statusBar.setup()
 
+        // What is kept of questions to Claude once they are over: receipts
+        // with no text in them, under claude.json's retention policy.
+        let askLedger = AskLedger()
+        statusBar.recentAsks = { [weak askLedger] in
+            askLedger.map { ($0.recent(), $0.retention) } ?? ([], Ask.Retention())
+        }
+
         // Spotlight launcher (command runner + app launcher + window search)
-        let spotlight = SpotlightController()
+        let spotlight = SpotlightController(askLedger: askLedger)
 
         // Menu-bar countdown timer widget, driven by the Spotlight launcher.
         let timerController = TimerController()
@@ -556,7 +563,8 @@ struct MCMonadCoreApp {
         let whatsUpCache = WhatsUpCache(
             text: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.text },
             textHash: { [weak screenIndex] wid in screenIndex?.entry(for: wid)?.textHash },
-            quiet: { ScreenIndex.secondsSinceInput() >= ScreenIndex.idleAfter }
+            quiet: { ScreenIndex.secondsSinceInput() >= ScreenIndex.idleAfter },
+            runner: AskRunner(ledger: askLedger)
         )
         spotlight.whatsUpCache = whatsUpCache
         statusBar.whatsUpMonitoringEnabled = { [weak whatsUpCache] in whatsUpCache?.isEnabled ?? false }

@@ -38,6 +38,17 @@ final class AskRunner: AskRunning {
     /// the launcher gives a whole question 120 s.
     static let sdkDeadline: TimeInterval = 75
 
+    /// Where the settings come from and how the API is called: the real
+    /// ones, or a check's.
+    private let loadSettings: () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem>
+    private let callAPI: (Ask.Request, String) async -> Ask.Outcome
+
+    init(loadSettings: @escaping () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> = ClaudeRoutes.loadSettings,
+         callAPI: @escaping (Ask.Request, String) async -> Ask.Outcome = { await ClaudeRoutes.callAPI($0, key: $1) }) {
+        self.loadSettings = loadSettings
+        self.callAPI = callAPI
+    }
+
     /// A byte buffer one reader thread appends to; boxed so the sendable
     /// handlers may hold it.
     private final class Bytes: @unchecked Sendable {
@@ -60,7 +71,7 @@ final class AskRunner: AskRunning {
         task = Task { @MainActor [weak self] in
             guard let self else { return }
             let settings: ClaudeAccess.Settings
-            switch ClaudeRoutes.loadSettings() {
+            switch self.loadSettings() {
             case .failure(let problem): self.finish(.unavailable(problem.why), runID: runID); return
             case .success(let s): settings = s
             }
@@ -81,7 +92,7 @@ final class AskRunner: AskRunning {
                 let api: Ask.Outcome
                 switch await ClaudeRoutes.fetch(key) {
                 case .failure(let problem): api = .unavailable("API key: \(problem.why)")
-                case .success(let key): api = await ClaudeRoutes.callAPI(request, key: key)
+                case .success(let key): api = await self.callAPI(request, key)
                 }
                 guard self.runID == runID else { return }
                 if case .answered = api { Self.logger.info("ask: answered by the API") }
@@ -140,6 +151,7 @@ final class AskRunner: AskRunning {
     private func launch(cli: String, request: Ask.Request, environment: [String: String], cwd: URL, runID: UUID,
                         done: @escaping (Ask.Outcome?) -> Void) {
         sdkDone = done
+        sessionChecked = false
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cli)
@@ -175,9 +187,12 @@ final class AskRunner: AskRunning {
                         switch item {
                         case .delta(let text): self.onTranscript?(text)
                         case .note(let text): self.onNote?(text)
+                        case .session(let text):
+                            self.sessionChecked = true
+                            self.onNote?(text)
                         case .final(let outcome):
                             self.stopProcess()
-                            self.resolveSDK(outcome)
+                            self.resolveSDK(self.believed(outcome))
                         case .ignore: break
                         }
                     }
@@ -241,6 +256,19 @@ final class AskRunner: AskRunning {
 
     /// Where the SDK run in flight reports; called once, then cleared.
     private var sdkDone: ((Ask.Outcome?) -> Void)?
+    /// The run's `init` line came and showed the locked-down session.
+    private var sessionChecked = false
+
+    /// An answer counts only from a session that said what it was; one
+    /// that never did may have had tools, servers or settings.
+    private func believed(_ outcome: Ask.Outcome) -> Ask.Outcome {
+        switch outcome {
+        case .answered, .malformed:
+            return sessionChecked ? outcome : .failed("claude answered without describing its session; not believed")
+        case .failed, .unavailable:
+            return outcome
+        }
+    }
 
     private func resolveSDK(_ outcome: Ask.Outcome?) {
         guard let done = sdkDone else { return }

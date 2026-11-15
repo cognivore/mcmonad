@@ -221,6 +221,9 @@ enum Ask {
         /// A protocol event that is not content: shown as one dim line so a
         /// slow call is visibly alive (init, rate limit, message boundaries).
         case note(String)
+        /// The session's `init` line, checked to be the locked-down session
+        /// asked for; shown like a note. An answer is believed only after it.
+        case session(String)
         /// The final result line.
         case final(Outcome)
         /// A line that is not JSON.
@@ -247,13 +250,14 @@ enum Ask {
             return .note(eventType)
         case "system":
             let subtype = (obj["subtype"] as? String) ?? ""
-            if subtype == "init", obj["tools"] != nil, let why = ClaudeAccess.lockedDown(obj) {
+            if subtype == "init", let why = ClaudeAccess.lockedDown(obj) {
                 return .final(.failed("refused to use the answer: \(why)"))
             }
             let model = (obj["model"] as? String).map { " model=\($0)" } ?? ""
             let status = (obj["status"] as? String).map { " \($0)" } ?? ""
             let source = (obj["apiKeySource"] as? String).map { " key=\($0)" } ?? ""
-            return .note("system \(subtype)\(model)\(status)\(source)")
+            let text = "system \(subtype)\(model)\(status)\(source)"
+            return subtype == "init" ? .session(text) : .note(text)
         case "rate_limit_event":
             let status = ((obj["rate_limit_info"] as? [String: Any])?["status"] as? String)
                 ?? (obj["status"] as? String) ?? ""

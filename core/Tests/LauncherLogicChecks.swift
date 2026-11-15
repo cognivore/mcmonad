@@ -23,6 +23,7 @@ enum LauncherLogicChecks {
         checkWhatsUp()
         checkWhatsUpCache()
         await checkMonitoringPrivacy()
+        await checkAskRunner()
         checkRecency()
         checkOverlayScreenWire()
         checkWorkspaceWindowLookup()
@@ -221,7 +222,7 @@ enum LauncherLogicChecks {
         let initLine = #"{"type":"system","subtype":"init","model":"m","tools":["Read"],"mcp_servers":[],"permissionMode":"dontAsk"}"#
         guard case .final(.failed) = WhereIs.parseLine(initLine, known: []) else { preconditionFailure("a session with tools was believed") }
         let goodInit = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk","apiKeySource":"none"}"#
-        precondition(WhereIs.parseLine(goodInit, known: []) == .note("system init model=m key=none"))
+        precondition(WhereIs.parseLine(goodInit, known: []) == .session("system init model=m key=none"))
         // The API route: same model, effort, schema; refusals and errors kept apart.
         let request = Ask.Request(systemPrompt: "sys", schema: WhereIs.schemaJSON, prompt: "q",
                                   answer: { WhereIs.answer(from: $0, known: [7]) })
@@ -250,7 +251,11 @@ enum LauncherLogicChecks {
         precondition(WhereIs.parseLine(delta, known: known) == .delta("{\"matches\":["))
         let textDelta = #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#
         precondition(WhereIs.parseLine(textDelta, known: known) == .delta("hi"))
-        precondition(WhereIs.parseLine(#"{"type":"system","subtype":"init","model":"m"}"#, known: known) == .note("system init model=m"))
+        // An init line that does not say what the session has is not believed.
+        guard case .final(.failed) = WhereIs.parseLine(#"{"type":"system","subtype":"init","model":"m"}"#, known: known) else {
+            preconditionFailure("an init line without tools, servers or mode was believed")
+        }
+        precondition(WhereIs.parseLine(#"{"type":"system","subtype":"status","status":"ok"}"#, known: known) == .note("system status ok"))
         precondition(WhereIs.parseLine(#"{"type":"stream_event","event":{"type":"message_start"}}"#, known: known) == .note("message_start"))
         precondition(WhereIs.parseLine(#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#, known: known) == .note("rate_limit allowed"))
         precondition(WhereIs.parseLine(#"{"type":"assistant","message":{}}"#, known: known) == .note("assistant message"))
@@ -490,6 +495,66 @@ enum LauncherLogicChecks {
     }
 
     // MARK: RecentUse
+
+    /// The real runner against a fake `claude`: a shell script that prints
+    /// stream-json lines. No network, no real CLI.
+    @MainActor static func checkAskRunner() async {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mcmonad-ask-checks-\(UUID())")
+        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func fake(_ name: String, _ body: String) -> String {
+            let path = dir.appendingPathComponent(name).path
+            try! ("#!/bin/sh\ncat > /dev/null\n" + body).write(toFile: path, atomically: true, encoding: .utf8)
+            try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+            return path
+        }
+        let initLine = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk"}"#
+        let result = #"{"type":"result","is_error":false,"structured_output":{"matches":[{"id":7,"reason":"r"}]}}"#
+        let good = fake("good", "echo '\(initLine)'\necho '\(result)'\n")
+        let silent = fake("silent", "echo '\(result)'\n")
+        let broken = fake("broken", "exit 3\n")
+        let request = Ask.Request(systemPrompt: "s", schema: WhereIs.schemaJSON, prompt: "q",
+                                  answer: { WhereIs.answer(from: $0, known: [7]) })
+        let answered = Ask.Outcome.answered(.windows(matches: [.init(windowId: 7, reason: "r")], droppedUnknownIds: 0))
+        let token = String(repeating: "k", count: 40)
+        var apiKeys: [String] = []
+        func run(_ settings: ClaudeAccess.Settings) async -> Ask.Outcome {
+            let runner = AskRunner(loadSettings: { .success(settings) },
+                                   callAPI: { _, key in apiKeys.append(key); return answered })
+            return await withCheckedContinuation { done in
+                runner.onFinished = { done.resume(returning: $0) }
+                runner.start(request)
+            }
+        }
+        let first = await run(ClaudeAccess.Settings(cli: good))
+        precondition(first == answered, "\(first)")
+        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: silent)), why.contains("not believed") else {
+            preconditionFailure("an answer from a session that never described itself was believed")
+        }
+        precondition(apiKeys.isEmpty, "no API route without a key source")
+        // The SDK route fails; the API answers, with the key the command printed.
+        let fellBack = await run(ClaudeAccess.Settings(cli: broken, apiKey: .command(["/bin/echo", token])))
+        precondition(fellBack == answered, "\(fellBack)")
+        precondition(apiKeys == [token])
+        // An answer in the wrong shape is not asked again elsewhere.
+        let prose = fake("prose", "echo '\(initLine)'\necho '{\"type\":\"result\",\"is_error\":false,\"result\":\"prose\"}'\n")
+        guard case .malformed = await run(ClaudeAccess.Settings(cli: prose, apiKey: .command(["/bin/echo", token]))) else {
+            preconditionFailure("malformed")
+        }
+        precondition(apiKeys.count == 1)
+        // A cancelled run reports nothing, and a key command that fails says so.
+        let slow = fake("slow", "sleep 30\n")
+        let runner = AskRunner(loadSettings: { .success(ClaudeAccess.Settings(cli: slow)) }, callAPI: { _, _ in answered })
+        var reported = 0
+        runner.onFinished = { _ in reported += 1 }
+        runner.start(request)
+        try? await Task.sleep(for: .milliseconds(300))
+        runner.cancel()
+        try? await Task.sleep(for: .milliseconds(300))
+        precondition(reported == 0, "a cancelled run reported an outcome")
+        guard case .unavailable(let both) = await run(ClaudeAccess.Settings(cli: broken, apiKey: .command(["/usr/bin/false"]))),
+              both.contains("SDK:"), both.contains("API key:") else { preconditionFailure("both reasons") }
+    }
 
     static func checkRecency() {
         let stamps: [String: UInt64] = ["b": 5, "d": 9]

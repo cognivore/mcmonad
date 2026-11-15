@@ -71,7 +71,7 @@ enum WhatsUp {
 
     static func request(for manifold: Ask.Manifold) -> Ask.Request {
         let tags = manifold.tags
-        return Ask.Request(systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
+        return Ask.Request(kind: .whatsUp, systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
                            answer: { answer(from: $0, knownTags: tags) })
     }
 }

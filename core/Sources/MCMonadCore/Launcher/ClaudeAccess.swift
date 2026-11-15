@@ -28,11 +28,16 @@ import Foundation
 ///
 ///     { "sdk": { "cli": "/abs/path/claude",
 ///                "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
-///       "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] } }
+///       "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] },
+///       "retention": { "receipts": "log", "hours": 24 } }
 ///
 /// (`oauthTokenFile` / `keyFile` name owner-only files instead.) Without
 /// the file the SDK route uses the CLI's own login and there is no API
 /// route; a file that is not this shape is an error, never ignored.
+/// `retention` is what is kept of questions once they are over
+/// (`Ask.Retention`): receipts in memory for `hours` (1 to 168), and with
+/// `"log"` also one line each in mcmonad-core.log; `"memory"` keeps them
+/// out of the log.
 enum ClaudeAccess {
     /// Why a route or a secret is not usable, in words for the transcript.
     /// Never carries a secret's text.
@@ -53,6 +58,7 @@ enum ClaudeAccess {
         var cli: String?
         var oauthToken: Secret?
         var apiKey: Secret?
+        var retention = Ask.Retention()
     }
 
     static func settingsPath(home: String) -> String { home + "/.config/mcmonad/claude.json" }
@@ -62,7 +68,7 @@ enum ClaudeAccess {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .failure(Problem("not a JSON object"))
         }
-        for key in root.keys where key != "sdk" && key != "api" { return .failure(Problem("unknown key \"\(key)\"")) }
+        for key in root.keys where !["sdk", "api", "retention"].contains(key) { return .failure(Problem("unknown key \"\(key)\"")) }
         var settings = Settings()
         if let sdk = root["sdk"] {
             guard let sdk = sdk as? [String: Any] else { return .failure(Problem("\"sdk\" is not an object")) }
@@ -90,7 +96,36 @@ enum ClaudeAccess {
                 settings.apiKey = s
             }
         }
+        if let retention = root["retention"] {
+            switch parseRetention(retention) {
+            case .failure(let problem): return .failure(problem)
+            case .success(let r): settings.retention = r
+            }
+        }
         return .success(settings)
+    }
+
+    private static func parseRetention(_ value: Any) -> Result<Ask.Retention, Problem> {
+        guard let o = value as? [String: Any] else { return .failure(Problem("\"retention\" is not an object")) }
+        for key in o.keys where !["receipts", "hours"].contains(key) {
+            return .failure(Problem("unknown key \"retention.\(key)\""))
+        }
+        var retention = Ask.Retention()
+        if let v = o["receipts"] {
+            guard let s = v as? String, let r = Ask.Retention.Receipts(rawValue: s) else {
+                return .failure(Problem("\"retention.receipts\" is neither \"memory\" nor \"log\""))
+            }
+            retention.receipts = r
+        }
+        if let v = o["hours"] {
+            // A JSON true is an NSNumber too; it is not a number of hours.
+            guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
+                  let hours = Int(exactly: n.doubleValue), Ask.Retention.hourRange.contains(hours) else {
+                return .failure(Problem("\"retention.hours\" is not a whole number from 1 to 168"))
+            }
+            retention.hours = hours
+        }
+        return .success(retention)
     }
 
     private static func secret(_ o: [String: Any], command: String, file: String, in section: String) -> Result<Secret?, Problem> {
@@ -193,6 +228,14 @@ enum ClaudeAccess {
             "fallbacks": "default",
         ]
         return try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+    }
+
+    /// What the API's reply says beyond its outcome: the HTTP status when
+    /// it is not 200, else why the model stopped, and the tokens it used.
+    static func apiFacts(status: Int, data: Data) -> Ask.Facts {
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        guard status == 200 else { return Ask.Facts(detail: "http-\(status)") }
+        return Ask.Facts(detail: obj?["stop_reason"] as? String, usage: Ask.Usage(obj?["usage"]), turns: 1)
     }
 
     /// The API's reply as an outcome. Only the kind of an error is kept:

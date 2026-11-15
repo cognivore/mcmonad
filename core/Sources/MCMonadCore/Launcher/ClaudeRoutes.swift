@@ -123,9 +123,10 @@ enum ClaudeRoutes {
 
     static let apiDeadline: TimeInterval = 60
 
-    /// One Messages API call for `request`, keyed by `key`.
-    static func callAPI(_ request: Ask.Request, key: String, session: URLSession = .shared) async -> Ask.Outcome {
-        guard let body = ClaudeAccess.apiBody(request) else { return .malformed("the schema is not JSON") }
+    /// One Messages API call for `request`, keyed by `key`: its outcome,
+    /// and what its receipt keeps of it.
+    static func callAPI(_ request: Ask.Request, key: String, session: URLSession = .shared) async -> (Ask.Outcome, Ask.Facts) {
+        guard let body = ClaudeAccess.apiBody(request) else { return (.malformed("the schema is not JSON"), Ask.Facts(detail: "schema")) }
         var http = URLRequest(url: ClaudeAccess.apiURL, timeoutInterval: apiDeadline)
         http.httpMethod = "POST"
         for (name, value) in ClaudeAccess.apiHeaders(key: key) { http.setValue(value, forHTTPHeaderField: name) }
@@ -133,9 +134,10 @@ enum ClaudeRoutes {
         do {
             let (data, response) = try await session.data(for: http)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return ClaudeAccess.apiOutcome(status: status, data: data, request: request)
+            return (ClaudeAccess.apiOutcome(status: status, data: data, request: request),
+                    ClaudeAccess.apiFacts(status: status, data: data))
         } catch {
-            return .failed("API call failed: \(error.localizedDescription)")
+            return (.failed("API call failed: \(error.localizedDescription)"), Ask.Facts(detail: "transport"))
         }
     }
 }

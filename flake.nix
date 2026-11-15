@@ -69,7 +69,9 @@
                 Sources/MCMonadCore/Display/ScreenRoleMap.swift \
                 Sources/MCMonadCore/Index/TextSearch.swift \
                 Sources/MCMonadCore/Launcher/RecentUse.swift \
+                Sources/MCMonadCore/LogTimestamp.swift \
                 Sources/MCMonadCore/Launcher/AskProtocol.swift \
+                Sources/MCMonadCore/Launcher/AskReceipts.swift \
                 Sources/MCMonadCore/Launcher/WhereIsProtocol.swift \
                 Sources/MCMonadCore/Launcher/WhatsUp.swift \
                 Sources/MCMonadCore/Launcher/ClaudeAccess.swift \

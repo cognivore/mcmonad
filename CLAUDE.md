@@ -283,7 +283,10 @@ collapsed every workspace after a rollback. So:
   locked-down `claude -p` first and to the Messages API only as its fallback,
   with a key from a command or an owner-only file named in
   `~/.config/mcmonad/claude.json`, never an environment variable
-  (`Launcher/ClaudeAccess.swift`).
+  (`Launcher/ClaudeAccess.swift`). What is kept of a question afterwards is a
+  receipt with no text field (`Launcher/AskReceipts.swift`): in memory, and
+  one `ASK:` log line unless claude.json's `retention.receipts` is
+  `"memory"`.
   (AI-assisted update of this paragraph: model claude-opus-5-5; reasoning
   effort unavailable, not exposed by the harness.)
 - No other explicit permissions needed.

@@ -1,7 +1,8 @@
 import Foundation
 
-// AI-assisted update (history in the manifold; the SDK and API routes): model
-// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (history in the manifold; the SDK and API routes; turn
+// ceilings and the request's kind): model claude-opus-5-5; reasoning effort
+// unavailable (not exposed by the harness).
 
 /// What every launcher question to the model shares — "where is …" and
 /// "what's up": describing every window to it (the manifold), calling the
@@ -52,6 +53,8 @@ enum Ask {
     /// the system prompt and schema it is asked under, and how its
     /// structured answer is read back.
     struct Request: Sendable {
+        /// Which feature asks: named in the question's receipt.
+        let kind: Kind
         let systemPrompt: String
         let schema: String
         let prompt: String

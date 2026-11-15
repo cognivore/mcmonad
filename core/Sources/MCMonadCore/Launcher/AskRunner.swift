@@ -1,16 +1,18 @@
 import Foundation
-import os
 
 // AI-assisted update (SDK route first, locked down like laptop-pool's workers;
-// the Messages API only as its fallback): model claude-opus-5-5; reasoning
-// effort unavailable (not exposed by the harness).
+// the Messages API only as its fallback; a receipt per question in the
+// ledger): model claude-opus-5-5; reasoning effort unavailable (not exposed
+// by the harness).
 
 /// Runs one launcher question to the model and ends in exactly one
 /// `Ask.Outcome`. The SDK route first — Claude Code headless (`claude -p`)
 /// on the user's own login, streaming its transcript back; the Messages API
 /// only when that route could not answer and a key source is configured
 /// (`ClaudeAccess`). The prompt goes in on stdin and no local session is
-/// persisted. This does not control the provider's retention.
+/// persisted. This does not control the provider's retention. Every
+/// question, answered or not, leaves a receipt in the `AskLedger`, which
+/// has no field for text.
 @MainActor
 protocol AskRunning: AnyObject {
     var onFinished: ((Ask.Outcome) -> Void)? { get set }
@@ -20,8 +22,6 @@ protocol AskRunning: AnyObject {
 
 @MainActor
 final class AskRunner: AskRunning {
-    private static let logger = Logger(subsystem: "com.mcmonad.core", category: "Ask")
-
     /// Text to append to the on-screen transcript, in order.
     var onTranscript: ((String) -> Void)?
     /// A protocol event worth a dim line in the transcript.
@@ -33,18 +33,25 @@ final class AskRunner: AskRunning {
     private var finished = false
     private var runID: UUID?
     private var task: Task<Void, Never>?
+    /// The receipt of the question in flight, and the retention its
+    /// settings named.
+    private var receipt: Ask.Receipt?
+    private var retention: Ask.Retention?
 
     /// The longest the SDK route may take before the API route is tried;
     /// the launcher gives a whole question 120 s.
     static let sdkDeadline: TimeInterval = 75
 
-    /// Where the settings come from and how the API is called: the real
-    /// ones, or a check's.
+    /// Where receipts go, where the settings come from and how the API is
+    /// called: the real ones, or a check's.
+    private let ledger: AskLedger
     private let loadSettings: () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem>
-    private let callAPI: (Ask.Request, String) async -> Ask.Outcome
+    private let callAPI: (Ask.Request, String) async -> (Ask.Outcome, Ask.Facts)
 
-    init(loadSettings: @escaping () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> = ClaudeRoutes.loadSettings,
-         callAPI: @escaping (Ask.Request, String) async -> Ask.Outcome = { await ClaudeRoutes.callAPI($0, key: $1) }) {
+    init(ledger: AskLedger,
+         loadSettings: @escaping () -> Result<ClaudeAccess.Settings, ClaudeAccess.Problem> = ClaudeRoutes.loadSettings,
+         callAPI: @escaping (Ask.Request, String) async -> (Ask.Outcome, Ask.Facts) = { await ClaudeRoutes.callAPI($0, key: $1) }) {
+        self.ledger = ledger
         self.loadSettings = loadSettings
         self.callAPI = callAPI
     }
@@ -72,10 +79,13 @@ final class AskRunner: AskRunning {
         let runID = UUID()
         self.runID = runID
         finished = false
+        receipt = Ask.Receipt(id: String(runID.uuidString.prefix(8)).lowercased(), kind: request.kind,
+                              model: Ask.model, effort: Ask.effort, started: Date())
+        retention = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.deadline) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.runID == runID, !self.finished else { return }
-                self.finish(.failed("no answer within \(Int(Self.deadline)) seconds"), runID: runID)
+                self.finish(.failed("no answer within \(Int(Self.deadline)) seconds"), runID: runID, end: .timedOut)
                 self.cancel()
             }
         }
@@ -87,28 +97,33 @@ final class AskRunner: AskRunning {
             case .failure(let problem): self.finish(.unavailable(problem.why), runID: runID); return
             case .success(let s): settings = s
             }
+            self.retention = settings.retention
+            let sdkStarted = Date()
             guard let sdk = await self.runSDK(request, settings: settings, runID: runID), self.runID == runID else { return }
-            switch sdk {
+            self.receipt?.legs.append(Ask.Leg(route: .sdk, seconds: Date().timeIntervalSince(sdkStarted),
+                                              end: sdk.timedOut ? .timedOut : Ask.End(sdk.outcome), facts: sdk.facts))
+            switch sdk.outcome {
             case .answered, .malformed:
                 // An answer, or one in the wrong shape: the model was
                 // reached, and asking again elsewhere would pay twice.
-                self.finish(sdk, runID: runID)
+                self.finish(sdk.outcome, runID: runID)
                 return
             case .unavailable(let why), .failed(let why):
                 guard let key = settings.apiKey else {
-                    self.finish(sdk, runID: runID)
+                    self.finish(sdk.outcome, runID: runID)
                     return
                 }
-                Self.logger.info("ask: SDK route did not answer; trying the API")
                 self.onNote?("SDK route did not answer (\(why.split(separator: "\n").first ?? "")); asking the API")
-                let api: Ask.Outcome
+                let apiStarted = Date()
+                let api: Ask.Outcome, facts: Ask.Facts
                 switch await ClaudeRoutes.fetch(key) {
-                case .failure(let problem): api = .unavailable("API key: \(problem.why)")
-                case .success(let key): api = await self.callAPI(request, key)
+                case .failure(let problem): (api, facts) = (.unavailable("API key: \(problem.why)"), Ask.Facts(detail: "key"))
+                case .success(let key): (api, facts) = await self.callAPI(request, key)
                 }
                 guard self.runID == runID else { return }
-                if case .answered = api { Self.logger.info("ask: answered by the API") }
-                self.finish(Self.both(sdk: sdk, api: api), runID: runID)
+                self.receipt?.legs.append(Ask.Leg(route: .api, seconds: Date().timeIntervalSince(apiStarted),
+                                                  end: Ask.End(api), facts: facts))
+                self.finish(Self.both(sdk: sdk.outcome, api: api), runID: runID)
             }
         }
     }
@@ -132,17 +147,29 @@ final class AskRunner: AskRunning {
 
     // MARK: - The SDK route
 
+    /// How the SDK route ended: its outcome, what its receipt keeps of it,
+    /// and whether its own deadline ended it.
+    private struct SDKResult {
+        let outcome: Ask.Outcome
+        let facts: Ask.Facts
+        var timedOut = false
+    }
+
     /// One run of the locked-down CLI; nil when cancelled.
-    private func runSDK(_ request: Ask.Request, settings: ClaudeAccess.Settings, runID: UUID) async -> Ask.Outcome? {
+    private func runSDK(_ request: Ask.Request, settings: ClaudeAccess.Settings, runID: UUID) async -> SDKResult? {
         guard let cli = settings.cli ?? Self.locateCLI() else {
             let looked = Ask.candidates(home: NSHomeDirectory(), path: ProcessInfo.processInfo.environment["PATH"])
-            return .unavailable("No claude CLI found. Looked in:\n" + looked.joined(separator: "\n"))
+            return SDKResult(outcome: .unavailable("No claude CLI found. Looked in:\n" + looked.joined(separator: "\n")),
+                             facts: Ask.Facts(detail: "no-cli"))
         }
-        guard FileManager.default.isExecutableFile(atPath: cli) else { return .unavailable("\(cli) is not executable") }
+        guard FileManager.default.isExecutableFile(atPath: cli) else {
+            return SDKResult(outcome: .unavailable("\(cli) is not executable"), facts: Ask.Facts(detail: "not-executable"))
+        }
         var token: String?
         if let secret = settings.oauthToken {
             switch await ClaudeRoutes.fetch(secret) {
-            case .failure(let problem): return .unavailable("OAuth token: \(problem.why)")
+            case .failure(let problem):
+                return SDKResult(outcome: .unavailable("OAuth token: \(problem.why)"), facts: Ask.Facts(detail: "token"))
             case .success(let t): token = t
             }
             guard self.runID == runID else { return nil }
@@ -154,7 +181,7 @@ final class AskRunner: AskRunning {
         // An empty private directory: nothing for the CLI to find around it.
         let cwd = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcmonad-ask", isDirectory: true)
         try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        return await withCheckedContinuation { (done: CheckedContinuation<Ask.Outcome?, Never>) in
+        return await withCheckedContinuation { (done: CheckedContinuation<SDKResult?, Never>) in
             launch(cli: cli, request: request, environment: environment, cwd: cwd, runID: runID) { done.resume(returning: $0) }
         }
     }
@@ -162,7 +189,7 @@ final class AskRunner: AskRunning {
     /// Starts the CLI and calls `done` exactly once: with its outcome, or
     /// nil when the run is cancelled.
     private func launch(cli: String, request: Ask.Request, environment: [String: String], cwd: URL, runID: UUID,
-                        done: @escaping (Ask.Outcome?) -> Void) {
+                        done: @escaping (SDKResult?) -> Void) {
         sdkDone = done
         sessionChecked = false
 
@@ -194,6 +221,8 @@ final class AskRunner: AskRunning {
                 buffer.data.removeSubrange(buffer.data.startIndex...nl)
                 guard let line = String(data: lineData, encoding: .utf8) else { continue }
                 let item = request.parseLine(line)
+                var facts: Ask.Facts?
+                if case .final = item { facts = Ask.Facts.ofResultLine(line) }
                 DispatchQueue.main.async { [weak self] in
                     MainActor.assumeIsolated {
                         guard let self, self.runID == runID, self.sdkDone != nil else { return }
@@ -205,7 +234,12 @@ final class AskRunner: AskRunning {
                             self.onNote?(text)
                         case .final(let outcome):
                             self.stopProcess()
-                            self.resolveSDK(self.believed(outcome))
+                            let believed = self.believed(outcome)
+                            // A final outcome from any line but the result
+                            // line is a session that was not the one asked for.
+                            let detail = believed != outcome ? "unchecked-session" : (facts == nil ? "refused-session" : facts?.detail)
+                            self.resolveSDK(SDKResult(outcome: believed, facts: Ask.Facts(detail: detail, usage: facts?.usage,
+                                                                                         turns: facts?.turns)))
                         case .ignore: break
                         }
                     }
@@ -231,8 +265,10 @@ final class AskRunner: AskRunning {
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     // A result line normally arrives before exit; if it did
                     // not, the exit status is the only evidence there is.
-                    self.resolveSDK(.failed((status == 0 ? "claude exited without a result line" : "claude exited with status \(status)")
-                        + (errText.isEmpty ? "" : "\n" + errText)))
+                    self.resolveSDK(SDKResult(
+                        outcome: .failed((status == 0 ? "claude exited without a result line" : "claude exited with status \(status)")
+                            + (errText.isEmpty ? "" : "\n" + errText)),
+                        facts: Ask.Facts(detail: status == 0 ? "no-result" : "exit-\(status)")))
                 }
             }
         }
@@ -240,11 +276,11 @@ final class AskRunner: AskRunning {
         do {
             try p.run()
         } catch {
-            resolveSDK(.unavailable("Could not start \(cli): \(error.localizedDescription)"))
+            resolveSDK(SDKResult(outcome: .unavailable("Could not start \(cli): \(error.localizedDescription)"),
+                                 facts: Ask.Facts(detail: "launch")))
             return
         }
         process = p
-        Self.logger.info("ask: \(Ask.model, privacy: .public) via the SDK route (\(cli, privacy: .public))")
 
         // No run may go on for ever. A CLI stuck on the network or on a
         // prompt of its own would otherwise hold what it was sent.
@@ -252,7 +288,8 @@ final class AskRunner: AskRunning {
             MainActor.assumeIsolated {
                 guard let self, self.runID == runID, self.sdkDone != nil else { return }
                 self.stopProcess()
-                self.resolveSDK(.failed("claude gave no answer within \(Int(Self.sdkDeadline)) seconds"))
+                self.resolveSDK(SDKResult(outcome: .failed("claude gave no answer within \(Int(Self.sdkDeadline)) seconds"),
+                                          facts: Ask.Facts(), timedOut: true))
             }
         }
 
@@ -268,7 +305,7 @@ final class AskRunner: AskRunning {
     }
 
     /// Where the SDK run in flight reports; called once, then cleared.
-    private var sdkDone: ((Ask.Outcome?) -> Void)?
+    private var sdkDone: ((SDKResult?) -> Void)?
     /// The run's `init` line came and showed the locked-down session.
     private var sessionChecked = false
 
@@ -283,14 +320,20 @@ final class AskRunner: AskRunning {
         }
     }
 
-    private func resolveSDK(_ outcome: Ask.Outcome?) {
+    private func resolveSDK(_ result: SDKResult?) {
         guard let done = sdkDone else { return }
         sdkDone = nil
-        done(outcome)
+        done(result)
     }
 
-    /// Stop a running call. No outcome is reported for a cancelled call.
+    /// Stop a running call. No outcome is reported for a cancelled call;
+    /// its receipt says it was cancelled.
     func cancel() {
+        if !finished, var open = receipt {
+            open.close(nil, end: .cancelled, at: Date())
+            ledger.record(open, under: retention)
+        }
+        receipt = nil
         runID = nil
         finished = true
         task?.cancel()
@@ -327,20 +370,17 @@ final class AskRunner: AskRunning {
         }
     }
 
-    private func finish(_ outcome: Ask.Outcome, runID: UUID) {
+    /// Ends the question: its receipt goes to the ledger (counts and
+    /// kinds only; the outcome's words can carry the model's words about
+    /// screen contents, which stay on screen), then `onFinished`.
+    private func finish(_ outcome: Ask.Outcome, runID: UUID, end: Ask.End? = nil) {
         guard self.runID == runID, !finished else { return }
         finished = true
-        // Only the kind is logged: the payloads can carry the model's words
-        // about screen contents, which stay on screen.
-        switch outcome {
-        case .answered(.windows(let m, let dropped)):
-            Self.logger.info("ask: \(m.count, privacy: .public) window(s), \(dropped, privacy: .public) dropped")
-        case .answered(.workspaces(let s, let dropped)):
-            Self.logger.info("ask: \(s.count, privacy: .public) workspace summaries, \(dropped, privacy: .public) dropped")
-        case .unavailable: Self.logger.error("ask: no route to the model")
-        case .failed: Self.logger.error("ask: the model call failed")
-        case .malformed: Self.logger.error("ask: answer was not in the schema")
+        if var closed = receipt {
+            closed.close(outcome, end: end, at: Date())
+            ledger.record(closed, under: retention)
         }
+        receipt = nil
         onFinished?(outcome)
     }
 }

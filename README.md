@@ -176,9 +176,9 @@ list on the clipboard; the same lines are logged as `PERMS:` at startup.
 commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.
 
-_AI-assisted update (the screen index's reading and history, and the routes to
-Claude, below): model claude-opus-5-5; reasoning effort unavailable (not
-exposed by the harness)._
+_AI-assisted update (the screen index's reading and history, the routes to
+Claude, and what is kept of questions, below): model claude-opus-5-5;
+reasoning effort unavailable (not exposed by the harness)._
 
 **Local window search can read inside windows.** mcmonad-core keeps an OCR index of
 every window it manages, displayed or parked on a hidden workspace: each is
@@ -243,8 +243,11 @@ the Mac (`claude -p`, the Agent SDK's engine, model `claude-fable-5-1` at low
 effort) on your own Claude login, locked down the way laptop-pool runs its
 workers — an environment allowlist (an `ANTHROPIC_API_KEY` the daemon happens
 to carry is not passed on), no tools, no MCP servers, no settings, no CLAUDE.md
-or memory, nothing to ask, no session written, an empty working directory —
-and its answer is believed only if the session says it was exactly that.
+or memory, nothing to ask, no session written, an empty working directory,
+at most 4 turns and 16,000 output tokens a turn —
+and its answer is believed only if the session says it was exactly that. A
+CLI still running when its question is answered, cancelled or out of time
+gets SIGTERM, then SIGKILL two seconds later: it holds the prompt.
 Every `@` in the prompt is escaped, so screen text cannot make the CLI attach
 a file. The CLI is looked for in `~/.local/bin`, `/opt/homebrew/bin`,
 `/usr/local/bin` and `PATH`. Only if that route cannot answer, and a key
@@ -255,13 +258,32 @@ the same model, effort and schema. Both are set in
 ```json
 { "sdk": { "cli": "/Users/you/.local/bin/claude",
            "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
-  "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] } }
+  "api": { "keyCommand": ["rageveil", "show", "anthropic/api-key"] },
+  "retention": { "receipts": "log", "hours": 24 } }
 ```
 
 `oauthTokenFile` and `keyFile` name owner-only files (`chmod 600`) instead of
 commands; a command runs with no input and its output must be one token. There
 is no API key in the environment or in the file itself, and without an `api`
 section there is no API route.
+
+**What is kept of a question once it is over** is a receipt, in
+mcmonad-core's memory, for `retention.hours` (1 to 168; 24 by default): which
+feature asked, which routes ran and how each ended (the CLI's result subtype,
+the API's HTTP status), how long it took, turns and tokens, and how many
+windows or workspaces the answer named. A receipt has no field for text: not
+the question, the screen text, the answer, or an error's words. The menu
+bar's **Questions to Claude** lists them. With `"receipts": "log"` (the
+default) each is also one line of `~/Library/Logs/mcmonad-core.log`:
+
+```
+ASK: id=3f2a91c0 kind=where-is model=claude-fable-5-1 effort=low end=answered seconds=6.3 named=2 dropped=0 sdk=answered/success,6.2s,turns=2,tokens=1312+208,cache=0+0
+```
+
+`"receipts": "memory"` keeps them out of the log. The question's text itself
+is held only for the call and, after it, only where the launcher shows it; no
+setting writes it anywhere. Dollars are not counted: on the SDK route the
+subscription carries the cost, so there is no dollar ceiling either.
 
 **"What's up" monitoring is off by default.** The mcmonad menu bar has a
 **What's up monitoring: Off/On — sends to Claude** switch. Turning it on

@@ -162,7 +162,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     private let appIndex = AppIndex()
     private let screenshotPicker = ScreenshotRegionPicker()
-    private let askRunner = AskRunner()
+    private let askRunner: AskRunner
     private var confirmingCloudSearch = false
     /// The question being asked / just answered: its words (for
     /// highlighting) and the manifold it was asked about (for row order).
@@ -254,6 +254,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         } else {
             show(mode: mode)
         }
+    }
+
+    /// Its questions' receipts go to `askLedger`.
+    init(askLedger: AskLedger) {
+        askRunner = AskRunner(ledger: askLedger)
+        super.init()
     }
 
     func show(mode: Mode) {

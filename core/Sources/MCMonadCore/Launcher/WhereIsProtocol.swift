@@ -103,7 +103,7 @@ enum WhereIs {
     /// the ids an answer may name.
     static func request(for manifold: Ask.Manifold) -> Ask.Request {
         let known = manifold.windowIds.union(manifold.closedIds)
-        return Ask.Request(systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
+        return Ask.Request(kind: .whereIs, systemPrompt: systemPrompt, schema: schemaJSON, prompt: Ask.prompt(for: manifold),
                            answer: { answer(from: $0, known: known) })
     }
 }

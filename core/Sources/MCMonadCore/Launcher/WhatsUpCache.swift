@@ -79,7 +79,7 @@ final class WhatsUpCache {
     var isRefreshing: Bool { !inFlight.isEmpty }
 
     init(text: @escaping (UInt32) -> String?, textHash: @escaping (UInt32) -> Int?, quiet: @escaping () -> Bool,
-         preferences: UserDefaults = .standard, runner: any AskRunning = AskRunner(),
+         preferences: UserDefaults = .standard, runner: any AskRunning,
          wait: @escaping (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }) {
         self.text = text
         self.textHash = textHash

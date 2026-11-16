@@ -20,12 +20,12 @@ jobs:
         run: nix build .#mcmonad
 
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16'
+          xcode-version: '26.4'
       - uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixpkgs-unstable

@@ -484,7 +484,7 @@ The `haskell/` directory contains ~5,500 lines of Haskell that wire xmonad's pur
 
 **`MCMonad.Layout`** provides `Tall`, `Full`, `Mirror`, and `Choose` (the `|||` combinator). These are pure geometric algorithms copied from xmonad: `tile`, `splitVertically`, `splitHorizontally`, `mirrorRect`. No I/O, no platform specifics. A `Tall 1 0.03 0.5` on macOS produces the exact same rectangle list as on X11 for the same input.
 
-**`MCMonad.ManageHook`** provides the `Query` monad over `WindowInfo` metadata and the standard combinators: `—>`, `=?`, `<&&>`, `<||>`, `composeAll`, `composeOne`, `doFloat`, `doShift`, `doIgnore`. Predicates include `title`, `appName`, `bundleId`, `isDialog`, `isFixedSize`, `hasCloseButton`, `hasFullscreenButton`. The `defaultManageHook` floats dialogs, fixed-size windows, and windows without a fullscreen button.
+**`MCMonad.ManageHook`** provides the `Query` monad over `WindowInfo` metadata and the standard combinators: `—>`, `=?`, `<&&>`, `<||>`, `composeAll`, `composeOne`, `doFloat`, `doFloatNative`, `doShift`, `doIgnore`. Predicates include `title`, `appName`, `bundleId`, `isDialog`, `isFixedSize`, `hasCloseButton`, `hasFullscreenButton`. The `defaultManageHook` floats dialogs, fixed-size windows, and windows without a fullscreen button, each at the position and size its application chose (`doFloatNative`); `doFloat` makes a window fill its screen.
 
 **`MCMonad.Config`** defines the configuration record (same fields as xmonad's `XConfig`: `terminal`, `layoutHook`, `manageHook`, `modMask`, `keys`, `borderWidth`, `focusFollowsMouse`, `logHook`, `startupHook`) and the default keybindings, which follow xmonad conventions exactly.
 

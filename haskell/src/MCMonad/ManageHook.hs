@@ -156,12 +156,10 @@ hasFullscreenButton = Query $ asks wiHasFullscreenButton
 -- ---------------------------------------------------------------------------
 -- Actions
 
--- | Float the window at its current frame position. Converts the window's
--- absolute frame to a 'W.RationalRect' relative to the screen.
---
--- Note: since we don't know the screen geometry at manage-hook time, we
--- store a unit RationalRect (0, 0, 1, 1) and let 'Operations.windows'
--- resolve it. A more precise version would require screen info in the Query.
+-- | Float the window over its whole screen: the stored rectangle is the
+-- unit 'W.RationalRect' (0, 0, 1, 1), which 'Operations.windows' resolves
+-- against the screen and writes on every layout pass. To float a window
+-- where its application put it, use 'doFloatNative'.
 doFloat :: ManageHook
 doFloat = Query $ do
     wi <- ask
@@ -205,10 +203,14 @@ doFloatNative = Query $ do
 
 -- | Default window classification heuristics, derived from OmniWM's
 -- WindowDecisionKernel. Dialogs, fixed-size windows, and windows without
--- a fullscreen button are floated.
+-- a fullscreen button are floated where the application put them, at the
+-- size it chose ('doFloatNative'). 'doFloat' would ask each of them to
+-- fill the screen: a picture-in-picture popup grew to cover every tiled
+-- window, and a resize by its own edges was undone on the next focus
+-- change.
 defaultManageHook :: ManageHook
 defaultManageHook = composeAll
-    [ isDialog                          --> doFloat
-    , isFixedSize                       --> doFloat
-    , fmap not hasFullscreenButton      --> doFloat
+    [ isDialog                          --> doFloatNative
+    , isFixedSize                       --> doFloatNative
+    , fmap not hasFullscreenButton      --> doFloatNative
     ]

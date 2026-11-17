@@ -1,13 +1,17 @@
 import Foundation
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (a receipt keeps every CLI run, Codex and Claude):
+// model claude-opus-5-5; reasoning effort unavailable (not exposed by the
+// harness).
 
 /// What mcmonad keeps of each launcher question once it is over, and for
 /// how long: its own ledger, kept the way laptop-pool keeps job receipts
 /// but under a local retention policy.
 ///
-/// A receipt says which feature asked, how the CLI run ended, how long it
-/// took, how many turns and tokens it used, and how many windows or
+/// A receipt says which feature asked, which CLIs it went to (Codex, then
+/// Claude if Codex gave no usable answer) and how each run ended, how long
+/// it took, how many turns and tokens it used, and how many windows or
 /// workspaces the answer named. It has no field for text: not the question,
 /// the screen text sent, the answer, or an error's words (which can quote
 /// any of them). The only strings are closed vocabularies: the CLI's result
@@ -100,22 +104,33 @@ extension Ask {
         }
     }
 
-    /// The CLI's part in a question.
+    /// One CLI's part in a question.
     struct CLIRun: Equatable, Sendable {
+        let engine: Engine
         let seconds: Double
         let end: End
         let facts: Facts
+
+        /// "codex:gpt-6-astra:medium:answered/completed,6.2s,tokens=1312+208,cache=0+0"
+        var logField: String {
+            var field = "\(engine.rawValue):\(engine.model):\(engine.effort):\(end.rawValue)"
+            if let d = facts.detail { field += "/\(d)" }
+            field += ",\(Receipt.decimal(seconds))s"
+            if let t = facts.turns { field += ",turns=\(t)" }
+            if let u = facts.usage {
+                field += ",tokens=\(u.input)+\(u.output),cache=\(u.cacheRead)+\(u.cacheWrite)"
+            }
+            return field
+        }
     }
 
     struct Receipt: Equatable, Sendable {
         let id: String
         let kind: Kind
-        let model: String
-        let effort: String
         let started: Date
-        /// Absent when the question ended before the CLI's route reported
-        /// (settings that cannot be read, a cancel).
-        var run: CLIRun?
+        /// The CLI runs, in order. Empty when the question ended before a
+        /// CLI's route reported (settings that cannot be read, a cancel).
+        var runs: [CLIRun] = []
         var end: End = .cancelled
         var seconds: Double = 0
         /// How many windows or workspaces the answer named, and how many
@@ -123,15 +138,13 @@ extension Ask {
         var named: Int?
         var dropped: Int?
 
-        init(id: String, kind: Kind, model: String, effort: String, started: Date) {
+        init(id: String, kind: Kind, started: Date) {
             self.id = id
             self.kind = kind
-            self.model = model
-            self.effort = effort
             self.started = started
         }
 
-        var tokens: Int { run?.facts.usage?.total ?? 0 }
+        var tokens: Int { runs.reduce(0) { $0 + ($1.facts.usage?.total ?? 0) } }
 
         /// Ends the receipt with `outcome` (or `end`, for a deadline or a
         /// cancel), `seconds` after it started.
@@ -147,32 +160,24 @@ extension Ask {
 
         /// One line of mcmonad-core.log.
         var logLine: String {
-            var line = "ASK: id=\(id) kind=\(kind.rawValue) model=\(model) effort=\(effort) end=\(end.rawValue)"
-                + " seconds=\(Self.decimal(seconds))"
+            var line = "ASK: id=\(id) kind=\(kind.rawValue) end=\(end.rawValue) seconds=\(Self.decimal(seconds))"
             if let named { line += " named=\(named)" }
             if let dropped { line += " dropped=\(dropped)" }
-            if let run {
-                line += " cli=\(run.end.rawValue)"
-                if let d = run.facts.detail { line += "/\(d)" }
-                line += ",\(Self.decimal(run.seconds))s"
-                if let t = run.facts.turns { line += ",turns=\(t)" }
-                if let u = run.facts.usage {
-                    line += ",tokens=\(u.input)+\(u.output),cache=\(u.cacheRead)+\(u.cacheWrite)"
-                }
-            }
+            for run in runs { line += " run=" + run.logField }
             return line
         }
 
         /// One row of the menu bar's list: "21:40  where-is  answered in
-        /// 6.3 s · 1.5k tokens · 2 named".
+        /// 6.3 s · 1.5k tokens · 2 named · codex → claude".
         func menuLine(clock: (Date) -> String) -> String {
             var parts = ["\(end.rawValue) in \(Self.decimal(seconds)) s"]
             if tokens > 0 { parts.append(tokens >= 1000 ? "\(Self.decimal(Double(tokens) / 1000))k tokens" : "\(tokens) tokens") }
             if let named { parts.append("\(named) named") }
+            if !runs.isEmpty { parts.append(runs.map(\.engine.rawValue).joined(separator: " → ")) }
             return "\(clock(started))  \(kind.rawValue)  " + parts.joined(separator: " · ")
         }
 
-        private static func decimal(_ x: Double) -> String { String(format: "%.1f", x) }
+        fileprivate static func decimal(_ x: Double) -> String { String(format: "%.1f", x) }
     }
 
     /// What mcmonad keeps of its questions, and where. Receipts stay in

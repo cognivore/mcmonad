@@ -76,6 +76,7 @@
                 Sources/MCMonadCore/Launcher/WhatsUp.swift \
                 Sources/MCMonadCore/Launcher/ClaudeAccess.swift \
                 Sources/MCMonadCore/Launcher/ClaudeRoutes.swift \
+                Sources/MCMonadCore/Launcher/CodexAccess.swift \
                 Sources/MCMonadCore/Launcher/AskRunner.swift \
                 Sources/MCMonadCore/Launcher/WhatsUpCache.swift \
                 Tests/LauncherLogicChecks.swift \

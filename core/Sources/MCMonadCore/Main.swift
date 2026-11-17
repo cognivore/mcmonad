@@ -451,7 +451,7 @@ struct MCMonadCoreApp {
 
         // Writing to a socket or pipe whose reader has gone raises SIGPIPE,
         // whose default action ends the process. The brain exiting between
-        // two events, or the claude CLI exiting before it has read its
+        // two events, or the model CLI exiting before it has read its
         // prompt, must surface as a failed write and nothing more.
         signal(SIGPIPE, SIG_IGN)
 
@@ -518,7 +518,7 @@ struct MCMonadCoreApp {
         let statusBar = StatusBarController()
         statusBar.setup()
 
-        // What is kept of questions to Claude once they are over: receipts
+        // What is kept of questions to the models once they are over: receipts
         // with no text in them, under claude.json's retention policy.
         let askLedger = AskLedger()
         statusBar.recentAsks = { [weak askLedger] in

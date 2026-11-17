@@ -54,7 +54,12 @@ final class WhatsUpCache {
     /// A summary needs far less of each window's text than a search does.
     static let textBudget = 40_000
     static let textPerWindow = 500
-    static let preferenceKey = "whatsUpMonitoringEnabled"
+    /// The opt-in, given under the disclosure that names OpenAI first
+    /// (AI-assisted update: model claude-opus-5-5; reasoning effort
+    /// unavailable, not exposed by the harness). The earlier key,
+    /// "whatsUpMonitoringEnabled", recorded consent to Anthropic alone and
+    /// is no longer read: monitoring stays off until the user opts in again.
+    static let preferenceKey = "whatsUpMonitoringEnabledOpenAI"
 
     private(set) var isEnabled: Bool
     private(set) var entries: [String: Entry] = [:]

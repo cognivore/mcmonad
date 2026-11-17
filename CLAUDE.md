@@ -279,14 +279,17 @@ collapsed every workspace after a rollback. So:
   one-off search or explicit menu-bar opt-in to What's up monitoring (off by
   default). Opting out cancels queued/in-flight monitoring and clears cached
   summaries; it cannot recall data already sent. Claude's local session
-  persistence flag is not a provider-retention guarantee. Questions go only to the
-  locked-down `claude -p` on the user's Claude login (an OAuth token may come
-  from a command or an owner-only file named in
-  `~/.config/mcmonad/claude.json`); there is no Messages API route
-  (`Launcher/ClaudeAccess.swift`). What is kept of a question afterwards is a
-  receipt with no text field (`Launcher/AskReceipts.swift`): in memory, and
-  one `ASK:` log line unless claude.json's `retention.receipts` is
-  `"memory"`.
+  persistence flag is not a provider-retention guarantee. Questions go first
+  to the locked-down `codex exec` (gpt-6-astra, medium effort) on the user's
+  ChatGPT login (`Launcher/CodexAccess.swift`), and only when it gives no
+  usable answer to the locked-down `claude -p` on the user's Claude login (an
+  OAuth token may come from a command or an owner-only file named in
+  `~/.config/mcmonad/claude.json`; `Launcher/ClaudeAccess.swift`). Both
+  consents name OpenAI first and Anthropic as fallback. There is no Messages
+  API route, OpenAI's or Anthropic's. What is kept of a question afterwards is
+  a receipt with no text field (`Launcher/AskReceipts.swift`) listing each CLI
+  run: in memory, and one `ASK:` log line unless claude.json's
+  `retention.receipts` is `"memory"`.
   (AI-assisted update of this paragraph: model claude-opus-5-5; reasoning
   effort unavailable, not exposed by the harness.)
 - No other explicit permissions needed.

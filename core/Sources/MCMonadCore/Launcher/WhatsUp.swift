@@ -39,7 +39,7 @@ enum WhatsUp {
     {"type":"object","properties":{"workspaces":{"type":"array","items":{"type":"object","properties":{"tag":{"type":"string"},"summary":{"type":"string"},"reason":{"type":"string"}},"required":["tag","summary","reason"],"additionalProperties":false}}},"required":["workspaces"],"additionalProperties":false}
     """#
 
-    static let arguments = Ask.arguments(schema: schemaJSON, systemPrompt: systemPrompt)
+    static let claudeArguments = Ask.arguments(schema: schemaJSON, systemPrompt: systemPrompt)
 
     struct Summary: Equatable {
         let tag: String

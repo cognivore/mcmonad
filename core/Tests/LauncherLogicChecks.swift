@@ -2,8 +2,9 @@
 // AskProtocol, WhereIsProtocol, WhatsUp, ClaudeAccess, Protocol) and run by
 // the Nix package checkPhase.
 //
-// AI-assisted update (history manifold, SDK/API route checks): model
-// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (history manifold, SDK/API route checks; Codex first,
+// Claude as fallback): model claude-opus-5-5; reasoning effort unavailable
+// (not exposed by the harness).
 import Foundation
 import CoreGraphics
 
@@ -18,6 +19,7 @@ enum LauncherLogicChecks {
         checkManifold()
         checkHistoryManifold()
         checkClaudeAccess()
+        checkCodexAccess()
         checkTitleEvent()
         checkStream()
         checkWhatsUp()
@@ -138,19 +140,28 @@ enum LauncherLogicChecks {
         precondition(prompt.hasPrefix("Where is: the deploy\n\nManifold:\n{\"current_workspace\":\"3\""), prompt)
         precondition(prompt.contains("\"on_screen\":true"))
         let request = WhereIs.request(for: m)
-        precondition(request.prompt == prompt && request.arguments == WhereIs.arguments)
+        let claude = WhereIs.claudeArguments
+        precondition(request.prompt == prompt && request.kind == .whereIs
+                     && claude == Ask.arguments(schema: request.schema, systemPrompt: request.systemPrompt))
         for flag in ["--no-session-persistence", "--json-schema", "--strict-mcp-config", "--setting-sources"] {
-            precondition(WhereIs.arguments.contains(flag), flag)
+            precondition(claude.contains(flag), flag)
         }
-        precondition(WhereIs.arguments.contains(WhereIs.systemPrompt))
-        let tools = WhereIs.arguments.firstIndex(of: "--tools")!, mode = WhereIs.arguments.firstIndex(of: "--permission-mode")!
-        precondition(WhereIs.arguments[tools + 1] == "" && WhereIs.arguments[mode + 1] == "dontAsk")
+        precondition(claude.contains(WhereIs.systemPrompt) && !claude.contains(prompt))
+        let tools = claude.firstIndex(of: "--tools")!, mode = claude.firstIndex(of: "--permission-mode")!
+        precondition(claude[tools + 1] == "" && claude[mode + 1] == "dontAsk")
         // A laptop-pool profile's turn ceiling; no dollar one on a subscription.
-        let turns = WhereIs.arguments.firstIndex(of: "--max-turns")!
-        precondition(WhereIs.arguments[turns + 1] == "4" && !WhereIs.arguments.contains("--max-budget-usd"))
+        let turns = claude.firstIndex(of: "--max-turns")!
+        precondition(claude[turns + 1] == "4" && !claude.contains("--max-budget-usd"))
+        let model = claude.firstIndex(of: "--model")!
+        precondition(claude[model + 1] == "claude-fable-5-1" && claude[model + 3] == "low")
         precondition(WhereIs.systemPrompt.contains("snippets") && WhereIs.systemPrompt.contains("Reconstruct"))
-        precondition(Ask.candidates(home: "/h", path: "/usr/bin:/opt/homebrew/bin")
-                     == ["/h/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
+        // Codex first, Claude when Codex gives no usable answer.
+        precondition(Ask.Engine.allCases == [.codex, .claude])
+        precondition(Ask.Engine.codex.model == "gpt-6-astra" && Ask.Engine.codex.effort == "medium" && Ask.Engine.codex.provider == "OpenAI")
+        precondition(Ask.candidates(.claude, home: "/h", user: "u", path: "/usr/bin:/opt/homebrew/bin")
+                     == ["/h/.local/bin/claude", "/h/.nix-profile/bin/claude", "/etc/profiles/per-user/u/bin/claude",
+                         "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"])
+        precondition(Ask.candidates(.codex, home: "/h", user: "u", path: nil).first == "/h/.local/bin/codex")
     }
 
     static func checkHistoryManifold() {
@@ -199,8 +210,10 @@ enum LauncherLogicChecks {
         precondition(parse(#"{"sdk":{"cli":"/x/claude","oauthTokenCommand":["rageveil","show","a/b"]}}"#)
                      == .success(ClaudeAccess.Settings(cli: "/x/claude", oauthToken: .command(["rageveil", "show", "a/b"]))))
         precondition(parse(#"{"sdk":{"oauthTokenFile":"~/.config/t"}}"#) == .success(ClaudeAccess.Settings(oauthToken: .file("~/.config/t"))))
+        precondition(parse(#"{"codex":{"cli":"/x/codex"}}"#) == .success(ClaudeAccess.Settings(codexCLI: "/x/codex")))
         // There is no API route, so no place for a key.
         for bad in ["[]", #"{"apiKey":"sk-ant-x"}"#, #"{"api":{"keyFile":"~/.config/k"}}"#, #"{"sdk":{"key":"sk-ant-naked"}}"#,
+                    #"{"codex":{"cli":"codex"}}"#, #"{"codex":{"apiKey":"sk-x"}}"#, #"{"codex":"/x/codex"}"#,
                     #"{"sdk":{"oauthTokenCommand":["a"],"oauthTokenFile":"/k"}}"#, #"{"sdk":{"cli":"claude"}}"#,
                     #"{"sdk":{"oauthTokenCommand":[]}}"#, #"{"sdk":{"oauthTokenFile":"relative"}}"#] {
             guard case .failure = parse(bad) else { preconditionFailure("accepted \(bad)") }
@@ -229,6 +242,72 @@ enum LauncherLogicChecks {
         guard case .final(.failed) = WhereIs.parseLine(initLine, known: []) else { preconditionFailure("a session with tools was believed") }
         let goodInit = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk","apiKeySource":"none"}"#
         precondition(WhereIs.parseLine(goodInit, known: []) == .session("system init model=m key=none"))
+    }
+
+    /// The Codex route's arguments, environment and stream, without Codex.
+    static func checkCodexAccess() {
+        let files = Ask.ContractFiles(schema: "/c/where-is.schema.json", instructions: "/c/where \"is\".md")
+        let args = CodexAccess.arguments(files: files, cwd: "/empty")
+        precondition(args.first == "exec" && args.last == "-", "the prompt goes on stdin")
+        for flag in ["--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"] {
+            precondition(args.contains(flag), flag)
+        }
+        func after(_ flag: String) -> [String] { args.indices.filter { args[$0] == flag }.map { args[$0 + 1] } }
+        precondition(after("--model") == ["gpt-6-astra"] && after("--sandbox") == ["read-only"] && after("--cd") == ["/empty"])
+        precondition(after("--output-schema") == [files.schema])
+        precondition(after("--config").contains(#"model_reasoning_effort="medium""#))
+        precondition(after("--config").contains(#"model_instructions_file="/c/where \"is\".md""#), "\(after("--config"))")
+        for feature in ["shell_tool", "unified_exec", "code_mode_host", "apps", "plugins", "multi_agent_v2", "memories", "hooks"] {
+            precondition(after("--disable").contains(feature), feature)
+        }
+        for setting in [#"history.persistence="none""#, #"web_search="disabled""#, "include_environment_context=false"] {
+            precondition(after("--config").contains(setting), setting)
+        }
+        // An allowlist: no API key, no other Codex home, no logging switches.
+        let env = CodexAccess.environment(inherited: ["OPENAI_API_KEY": "sk-naked", "CODEX_HOME": "/elsewhere", "RUST_LOG": "trace",
+                                                      "PATH": "/custom/bin", "LANG": "en_GB.UTF-8"], home: "/h", user: "u")
+        precondition(env["OPENAI_API_KEY"] == nil && env["CODEX_HOME"] == nil && env["RUST_LOG"] == nil)
+        precondition(env["HOME"] == "/h" && env["LANG"] == "en_GB.UTF-8" && env["PATH"]!.hasSuffix(":/custom/bin"))
+        // The stream: the turn's last agent message is the answer.
+        let request = Ask.Request(kind: .whereIs, systemPrompt: "s", schema: WhereIs.schemaJSON, prompt: "p",
+                                  answer: { WhereIs.answer(from: $0, known: [7]) })
+        var reader = request.reader(for: .codex)
+        func message(_ text: String) -> String {
+            let quoted = String(data: try! JSONSerialization.data(withJSONObject: [text], options: []), encoding: .utf8)!.dropFirst().dropLast()
+            return #"{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"# + quoted + "}}"
+        }
+        let done = #"{"type":"turn.completed","usage":{"input_tokens":9000,"cached_input_tokens":3000,"cache_write_input_tokens":5,"output_tokens":200,"reasoning_output_tokens":80}}"#
+        precondition(reader.read(#"{"type":"thread.started","thread_id":"t"}"#).item == .session("codex thread started"))
+        guard case .note(let warning) = reader.read(#"{"type":"item.completed","item":{"id":"e","type":"error","message":"Code Mode is unavailable\nmore"}}"#).item,
+              warning == "codex: Code Mode is unavailable" else { preconditionFailure("a Codex warning") }
+        precondition(reader.read(message("Looking.")).item == .delta("Looking."))
+        precondition(reader.read(message(#"{"matches":[{"id":7,"reason":"title"},{"id":99,"reason":"x"}]}"#)).item
+                     == .delta(#"{"matches":[{"id":7,"reason":"title"},{"id":99,"reason":"x"}]}"#))
+        let end = reader.read(done)
+        precondition(end.item == .final(.answered(.windows(matches: [.init(windowId: 7, reason: "title")], droppedUnknownIds: 1))))
+        precondition(end.facts == Ask.Facts(detail: "completed", usage: Ask.Usage(input: 6000, output: 200, cacheRead: 3000, cacheWrite: 5)))
+        // A tool item ends the run there and then; its answer is refused.
+        for tool in ["command_execution", "mcp_tool_call", "collab_tool_call", "web_search", "file_change"] {
+            var r = request.reader(for: .codex)
+            let started = r.read(#"{"type":"item.started","item":{"id":"x","type":"\#(tool)"}}"#)
+            guard case .final(.failed(let why)) = started.item, why.contains(tool), started.facts == nil else {
+                preconditionFailure("a \(tool) item was not refused")
+            }
+        }
+        var prose = request.reader(for: .codex)
+        _ = prose.read(message("I cannot."))
+        guard case .final(.malformed) = prose.read(done).item else { preconditionFailure("prose was believed") }
+        var empty = request.reader(for: .codex)
+        guard case .final(.malformed) = empty.read(done).item else { preconditionFailure("an empty turn") }
+        var failed = request.reader(for: .codex)
+        let turnFailed = failed.read(#"{"type":"turn.failed","error":{"message":"usage limit"}}"#)
+        precondition(turnFailed.item == .final(.failed("usage limit")) && turnFailed.facts == Ask.Facts(detail: "turn-failed"))
+        precondition(CodexAccess.toml(#"a"b\c"#) == #""a\"b\\c""#)
+        // No CLI answered: every reason, the kind of the last that ran.
+        let both = Ask.combined([(.codex, .failed("exit 1")), (.claude, .unavailable("no claude"))])
+        precondition(both == .failed("codex: exit 1\n\nclaude: no claude"), "\(both)")
+        precondition(Ask.combined([(.codex, .unavailable("a")), (.claude, .unavailable("b"))]) == .unavailable("codex: a\n\nclaude: b"))
+        precondition(Ask.combined([(.codex, .malformed("m"))]) == .malformed("m"))
     }
 
     static func checkStream() {
@@ -291,7 +370,7 @@ enum LauncherLogicChecks {
             precondition(!WhatsUp.matches(text), text)
         }
         precondition(WhatsUp.systemPrompt.contains("caveman"))
-        precondition(WhatsUp.arguments.contains(WhatsUp.schemaJSON))
+        precondition(WhatsUp.claudeArguments.contains(WhatsUp.schemaJSON))
         let tags: Set<String> = ["3", "o5"]
         let ok = #"{"type":"result","is_error":false,"structured_output":{"workspaces":[{"tag":"3","summary":"Deploy work.","reason":"title 'deploy notes'"},{"tag":"3","summary":"dup","reason":"dup"},{"tag":"zz","summary":"invented","reason":"none"},{"tag":"o5","summary":"Cats.","reason":"title 'cat videos'"},{"tag":"o5"}]}}"#
         precondition(WhatsUp.parseLine(ok, knownTags: tags) == .final(.answered(.workspaces(
@@ -491,8 +570,8 @@ enum LauncherLogicChecks {
 
     // MARK: RecentUse
 
-    /// The real runner against a fake `claude`: a shell script that prints
-    /// stream-json lines. No network, no real CLI.
+    /// The real runner against a fake `codex` and a fake `claude`: shell
+    /// scripts that print their CLI's stream. No network, no real CLI.
     @MainActor static func checkAskRunner() async {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mcmonad-ask-checks-\(UUID())")
         try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -503,11 +582,34 @@ enum LauncherLogicChecks {
             try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
             return path
         }
+        func exists(_ path: String) -> Bool { FileManager.default.fileExists(atPath: path) }
         let initLine = #"{"type":"system","subtype":"init","model":"m","tools":["StructuredOutput"],"mcp_servers":[],"permissionMode":"dontAsk"}"#
         let result = #"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"usage":{"input_tokens":1300,"output_tokens":200,"cache_read_input_tokens":5},"structured_output":{"matches":[{"id":7,"reason":"SECRET-REASON"}]}}"#
         let good = fake("good", "echo '\(initLine)'\necho '\(result)'\n")
         let silent = fake("silent", "echo '\(result)'\n")
         let broken = fake("broken", "echo SECRET-STDERR >&2\nexit 3\n")
+        let claudeRan = dir.appendingPathComponent("claude-ran").path
+        let claudeWitness = fake("claude-witness", "touch '\(claudeRan)'\necho '\(initLine)'\necho '\(result)'\n")
+        // Codex: its schema file must hold the contract; it saves its
+        // arguments, which must not hold the prompt.
+        let codexArgs = dir.appendingPathComponent("codex-args").path
+        let codexLines = [#"{"type":"thread.started","thread_id":"t"}"#,
+                          #"{"type":"item.completed","item":{"id":"e","type":"error","message":"Code Mode is unavailable"}}"#,
+                          #"{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"{\"matches\":[{\"id\":7,\"reason\":\"SECRET-REASON\"}]}"}}"#,
+                          #"{"type":"turn.completed","usage":{"input_tokens":1300,"cached_input_tokens":300,"output_tokens":200}}"#]
+        let codexGood = fake("codex-good", """
+            printf '%s\\n' "$@" > '\(codexArgs)'
+            prev=""; for a in "$@"; do if [ "$prev" = "--output-schema" ]; then grep -q matches "$a" || exit 9; fi; prev="$a"; done
+            \(codexLines.map { "printf '%s\\n' '\($0)'" }.joined(separator: "\n"))
+
+            """)
+        let codexBroken = fake("codex-broken", "echo SECRET-CODEX-STDERR >&2\nexit 1\n")
+        let codexTool = fake("codex-tool", """
+            printf '%s\\n' '{"type":"thread.started","thread_id":"t"}'
+            printf '%s\\n' '{"type":"item.started","item":{"id":"c","type":"command_execution","command":"cat ~/x"}}'
+            sleep 30
+
+            """)
         // Screen text in the prompt, the model's words in the answer, an
         // error's words on stderr: none of them may reach a log line.
         let request = Ask.Request(kind: .whereIs, systemPrompt: "s", schema: WhereIs.schemaJSON, prompt: "SECRET-SCREEN-TEXT",
@@ -523,30 +625,55 @@ enum LauncherLogicChecks {
                 runner.start(request)
             }
         }
-        let first = await run(ClaudeAccess.Settings(cli: good))
+        func engines() -> [Ask.Engine] { ledger.recent()[0].runs.map(\.engine) }
+        // Codex answers: Claude is never started.
+        let first = await run(ClaudeAccess.Settings(cli: claudeWitness, codexCLI: codexGood))
         precondition(first == answered, "\(first)")
-        // Its receipt: the route, how it ended, turns and tokens, how many
-        // windows the answer named.
+        precondition(!exists(claudeRan), "Claude was asked after Codex answered")
         let receipt = ledger.recent()[0]
         precondition(receipt.kind == .whereIs && receipt.end == .answered && receipt.named == 1 && receipt.dropped == 0)
-        precondition(receipt.run?.end == .answered)
-        precondition(receipt.run?.facts == Ask.Facts(detail: "success", usage: Ask.Usage(input: 1300, output: 200, cacheRead: 5), turns: 2))
-        precondition(logged.count == 1 && logged[0].hasPrefix("ASK: id=\(receipt.id) kind=where-is model=\(Ask.model)")
-                     && logged[0].contains(" end=answered ") && logged[0].contains(" cli=answered/success,")
-                     && logged[0].contains(",turns=2,tokens=1300+200,cache=5+0"), logged[0])
-        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: silent)), why.contains("not believed") else {
+        precondition(receipt.runs.count == 1 && receipt.runs[0].engine == .codex && receipt.runs[0].end == .answered)
+        precondition(receipt.runs[0].facts == Ask.Facts(detail: "completed", usage: Ask.Usage(input: 1000, output: 200, cacheRead: 300)),
+                     "\(receipt.runs[0].facts)")
+        precondition(logged.count == 1 && logged[0].hasPrefix("ASK: id=\(receipt.id) kind=where-is end=answered ")
+                     && logged[0].contains(" run=codex:gpt-6-astra:medium:answered/completed,")
+                     && logged[0].hasSuffix(",tokens=1000+200,cache=300+0"), logged[0])
+        let sentArgs = (try? String(contentsOfFile: codexArgs, encoding: .utf8)) ?? ""
+        precondition(sentArgs.contains("--ephemeral") && !sentArgs.contains("SECRET"), "the prompt reached Codex's arguments")
+        // Codex fails: Claude answers, and the receipt keeps both runs.
+        let fellBack = await run(ClaudeAccess.Settings(cli: good, codexCLI: codexBroken))
+        precondition(fellBack == answered, "\(fellBack)")
+        precondition(engines() == [.codex, .claude] && ledger.recent()[0].runs[0].end == .failed
+                     && ledger.recent()[0].runs[0].facts.detail == "exit-1" && ledger.recent()[0].runs[1].end == .answered)
+        precondition(logged.last!.contains(" run=codex:gpt-6-astra:medium:failed/exit-1,")
+                     && logged.last!.contains(" run=claude:claude-fable-5-1:low:answered/success,")
+                     && logged.last!.hasSuffix(",turns=2,tokens=1300+200,cache=5+0"), logged.last!)
+        // No Codex at all, or a Codex that reaches for a tool: Claude answers.
+        let noCodex = await run(ClaudeAccess.Settings(cli: good, codexCLI: dir.appendingPathComponent("none").path))
+        precondition(noCodex == answered, "\(noCodex)")
+        precondition(ledger.recent()[0].runs[0].facts.detail == "not-executable" && ledger.recent()[0].runs[0].end == .unavailable)
+        let refusing = Date()
+        let refused = await run(ClaudeAccess.Settings(cli: good, codexCLI: codexTool))
+        precondition(refused == answered, "\(refused)")
+        precondition(Date().timeIntervalSince(refusing) < 10, "a Codex that used a tool was left running")
+        precondition(ledger.recent()[0].runs[0].facts.detail == "refused-session" && ledger.recent()[0].runs[0].end == .failed)
+        // Neither answers: every reason on screen, only how in the receipt.
+        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: broken, codexCLI: codexBroken)),
+              why.contains("codex: codex exited with status 1"), why.contains("SECRET-CODEX-STDERR"),
+              why.contains("claude: claude exited with status 3"), why.contains("SECRET-STDERR") else {
+            preconditionFailure("two failed CLIs")
+        }
+        precondition(ledger.recent()[0].runs.map(\.facts.detail) == ["exit-1", "exit-3"] && ledger.recent()[0].end == .failed)
+        guard case .failed(let unbelieved) = await run(ClaudeAccess.Settings(cli: silent, codexCLI: codexBroken)),
+              unbelieved.contains("not believed") else {
             preconditionFailure("an answer from a session that never described itself was believed")
         }
-        // A CLI that fails says why, on screen; its receipt says only how.
-        guard case .failed(let why) = await run(ClaudeAccess.Settings(cli: broken)),
-              why.contains("status 3"), why.contains("SECRET-STDERR") else { preconditionFailure("a failed CLI") }
-        precondition(ledger.recent()[0].run?.end == .failed && ledger.recent()[0].run?.facts.detail == "exit-3")
         // An answer in the wrong shape.
         let prose = fake("prose", "echo '\(initLine)'\necho '{\"type\":\"result\",\"is_error\":false,\"result\":\"prose\"}'\n")
-        guard case .malformed = await run(ClaudeAccess.Settings(cli: prose)) else { preconditionFailure("malformed") }
-        // A cancelled run reports nothing, and a key command that fails says so.
+        guard case .malformed = await run(ClaudeAccess.Settings(cli: prose, codexCLI: codexBroken)) else { preconditionFailure("malformed") }
+        // A cancelled run reports nothing.
         let slow = fake("slow", "sleep 30\n")
-        let runner = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: slow)) })
+        let runner = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: claudeWitness, codexCLI: slow)) })
         var reported = 0
         runner.onFinished = { _ in reported += 1 }
         runner.start(request)
@@ -554,11 +681,11 @@ enum LauncherLogicChecks {
         runner.cancel()
         try? await Task.sleep(for: .milliseconds(300))
         precondition(reported == 0, "a cancelled run reported an outcome")
-        precondition(ledger.recent()[0].end == .cancelled, "a cancelled run left no receipt")
+        precondition(ledger.recent()[0].end == .cancelled && !exists(claudeRan), "a cancelled run left no receipt, or fell back")
         // A CLI that ignores SIGTERM is killed: it holds the prompt.
         let pidFile = dir.appendingPathComponent("stubborn.pid").path
         let stubborn = fake("stubborn", "trap '' TERM\necho $$ > '\(pidFile)'\nwhile :; do sleep 1; done\n")
-        let holder = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: stubborn)) })
+        let holder = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: claudeWitness, codexCLI: stubborn)) })
         holder.onFinished = { _ in reported += 1 }
         holder.start(request)
         try? await Task.sleep(for: .milliseconds(500))
@@ -573,21 +700,28 @@ enum LauncherLogicChecks {
         // Cancelled in the same turn it started: no CLI is launched at all.
         let marker = dir.appendingPathComponent("launched").path
         let witness = fake("witness", "touch '\(marker)'\n")
-        let eager = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: witness)) })
+        let eager = AskRunner(ledger: ledger, loadSettings: { .success(ClaudeAccess.Settings(cli: witness, codexCLI: witness)) })
         eager.onFinished = { _ in reported += 1 }
         eager.start(request)
         eager.cancel()
         try? await Task.sleep(for: .milliseconds(500))
-        precondition(reported == 0 && !FileManager.default.fileExists(atPath: marker), "a run cancelled before it began still ran")
-        // A token command that fails: no CLI is started, and the receipt says why.
-        guard case .unavailable(let reasons) = await run(ClaudeAccess.Settings(cli: good, oauthToken: .command(["/usr/bin/false"]))),
+        precondition(reported == 0 && !exists(marker), "a run cancelled before it began still ran")
+        // A token command that fails: Claude is not started, and the receipt says why.
+        guard case .failed(let reasons) = await run(ClaudeAccess.Settings(cli: claudeWitness, codexCLI: codexBroken,
+                                                                         oauthToken: .command(["/usr/bin/false"]))),
               reasons.contains("OAuth token:") else { preconditionFailure("token command") }
-        precondition(ledger.recent()[0].run?.facts.detail == "token")
-        // What reached the screen stays off the log.
+        precondition(ledger.recent()[0].runs.last?.facts.detail == "token" && !exists(claudeRan))
+        // What reached the screen stays off the log, and off the disk: the
+        // contract files hold the schema and system prompt only.
         precondition(!logged.isEmpty && !logged.contains { $0.contains("SECRET") }, "\(logged)")
+        let contract = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcmonad-ask-contract")
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: contract.path)) ?? [] {
+            let body = (try? String(contentsOf: contract.appendingPathComponent(name), encoding: .utf8)) ?? ""
+            precondition(!body.contains("SECRET"), "screen text reached \(name)")
+        }
         // Kept in memory only: still in the ledger, no longer in the log.
         let quiet = logged.count
-        var memoryOnly = ClaudeAccess.Settings(cli: good)
+        var memoryOnly = ClaudeAccess.Settings(cli: good, codexCLI: codexGood)
         memoryOnly.retention.receipts = .memory
         _ = await run(memoryOnly)
         precondition(logged.count == quiet && ledger.recent()[0].end == .answered && ledger.retention.receipts == .memory)
@@ -602,6 +736,9 @@ enum LauncherLogicChecks {
               case .failure = await ClaudeRoutes.fetch(.command(["/nonexistent/key-command"])) else {
             preconditionFailure("key commands")
         }
+        // Codex has the first 70 s, Claude what is left of 115.
+        precondition(AskRunner.cliDeadline(.codex, elapsed: 0) == 70 && AskRunner.cliDeadline(.claude, elapsed: 72) == 43)
+        precondition(AskRunner.cliDeadline(.codex, elapsed: 100) == 15 && AskRunner.cliDeadline(.claude, elapsed: 200) == 1)
     }
 
     /// Receipts, the ledger and its retention, and the settings that name it.
@@ -615,21 +752,24 @@ enum LauncherLogicChecks {
         precondition(Ask.Usage(["input_tokens": 1]) == nil && Ask.Usage(nil) == nil)
         // A receipt closes with counts, and renders without words.
         let t0 = Date(timeIntervalSince1970: 1_800_000_000)
-        var r = Ask.Receipt(id: "abcd1234", kind: .whatsUp, model: "m", effort: "low", started: t0)
-        r.run = Ask.CLIRun(seconds: 3.25, end: .answered, facts: Ask.Facts(detail: "success", usage: Ask.Usage(input: 1500, output: 100), turns: 2))
+        var r = Ask.Receipt(id: "abcd1234", kind: .whatsUp, started: t0)
+        r.runs = [Ask.CLIRun(engine: .codex, seconds: 0.4, end: .failed, facts: Ask.Facts(detail: "exit-1")),
+                  Ask.CLIRun(engine: .claude, seconds: 3.25, end: .answered,
+                             facts: Ask.Facts(detail: "success", usage: Ask.Usage(input: 1500, output: 100), turns: 2))]
         r.close(.answered(.workspaces(summaries: [.init(tag: "3", summary: "SECRET", reason: "r")], droppedUnknownTags: 2)), at: t0.addingTimeInterval(3.5))
         precondition(r.end == .answered && r.named == 1 && r.dropped == 2 && r.tokens == 1600 && r.seconds == 3.5)
-        precondition(r.logLine == "ASK: id=abcd1234 kind=whats-up model=m effort=low end=answered seconds=3.5 named=1 dropped=2"
-                     + " cli=answered/success,3.2s,turns=2,tokens=1500+100,cache=0+0", r.logLine)
-        precondition(r.menuLine(clock: { _ in "21:40" }) == "21:40  whats-up  answered in 3.5 s · 1.6k tokens · 1 named",
+        precondition(r.logLine == "ASK: id=abcd1234 kind=whats-up end=answered seconds=3.5 named=1 dropped=2"
+                     + " run=codex:gpt-6-astra:medium:failed/exit-1,0.4s"
+                     + " run=claude:claude-fable-5-1:low:answered/success,3.2s,turns=2,tokens=1500+100,cache=0+0", r.logLine)
+        precondition(r.menuLine(clock: { _ in "21:40" }) == "21:40  whats-up  answered in 3.5 s · 1.6k tokens · 1 named · codex → claude",
                      r.menuLine(clock: { _ in "21:40" }))
-        var timedOut = Ask.Receipt(id: "x", kind: .whereIs, model: "m", effort: "low", started: t0)
+        var timedOut = Ask.Receipt(id: "x", kind: .whereIs, started: t0)
         timedOut.close(.failed("no answer"), end: .timedOut, at: t0)
         precondition(timedOut.end == .timedOut && timedOut.named == nil)
         // The ledger keeps receipts for the policy's hours, at most `cap`, newest first.
         var lines: [String] = []
         let ledger = AskLedger(write: { lines.append($0) })
-        func receipt(_ id: String, _ at: Date) -> Ask.Receipt { Ask.Receipt(id: id, kind: .whereIs, model: "m", effort: "e", started: at) }
+        func receipt(_ id: String, _ at: Date) -> Ask.Receipt { Ask.Receipt(id: id, kind: .whereIs, started: at) }
         ledger.record(receipt("old", t0), under: nil, at: t0)
         ledger.record(receipt("new", t0.addingTimeInterval(3600)), under: Ask.Retention(receipts: .log, hours: 1), at: t0.addingTimeInterval(3600))
         precondition(ledger.recent(at: t0.addingTimeInterval(3600)).map(\.id) == ["new", "old"])

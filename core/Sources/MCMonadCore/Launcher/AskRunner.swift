@@ -1,18 +1,21 @@
 import Foundation
 
 // AI-assisted update (the SDK route, locked down like laptop-pool's workers;
-// a receipt per question in the ledger; no API route): model
-// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// a receipt per question in the ledger; no API route; Codex first, Claude
+// as fallback): model claude-opus-5-5; reasoning effort unavailable (not
+// exposed by the harness).
 
 /// Runs one launcher question to the model and ends in exactly one
-/// `Ask.Outcome`, by the one route there is: Claude Code headless
-/// (`claude -p`, the Agent SDK's engine) on the user's own Claude login,
-/// streaming its transcript back (`ClaudeAccess`). There is no Messages API
-/// route: its tokens cost money the subscription already covers. The
-/// prompt goes in on stdin and no local session is
-/// persisted. This does not control the provider's retention. Every
-/// question, answered or not, leaves a receipt in the `AskLedger`, which
-/// has no field for text.
+/// `Ask.Outcome`. It goes first to Codex (`codex exec`, the Codex SDK's
+/// engine, `CodexAccess`) on the user's ChatGPT login, and only when that
+/// gives no usable answer (no CLI, a failure, an answer out of shape, its
+/// deadline) to Claude Code headless (`claude -p`, the Agent SDK's engine,
+/// `ClaudeAccess`) on the user's Claude login. Each streams its transcript
+/// back. There is no Messages API route: its tokens cost money the
+/// subscriptions already cover. The prompt goes in on stdin and no local
+/// session is persisted. This does not control the providers' retention.
+/// Every question, answered or not, leaves a receipt in the `AskLedger`,
+/// which has no field for text.
 @MainActor
 protocol AskRunning: AnyObject {
     var onFinished: ((Ask.Outcome) -> Void)? { get set }
@@ -28,6 +31,8 @@ final class AskRunner: AskRunning {
     var onNote: ((String) -> Void)?
     /// Fires once per `start`, after which the runner is idle again.
     var onFinished: ((Ask.Outcome) -> Void)?
+    /// A CLI is about to start: which, where, and its arguments.
+    var onRoute: ((Ask.Engine, String, [String]) -> Void)?
 
     private var process: Process?
     private var finished = false
@@ -38,9 +43,17 @@ final class AskRunner: AskRunning {
     private var receipt: Ask.Receipt?
     private var retention: Ask.Retention?
 
-    /// The longest the CLI may run: just under the 120 s the launcher
-    /// gives a whole question, so the reason shown is the CLI's own.
-    static let sdkDeadline: TimeInterval = 115
+    /// The longest the CLIs may run between them: just under the 120 s
+    /// the launcher gives a whole question, so the reason shown is a CLI's
+    /// own. Codex may take `codexDeadline` of it; Claude has the rest.
+    static let cliBudget: TimeInterval = 115
+    static let codexDeadline: TimeInterval = 70
+
+    /// How long `engine` may run, `elapsed` seconds into the question.
+    static func cliDeadline(_ engine: Ask.Engine, elapsed: TimeInterval) -> TimeInterval {
+        let left = max(cliBudget - elapsed, 1)
+        return engine == .codex ? min(codexDeadline, left) : left
+    }
 
     /// Where receipts go and where the settings come from: the real ones,
     /// or a check's.
@@ -59,12 +72,15 @@ final class AskRunner: AskRunning {
         var data = Data()
     }
 
-    /// Locate the CLI when the settings do not name it; nil when no
-    /// candidate is an executable file.
-    static func locateCLI() -> String? {
+    /// Locate `engine`'s CLI when the settings do not name it; nil when
+    /// no candidate is an executable file.
+    static func locateCLI(_ engine: Ask.Engine) -> String? {
+        candidates(engine).first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static func candidates(_ engine: Ask.Engine) -> [String] {
         let env = ProcessInfo.processInfo.environment
-        return Ask.candidates(home: NSHomeDirectory(), path: env["PATH"])
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
+        return Ask.candidates(engine, home: NSHomeDirectory(), user: env["USER"] ?? NSUserName(), path: env["PATH"])
     }
 
     /// The longest a whole question may take, fetching the OAuth token
@@ -76,8 +92,8 @@ final class AskRunner: AskRunning {
         let runID = UUID()
         self.runID = runID
         finished = false
-        receipt = Ask.Receipt(id: String(runID.uuidString.prefix(8)).lowercased(), kind: request.kind,
-                              model: Ask.model, effort: Ask.effort, started: Date())
+        let started = Date()
+        receipt = Ask.Receipt(id: String(runID.uuidString.prefix(8)).lowercased(), kind: request.kind, started: started)
         retention = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.deadline) { [weak self] in
             MainActor.assumeIsolated {
@@ -95,65 +111,123 @@ final class AskRunner: AskRunning {
             case .success(let s): settings = s
             }
             self.retention = settings.retention
-            let sdkStarted = Date()
-            guard let sdk = await self.runSDK(request, settings: settings, runID: runID), self.runID == runID else { return }
-            self.receipt?.run = Ask.CLIRun(seconds: Date().timeIntervalSince(sdkStarted),
-                                           end: sdk.timedOut ? .timedOut : Ask.End(sdk.outcome), facts: sdk.facts)
-            self.finish(sdk.outcome, runID: runID)
+            var failures: [(Ask.Engine, Ask.Outcome)] = []
+            for engine in Ask.Engine.allCases {
+                let began = Date()
+                let deadline = Self.cliDeadline(engine, elapsed: began.timeIntervalSince(started))
+                guard let run = await self.runCLI(engine, request, settings: settings, deadline: deadline, runID: runID),
+                      self.runID == runID else { return }
+                self.receipt?.runs.append(Ask.CLIRun(engine: engine, seconds: Date().timeIntervalSince(began),
+                                                     end: run.timedOut ? .timedOut : Ask.End(run.outcome), facts: run.facts))
+                if case .answered = run.outcome {
+                    self.finish(run.outcome, runID: runID)
+                    return
+                }
+                failures.append((engine, run.outcome))
+                if engine != Ask.Engine.allCases.last {
+                    self.onTranscript?("\n\n✗ \(engine.rawValue): \(Ask.reason(run.outcome))\n\n")
+                }
+            }
+            self.finish(Ask.combined(failures), runID: runID)
         }
     }
 
-    // MARK: - The SDK route
+    // MARK: - The CLI routes
 
-    /// How the SDK route ended: its outcome, what its receipt keeps of it,
-    /// and whether its own deadline ended it.
-    private struct SDKResult {
+    /// How a CLI run ended: its outcome, what its receipt keeps of it, and
+    /// whether its own deadline ended it.
+    private struct CLIResult {
         let outcome: Ask.Outcome
         let facts: Ask.Facts
         var timedOut = false
     }
 
-    /// One run of the locked-down CLI; nil when cancelled.
-    private func runSDK(_ request: Ask.Request, settings: ClaudeAccess.Settings, runID: UUID) async -> SDKResult? {
-        guard let cli = settings.cli ?? Self.locateCLI() else {
-            let looked = Ask.candidates(home: NSHomeDirectory(), path: ProcessInfo.processInfo.environment["PATH"])
-            return SDKResult(outcome: .unavailable("No claude CLI found. Looked in:\n" + looked.joined(separator: "\n")),
+    /// One run of `engine`'s locked-down CLI; nil when cancelled.
+    private func runCLI(_ engine: Ask.Engine, _ request: Ask.Request, settings: ClaudeAccess.Settings,
+                        deadline: TimeInterval, runID: UUID) async -> CLIResult? {
+        guard let cli = (engine == .codex ? settings.codexCLI : settings.cli) ?? Self.locateCLI(engine) else {
+            return CLIResult(outcome: .unavailable("No \(engine.rawValue) CLI found. Looked in:\n"
+                                                   + Self.candidates(engine).joined(separator: "\n")),
                              facts: Ask.Facts(detail: "no-cli"))
         }
         guard FileManager.default.isExecutableFile(atPath: cli) else {
-            return SDKResult(outcome: .unavailable("\(cli) is not executable"), facts: Ask.Facts(detail: "not-executable"))
+            return CLIResult(outcome: .unavailable("\(cli) is not executable"), facts: Ask.Facts(detail: "not-executable"))
         }
-        var token: String?
-        if let secret = settings.oauthToken {
-            switch await ClaudeRoutes.fetch(secret) {
-            case .failure(let problem):
-                return SDKResult(outcome: .unavailable("OAuth token: \(problem.why)"), facts: Ask.Facts(detail: "token"))
-            case .success(let t): token = t
-            }
-            guard self.runID == runID else { return nil }
-        }
-        guard self.runID == runID else { return nil }
         let env = ProcessInfo.processInfo.environment
-        let environment = ClaudeAccess.cliEnvironment(inherited: env, home: NSHomeDirectory(),
-                                                      user: env["USER"] ?? NSUserName(), token: token)
+        let home = NSHomeDirectory(), user = env["USER"] ?? NSUserName()
         // An empty private directory: nothing for the CLI to find around it.
         let cwd = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcmonad-ask", isDirectory: true)
         try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        return await withCheckedContinuation { (done: CheckedContinuation<SDKResult?, Never>) in
-            launch(cli: cli, request: request, environment: environment, cwd: cwd, runID: runID) { done.resume(returning: $0) }
+        let environment: [String: String]
+        let arguments: [String]
+        switch engine {
+        case .codex:
+            guard let files = Self.writeContract(request) else {
+                return CLIResult(outcome: .unavailable("could not write Codex's schema and instructions files"),
+                                 facts: Ask.Facts(detail: "contract"))
+            }
+            environment = CodexAccess.environment(inherited: env, home: home, user: user)
+            arguments = CodexAccess.arguments(files: files, cwd: cwd.path)
+        case .claude:
+            var token: String?
+            if let secret = settings.oauthToken {
+                switch await ClaudeRoutes.fetch(secret) {
+                case .failure(let problem):
+                    return CLIResult(outcome: .unavailable("OAuth token: \(problem.why)"), facts: Ask.Facts(detail: "token"))
+                case .success(let t): token = t
+                }
+            }
+            environment = ClaudeAccess.cliEnvironment(inherited: env, home: home, user: user, token: token)
+            arguments = Ask.arguments(schema: request.schema, systemPrompt: request.systemPrompt)
         }
+        guard self.runID == runID else { return nil }
+        onRoute?(engine, cli, arguments)
+        return await withCheckedContinuation { (done: CheckedContinuation<CLIResult?, Never>) in
+            launch(engine, cli: cli, arguments: arguments, request: request, environment: environment, cwd: cwd,
+                   deadline: deadline, runID: runID) { done.resume(returning: $0) }
+        }
+    }
+
+    /// Where Codex reads `request`'s schema and system prompt: one pair of
+    /// files per feature in a private directory, rewritten before each
+    /// run. Fixed text, nothing of the screen. Nil when they cannot be
+    /// written.
+    static func writeContract(_ request: Ask.Request) -> Ask.ContractFiles? {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mcmonad-ask-contract", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let schema = dir.appendingPathComponent("\(request.kind.rawValue).schema.json")
+            let instructions = dir.appendingPathComponent("\(request.kind.rawValue).instructions.md")
+            try Data(request.schema.utf8).write(to: schema, options: .atomic)
+            try Data(request.systemPrompt.utf8).write(to: instructions, options: .atomic)
+            return Ask.ContractFiles(schema: schema.path, instructions: instructions.path)
+        } catch {
+            return nil
+        }
+    }
+
+    /// A stream reader, used by one reader thread at a time; boxed so the
+    /// sendable handlers may hold it.
+    private final class ReaderBox: @unchecked Sendable {
+        var reader: Ask.Reader
+        init(_ reader: Ask.Reader) { self.reader = reader }
     }
 
     /// Starts the CLI and calls `done` exactly once: with its outcome, or
     /// nil when the run is cancelled.
-    private func launch(cli: String, request: Ask.Request, environment: [String: String], cwd: URL, runID: UUID,
-                        done: @escaping (SDKResult?) -> Void) {
+    private func launch(_ engine: Ask.Engine, cli: String, arguments: [String], request: Ask.Request,
+                        environment: [String: String], cwd: URL, deadline: TimeInterval, runID: UUID,
+                        done: @escaping (CLIResult?) -> Void) {
         sdkDone = done
         sessionChecked = false
+        // Lines and timers of an earlier CLI in the same question (Codex,
+        // before Claude) can still be queued: they carry its launch.
+        let launch = UUID()
+        launchID = launch
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cli)
-        p.arguments = request.arguments
+        p.arguments = arguments
         p.currentDirectoryURL = cwd
         p.environment = environment
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
@@ -169,6 +243,7 @@ final class AskRunner: AskRunning {
         drained.enter()
         drained.enter()
         let buffer = Bytes()
+        let box = ReaderBox(request.reader(for: engine))
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
             // Empty read = EOF; unhook, or this handler spins until exit.
@@ -178,12 +253,10 @@ final class AskRunner: AskRunning {
                 let lineData = buffer.data.subdata(in: buffer.data.startIndex..<nl)
                 buffer.data.removeSubrange(buffer.data.startIndex...nl)
                 guard let line = String(data: lineData, encoding: .utf8) else { continue }
-                let item = request.parseLine(line)
-                var facts: Ask.Facts?
-                if case .final = item { facts = Ask.Facts.ofResultLine(line) }
+                let (item, facts) = box.reader.read(line)
                 DispatchQueue.main.async { [weak self] in
                     MainActor.assumeIsolated {
-                        guard let self, self.runID == runID, self.sdkDone != nil else { return }
+                        guard let self, self.runID == runID, self.launchID == launch, self.sdkDone != nil else { return }
                         switch item {
                         case .delta(let text): self.onTranscript?(text)
                         case .note(let text): self.onNote?(text)
@@ -196,7 +269,7 @@ final class AskRunner: AskRunning {
                             // A final outcome from any line but the result
                             // line is a session that was not the one asked for.
                             let detail = believed != outcome ? "unchecked-session" : (facts == nil ? "refused-session" : facts?.detail)
-                            self.resolveSDK(SDKResult(outcome: believed, facts: Ask.Facts(detail: detail, usage: facts?.usage,
+                            self.resolveSDK(CLIResult(outcome: believed, facts: Ask.Facts(detail: detail, usage: facts?.usage,
                                                                                          turns: facts?.turns)))
                         case .ignore: break
                         }
@@ -223,8 +296,8 @@ final class AskRunner: AskRunning {
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     // A result line normally arrives before exit; if it did
                     // not, the exit status is the only evidence there is.
-                    self.resolveSDK(SDKResult(
-                        outcome: .failed((status == 0 ? "claude exited without a result line" : "claude exited with status \(status)")
+                    self.resolveSDK(CLIResult(
+                        outcome: .failed((status == 0 ? "\(engine.rawValue) exited without a result" : "\(engine.rawValue) exited with status \(status)")
                             + (errText.isEmpty ? "" : "\n" + errText)),
                         facts: Ask.Facts(detail: status == 0 ? "no-result" : "exit-\(status)")))
                 }
@@ -234,7 +307,7 @@ final class AskRunner: AskRunning {
         do {
             try p.run()
         } catch {
-            resolveSDK(SDKResult(outcome: .unavailable("Could not start \(cli): \(error.localizedDescription)"),
+            resolveSDK(CLIResult(outcome: .unavailable("Could not start \(cli): \(error.localizedDescription)"),
                                  facts: Ask.Facts(detail: "launch")))
             return
         }
@@ -242,11 +315,11 @@ final class AskRunner: AskRunning {
 
         // No run may go on for ever. A CLI stuck on the network or on a
         // prompt of its own would otherwise hold what it was sent.
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.sdkDeadline) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + deadline) { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.runID == runID, self.sdkDone != nil else { return }
+                guard let self, self.runID == runID, self.launchID == launch, self.sdkDone != nil else { return }
                 self.stopProcess()
-                self.resolveSDK(SDKResult(outcome: .failed("claude gave no answer within \(Int(Self.sdkDeadline)) seconds"),
+                self.resolveSDK(CLIResult(outcome: .failed("\(engine.rawValue) gave no answer within \(Int(deadline)) seconds"),
                                           facts: Ask.Facts(), timedOut: true))
             }
         }
@@ -262,9 +335,12 @@ final class AskRunner: AskRunning {
         }
     }
 
-    /// Where the SDK run in flight reports; called once, then cleared.
-    private var sdkDone: ((SDKResult?) -> Void)?
-    /// The run's `init` line came and showed the locked-down session.
+    /// The CLI run in flight, among those of one question.
+    private var launchID: UUID?
+    /// Where the CLI run in flight reports; called once, then cleared.
+    private var sdkDone: ((CLIResult?) -> Void)?
+    /// The run's session line came: Claude's `init`, showing the
+    /// locked-down session; Codex's thread start.
     private var sessionChecked = false
 
     /// An answer counts only from a session that said what it was; one
@@ -272,13 +348,13 @@ final class AskRunner: AskRunning {
     private func believed(_ outcome: Ask.Outcome) -> Ask.Outcome {
         switch outcome {
         case .answered, .malformed:
-            return sessionChecked ? outcome : .failed("claude answered without describing its session; not believed")
+            return sessionChecked ? outcome : .failed("the CLI answered without describing its session; not believed")
         case .failed, .unavailable:
             return outcome
         }
     }
 
-    private func resolveSDK(_ result: SDKResult?) {
+    private func resolveSDK(_ result: CLIResult?) {
         guard let done = sdkDone else { return }
         sdkDone = nil
         done(result)

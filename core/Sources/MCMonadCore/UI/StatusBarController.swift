@@ -1,8 +1,9 @@
 import AppKit
 import os
 
-// AI-assisted update (the "Questions to Claude" submenu, addAsks): model
-// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (the "Questions to Claude" submenu, addAsks; Codex
+// first, Claude as fallback): model claude-opus-5-5; reasoning effort
+// unavailable (not exposed by the harness).
 
 /// The mcmonad-core menubar item.
 ///
@@ -32,7 +33,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     var snapshotProvider: (() -> OverlaySnapshot?)?
     /// The screen index's one-line status, read fresh on every open.
     var screenIndexStatus: (() -> String)?
-    /// The receipts of recent questions to Claude, newest first, and the
+    /// The receipts of recent questions to the models, newest first, and the
     /// policy they are kept under.
     var recentAsks: (() -> ([Ask.Receipt], Ask.Retention))?
     var whatsUpMonitoringEnabled: (() -> Bool)?
@@ -209,7 +210,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(header)
         let monitoring = whatsUpMonitoringEnabled?() ?? false
         let monitoringItem = NSMenuItem(
-            title: "What's up monitoring: \(monitoring ? "On" : "Off") — sends to Claude",
+            title: "What's up monitoring: \(monitoring ? "On" : "Off") — sends to OpenAI (Anthropic as fallback)",
             action: #selector(toggleWhatsUpMonitoring(_:)), keyEquivalent: "")
         monitoringItem.target = self
         monitoringItem.state = monitoring ? .on : .off
@@ -290,14 +291,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     /// The daemon's own view of its grants and identity, read fresh every
     /// time the menu opens. Nothing in it prompts.
-    /// "Questions to Claude", with a row per receipt kept: when, which
-    /// feature, how it ended, how long, by which route, tokens, how many
-    /// windows or workspaces the answer named. Never what was asked.
+    /// "Questions to models", with a row per receipt kept: when, which
+    /// feature, how it ended, how long, tokens, how many windows or
+    /// workspaces the answer named, and which CLIs it went to. Never what
+    /// was asked.
     private func addAsks(_ receipts: [Ask.Receipt], retention: Ask.Retention, to menu: NSMenu) {
         let tokens = receipts.reduce(0) { $0 + $1.tokens }
         let title = receipts.isEmpty
-            ? "Questions to Claude: none in \(retention.hours) h"
-            : "Questions to Claude: \(receipts.count) in \(retention.hours) h · \(tokens) tokens"
+            ? "Questions to models: none in \(retention.hours) h"
+            : "Questions to models: \(receipts.count) in \(retention.hours) h · \(tokens) tokens"
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         let sub = NSMenu()
         let clock = DateFormatter()
@@ -471,8 +473,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             return
         }
         let alert = NSAlert()
-        alert.messageText = "Enable background summaries with Claude?"
-        alert.informativeText = "While you are idle, mcmonad will send workspace names, app names, window titles and excerpts of recognised screen text to Anthropic through your Claude CLI. This includes covered windows and hidden workspaces. This choice is remembered. Turn it off here to stop future calls and clear summaries; data already sent cannot be recalled."
+        alert.messageText = "Enable background summaries with OpenAI?"
+        alert.informativeText = "While you are idle, mcmonad will send workspace names, app names, window titles and excerpts of recognised screen text to OpenAI through your Codex CLI, and, when Codex gives no answer, to Anthropic through your Claude CLI. This includes covered windows and hidden workspaces. This choice is remembered. Turn it off here to stop future calls and clear summaries; data already sent cannot be recalled."
         alert.addButton(withTitle: "Enable monitoring")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn { onSetWhatsUpMonitoring?(true) }

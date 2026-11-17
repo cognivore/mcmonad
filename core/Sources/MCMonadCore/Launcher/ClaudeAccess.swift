@@ -1,12 +1,16 @@
 import Foundation
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (Claude is the fallback; the settings name Codex's
+// CLI too): model claude-opus-5-5; reasoning effort unavailable (not
+// exposed by the harness).
 
 /// How a launcher question reaches Claude, and with which login. The pure
 /// half: reading the settings, and the locked-down CLI's arguments and
 /// environment. The effects are `ClaudeRoutes` and `AskRunner`.
 ///
-/// One route, the way laptop-pool runs its workers: Claude Code headless
+/// The fallback route, taken when Codex (`CodexAccess`) gives no usable
+/// answer, the way laptop-pool runs its workers: Claude Code headless
 /// (`claude -p`, the Agent SDK's engine) on the user's own Claude login.
 /// Its child gets an environment allowlist (an `ANTHROPIC_API_KEY` the
 /// daemon happens to carry is not passed on), no tools, no MCP servers, no
@@ -14,17 +18,20 @@ import Foundation
 /// line is checked for exactly that before any answer is believed. An
 /// OAuth token can be named (a command that prints it, or an owner-only
 /// file) when the CLI's own login discovery is not enough. There is no
-/// Messages API route: its tokens cost money the subscription covers.
+/// Messages API route, Anthropic's or OpenAI's: its tokens cost money the
+/// subscriptions cover.
 ///
 /// Settings: `~/.config/mcmonad/claude.json`, read at every question, all
 /// of it optional:
 ///
-///     { "sdk": { "cli": "/abs/path/claude",
+///     { "codex": { "cli": "/abs/path/codex" },
+///       "sdk": { "cli": "/abs/path/claude",
 ///                "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
 ///       "retention": { "receipts": "log", "hours": 24 } }
 ///
-/// (`oauthTokenFile` names an owner-only file instead.) Without the file
-/// the CLI uses its own login; a file that is not this shape is an error,
+/// (`oauthTokenFile` names an owner-only file instead.) `sdk` is Claude's
+/// section; its name predates Codex. Without the file each CLI is looked
+/// for in the usual places and uses its own login; a file that is not this shape is an error,
 /// never ignored. `retention` is what is kept of questions once they are
 /// over (`Ask.Retention`): receipts in memory for `hours` (1 to 168), and
 /// with `"log"` also one line each in mcmonad-core.log; `"memory"` keeps
@@ -46,7 +53,9 @@ enum ClaudeAccess {
     }
 
     struct Settings: Equatable, Sendable {
+        /// Claude's CLI.
         var cli: String?
+        var codexCLI: String?
         var oauthToken: Secret?
         var retention = Ask.Retention()
     }
@@ -58,8 +67,16 @@ enum ClaudeAccess {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .failure(Problem("not a JSON object"))
         }
-        for key in root.keys where !["sdk", "retention"].contains(key) { return .failure(Problem("unknown key \"\(key)\"")) }
+        for key in root.keys where !["codex", "sdk", "retention"].contains(key) { return .failure(Problem("unknown key \"\(key)\"")) }
         var settings = Settings()
+        if let codex = root["codex"] {
+            guard let codex = codex as? [String: Any] else { return .failure(Problem("\"codex\" is not an object")) }
+            for key in codex.keys where key != "cli" { return .failure(Problem("unknown key \"codex.\(key)\"")) }
+            if let cli = codex["cli"] {
+                guard let cli = cli as? String, cli.hasPrefix("/") else { return .failure(Problem("\"codex.cli\" is not an absolute path")) }
+                settings.codexCLI = cli
+            }
+        }
         if let sdk = root["sdk"] {
             guard let sdk = sdk as? [String: Any] else { return .failure(Problem("\"sdk\" is not an object")) }
             for key in sdk.keys where !["cli", "oauthTokenCommand", "oauthTokenFile"].contains(key) {

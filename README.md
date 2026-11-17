@@ -177,8 +177,8 @@ commands all sort by when you last focused or ran them; typing re-ranks by
 match, with recency breaking ties.
 
 _AI-assisted update (the screen index's reading and history, the routes to
-Claude, and what is kept of questions, below): model claude-opus-5-5;
-reasoning effort unavailable (not exposed by the harness)._
+Codex and Claude, and what is kept of questions, below): model
+claude-opus-5-5; reasoning effort unavailable (not exposed by the harness)._
 
 **Local window search can read inside windows.** mcmonad-core keeps an OCR index of
 every window it manages, displayed or parked on a hidden workspace: each is
@@ -217,11 +217,12 @@ The index keeps its readings in memory and does not write screenshots or OCR
 text to disk, logs or the Haskell socket. **Cloud features are a separate
 disclosure:** a confirmed search or opted-in monitoring sends window metadata
 and OCR excerpts (for a search, also lines from the day's history) through the
-installed Claude CLI. `--no-session-persistence`
-requests no local Claude session history; it does not establish provider
-retention. Ordinary window search stays local.
+installed Codex CLI to OpenAI, and, only when Codex gives no answer, through
+the installed Claude CLI to Anthropic. `--ephemeral` and
+`--no-session-persistence` keep both CLIs from writing a local session; they do
+not establish provider retention. Ordinary window search stays local.
 
-**"where is …" asks Claude.** Type or say `where is the deploy terminal`
+**"where is …" asks a model.** Type or say `where is the deploy terminal`
 (`where's`, `where are`, `where did I put` work too) in either mode and
 press Return, then confirm **Send this search**. Voice requests require the
 same confirmation. Cancel sends nothing. This approves one search and does
@@ -229,67 +230,90 @@ not enable background monitoring. The launcher hands the question, together with
 (workspace, app, title, focus, an excerpt of its recognised text, and from the
 day's history the lines and titles it had *earlier*, each with when it was
 seen — those matching the question first — and when you last worked in it)
-and the windows closed in the day, to Claude, and shows the whole exchange
-while it thinks: the exact command line, the prompt as sent, and the answer as
-it streams, over a muted spinner. The model is told the evidence is snippets
+and the windows closed in the day, to the model, and shows the whole exchange
+while it thinks: the prompt as sent, the exact command line of each CLI asked,
+and the answer as it comes, over a muted spinner. The model is told the evidence is snippets
 read rarely and mangled by OCR, and to reconstruct what each window was for
 before answering. The result is a list of windows with their workspace and
 the model's one-line reason, quoting fragments with their times, the
 question's words highlighted in it; Return focuses one, Esc goes back to the
 query. A closed window that answers it shows when it was closed and where.
 
-The question goes to the Claude Code CLI already on the Mac (`claude -p`, the
-Agent SDK's engine, model `claude-fable-5-1` at low effort) on your own Claude
-login, locked down the way laptop-pool runs its workers — an environment allowlist (an `ANTHROPIC_API_KEY` the daemon happens
-to carry is not passed on), no tools, no MCP servers, no settings, no CLAUDE.md
-or memory, nothing to ask, no session written, an empty working directory,
-at most 4 turns and 16,000 output tokens a turn —
-and its answer is believed only if the session says it was exactly that. A
-CLI still running when its question is answered, cancelled or out of time
-gets SIGTERM, then SIGKILL two seconds later: it holds the prompt.
-Every `@` in the prompt is escaped, so screen text cannot make the CLI attach
-a file. The CLI is looked for in `~/.local/bin`, `/opt/homebrew/bin`,
-`/usr/local/bin` and `PATH`. There is no Messages API route: its tokens cost
-money the subscription already covers. The CLI, its login and what is kept of
-questions are set in `~/.config/mcmonad/claude.json` (all optional; read at
-every question):
+The question goes first to the Codex CLI already on the Mac (`codex exec
+--json`, the engine the Codex SDK drives; model `gpt-6-astra`, the newest
+Astra, at medium effort) on your own ChatGPT login, locked down: none of your
+Codex configuration, rules, MCP servers, hooks or plugins
+(`--ignore-user-config`, `--ignore-rules`); every feature that gives the model
+a tool disabled, and what the model still declares failing closed (code mode
+has no host; a sub-agent cannot load an ephemeral thread); the question's own
+instructions in place of Codex's, with no AGENTS.md or environment context;
+`--ephemeral` and history off, so no rollout, history line or memory is
+written; a read-only sandbox in an empty working directory; an environment
+allowlist (an `OPENAI_API_KEY` the daemon happens to carry is not passed on).
+A stream that shows any tool call is refused at once and the CLI stopped. The
+schema and instructions Codex reads are fixed text in a private temporary
+directory; the prompt itself goes only on stdin.
+
+Only when Codex gives no usable answer — no CLI, a failure, an answer out of
+shape, or no answer within 70 seconds — does the question go to the Claude
+Code CLI (`claude -p`, the Agent SDK's engine, model `claude-fable-5-1` at low
+effort) on your own Claude login, in the time left of 115 seconds, locked down
+the way laptop-pool runs its workers — an environment allowlist (an
+`ANTHROPIC_API_KEY` the daemon happens to carry is not passed on), no tools, no
+MCP servers, no settings, no CLAUDE.md or memory, nothing to ask, no session
+written, an empty working directory, at most 4 turns and 16,000 output tokens
+a turn — and its answer is believed only if the session says it was exactly
+that. When neither answers, the launcher shows both reasons. A CLI still
+running when its question is answered, cancelled or out of time gets SIGTERM,
+then SIGKILL two seconds later: it holds the prompt. Every `@` in the prompt is
+escaped, so screen text cannot make a CLI attach a file. The CLIs are looked
+for in `~/.local/bin`, `~/.nix-profile/bin`, `/etc/profiles/per-user/$USER/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` and `PATH`. There is no Messages API
+route, OpenAI's or Anthropic's: its tokens cost money the subscriptions already
+cover. The CLIs, Claude's login and what is kept of questions are set in
+`~/.config/mcmonad/claude.json` (all optional; read at every question; `sdk` is
+Claude's section, named before Codex came):
 
 ```json
-{ "sdk": { "cli": "/Users/you/.local/bin/claude",
+{ "codex": { "cli": "/Users/you/.local/bin/codex" },
+  "sdk": { "cli": "/Users/you/.local/bin/claude",
            "oauthTokenCommand": ["rageveil", "show", "claude.ai/oauth-token"] },
   "retention": { "receipts": "log", "hours": 24 } }
 ```
 
 `oauthTokenFile` names an owner-only file (`chmod 600`) instead of a command;
 the command runs with no input and its output must be one token. Without the
-file the CLI uses its own login.
+file each CLI uses its own login.
 
 **What is kept of a question once it is over** is a receipt, in
 mcmonad-core's memory, for `retention.hours` (1 to 168; 24 by default): which
-feature asked, how the CLI run ended (its result subtype, or a reason such as
-`exit-3` or `no-cli`), how long it took, turns and tokens, and how many
-windows or workspaces the answer named. A receipt has no field for text: not
+feature asked, which CLIs it went to and how each run ended (its result, or a
+reason such as `exit-3`, `no-cli` or `refused-session`), how long each took,
+turns and tokens, and how many windows or workspaces the answer named. A receipt has no field for text: not
 the question, the screen text, the answer, or an error's words. The menu
-bar's **Questions to Claude** lists them. With `"receipts": "log"` (the
+bar's **Questions to models** lists them. With `"receipts": "log"` (the
 default) each is also one line of `~/Library/Logs/mcmonad-core.log`:
 
 ```
-ASK: id=3f2a91c0 kind=where-is model=claude-fable-5-1 effort=low end=answered seconds=6.3 named=2 dropped=0 cli=answered/success,6.2s,turns=2,tokens=1312+208,cache=0+0
+ASK: id=3f2a91c0 kind=where-is end=answered seconds=5.2 named=2 dropped=0 run=codex:gpt-6-astra:medium:answered/completed,5.2s,tokens=9084+47,cache=0+0
+ASK: id=04ad6975 kind=where-is end=answered seconds=11.3 named=1 dropped=0 run=codex:gpt-6-astra:medium:failed/exit-1,0.1s run=claude:claude-fable-5-1:low:answered/success,11.3s,turns=2,tokens=2+143,cache=1179+815
 ```
 
 `"receipts": "memory"` keeps them out of the log. The question's text itself
 is held only for the call and, after it, only where the launcher shows it; no
-setting writes it anywhere. Dollars are not counted: the subscription
-carries the cost, so there is no dollar ceiling either.
+setting writes it anywhere. Dollars are not counted: the subscriptions
+carry the cost, so there is no dollar ceiling either.
 
 **"What's up" monitoring is off by default.** The mcmonad menu bar has a
-**What's up monitoring: Off/On — sends to Claude** switch. Turning it on
-requires confirmation explaining what is sent to Anthropic: workspace names,
+**What's up monitoring: Off/On — sends to OpenAI (Anthropic as fallback)**
+switch. Turning it on requires confirmation explaining what is sent to OpenAI,
+and to Anthropic when Codex gives no answer: workspace names,
 app names, window titles, focus/window identifiers and OCR excerpts, including
 covered windows and hidden workspaces. Excerpts are limited to 500 characters
 per window and a shared 40,000-character budget (plus truncation markers);
 titles and metadata are included separately. The choice is remembered across
-restarts. Turning it off cancels queued refreshes and the active CLI process,
+restarts; an opt-in given before Codex was the first route covered Anthropic
+alone, so it does not carry over and monitoring starts off. Turning it off cancels queued refreshes and the active CLI process,
 clears cached summaries and prevents forced refreshes too. It cannot recall
 data already sent. `ocrIndex = False` removes OCR excerpts but does **not**
 disable title-based cloud monitoring; use the menu switch to stop monitoring.

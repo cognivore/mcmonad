@@ -1,37 +1,65 @@
 import Foundation
 
 // AI-assisted update (history in the manifold; the locked-down SDK route;
-// turn ceilings and the request's kind): model claude-opus-5-5; reasoning
-// effort unavailable (not exposed by the harness).
+// turn ceilings and the request's kind; Codex first, Claude as fallback):
+// model claude-opus-5-5; reasoning effort unavailable (not exposed by the
+// harness).
 
 /// What every launcher question to the model shares — "where is …" and
-/// "what's up": describing every window to it (the manifold), calling the
-/// Claude Code CLI already on this Mac, and reading its stream back into one
-/// of four distinct outcomes. Pure; the process handling is `AskRunner`.
+/// "what's up": describing every window to it (the manifold), calling a
+/// model CLI already on this Mac (Codex, then Claude), and reading its
+/// stream back into one of four distinct outcomes. Pure; the process
+/// handling is `AskRunner`.
 enum Ask {
-    /// The model and effort every question goes to. Fable 5.1 at low effort:
-    /// these are lookups over evidence we hand it, not reasoning tasks.
-    static let model = "claude-fable-5-1"
-    static let effort = "low"
+    /// The CLIs a question can go to, in the order tried: Codex, and Claude
+    /// when Codex gives no usable answer.
+    enum Engine: String, Sendable, CaseIterable {
+        case codex
+        case claude
 
-    /// The ceilings every question runs under, as a laptop-pool profile
-    /// sets them: turns (a structured answer takes one or two) and output
-    /// tokens per turn. A question that reaches one ends failed and says
-    /// which, instead of running on. No dollar ceiling: the subscription
-    /// carries the cost.
+        /// The newest Astra at medium effort; Fable 5.1 at low effort, for
+        /// lookups over evidence we hand it.
+        var model: String {
+            switch self {
+            case .codex: return "gpt-6-astra"
+            case .claude: return "claude-fable-5-1"
+            }
+        }
+
+        var effort: String {
+            switch self {
+            case .codex: return "medium"
+            case .claude: return "low"
+            }
+        }
+
+        /// Who runs the model, as the consent names it.
+        var provider: String {
+            switch self {
+            case .codex: return "OpenAI"
+            case .claude: return "Anthropic"
+            }
+        }
+    }
+
+    /// The ceilings every Claude question runs under, as a laptop-pool
+    /// profile sets them: turns (a structured answer takes one or two) and
+    /// output tokens per turn. A question that reaches one ends failed and
+    /// says which, instead of running on. No dollar ceiling: the
+    /// subscription carries the cost.
     static let maxTurns = 4
     static let maxOutputTokens = 16_000
 
-    /// Arguments after the executable. Print mode with structured output and
-    /// a streamed transcript; locked down the way laptop-pool runs the Agent
+    /// Claude's arguments after the executable. Print mode with structured
+    /// output and a streamed transcript; locked down the way laptop-pool runs the Agent
     /// SDK: no tools, no MCP server, no settings, nothing to ask, and no
     /// local session history. The prompt carries screen text; these flags do
     /// not control retention at the provider.
     static func arguments(schema: String, systemPrompt: String) -> [String] {
         [
             "-p",
-            "--model", model,
-            "--effort", effort,
+            "--model", Engine.claude.model,
+            "--effort", Engine.claude.effort,
             "--max-turns", String(maxTurns),
             "--no-session-persistence",
             "--tools", "",
@@ -50,7 +78,10 @@ enum Ask {
 
     /// One question for the model, whichever route takes it: the prompt,
     /// the system prompt and schema it is asked under, and how its
-    /// structured answer is read back.
+    /// structured answer is read back. The system prompt and schema are
+    /// fixed text with nothing of the screen in them: Codex reads them from
+    /// files (`ContractFiles`). Only the prompt carries screen text, and it
+    /// goes on stdin.
     struct Request: Sendable {
         /// Which feature asks: named in the question's receipt.
         let kind: Kind
@@ -59,19 +90,54 @@ enum Ask {
         let prompt: String
         let answer: @Sendable ([String: Any]) -> Answer?
 
-        var arguments: [String] { Ask.arguments(schema: schema, systemPrompt: systemPrompt) }
+        /// A reader for one run of `engine` on this request.
+        func reader(for engine: Engine) -> Reader { Reader(engine: engine, answer: answer) }
         func parseLine(_ line: String) -> StreamItem { Ask.parseLine(line, answer: answer) }
     }
 
-    /// Where the Claude Code CLI may live when the settings do not name it
-    /// and the daemon's own PATH (a launchd agent's, so nearly empty) does
-    /// not either.
-    static func candidates(home: String, path: String?) -> [String] {
-        var dirs = [home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+    /// Where Codex reads a request's schema and system prompt from.
+    struct ContractFiles: Equatable, Sendable {
+        let schema: String
+        let instructions: String
+    }
+
+    /// Reads one run's stream, line by line, in order: what each line
+    /// means, and for the line that ends the run, what its receipt keeps.
+    struct Reader {
+        let engine: Engine
+        private let claudeAnswer: @Sendable ([String: Any]) -> Answer?
+        private var codex: CodexAccess.Stream
+
+        init(engine: Engine, answer: @escaping @Sendable ([String: Any]) -> Answer?) {
+            self.engine = engine
+            claudeAnswer = answer
+            codex = CodexAccess.Stream(answer: answer)
+        }
+
+        mutating func read(_ line: String) -> (item: StreamItem, facts: Facts?) {
+            switch engine {
+            case .claude:
+                let item = Ask.parseLine(line, answer: claudeAnswer)
+                if case .final = item { return (item, Facts.ofResultLine(line)) }
+                return (item, nil)
+            case .codex:
+                let item = codex.read(line)
+                if case .final = item { return (item, Facts.ofCodexLine(line)) }
+                return (item, nil)
+            }
+        }
+    }
+
+    /// Where `engine`'s CLI may live when the settings do not name it and
+    /// the daemon's own PATH (a launchd agent's, so nearly empty) does not
+    /// either: the CLIs' own installers, the Nix profiles, Homebrew.
+    static func candidates(_ engine: Engine, home: String, user: String, path: String?) -> [String] {
+        var dirs = [home + "/.local/bin", home + "/.nix-profile/bin", "/etc/profiles/per-user/\(user)/bin",
+                    "/opt/homebrew/bin", "/usr/local/bin"]
         for dir in (path ?? "").split(separator: ":").map(String.init) where !dirs.contains(dir) {
             dirs.append(dir)
         }
-        return dirs.map { $0 + "/claude" }
+        return dirs.map { $0 + "/" + engine.rawValue }
     }
 
     // MARK: - Manifold (what we tell the model)
@@ -223,6 +289,29 @@ enum Ask {
         case failed(String)
         /// The CLI exited cleanly but what it printed is not the contract.
         case malformed(String)
+    }
+
+    /// An outcome's words, whatever its kind.
+    static func reason(_ outcome: Outcome) -> String {
+        switch outcome {
+        case .answered: return "answered"
+        case .unavailable(let s), .failed(let s), .malformed(let s): return s
+        }
+    }
+
+    /// One outcome for a question no CLI answered, with every CLI's reason
+    /// in the order asked. Its kind is the last CLI's that ran at all;
+    /// unavailable only when none could.
+    static func combined(_ failures: [(Engine, Outcome)]) -> Outcome {
+        guard let last = failures.last?.1 else { return .unavailable("no CLI was asked") }
+        guard failures.count > 1 else { return last }
+        let text = failures.map { "\($0.0.rawValue): \(reason($0.1))" }.joined(separator: "\n\n")
+        let ran = failures.last { if case .unavailable = $0.1 { return false } else { return true } }?.1
+        switch ran {
+        case .failed?: return .failed(text)
+        case .malformed?: return .malformed(text)
+        case .answered?, .unavailable?, nil: return .unavailable(text)
+        }
     }
 
     /// What one stream-json line means for the transcript and the outcome.

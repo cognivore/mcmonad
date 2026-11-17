@@ -195,6 +195,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// While asking: when the call started, and a 1 s tick for the hint and
     /// the deadline.
     private var askStarted = Date()
+    /// The CLI the question is with now: Codex, or Claude after it.
+    private var askEngine = Ask.Engine.allCases[0]
     private var askTicker: Timer?
     private static let askDeadline: TimeInterval = 120
     private let voice = VoiceInput()
@@ -451,7 +453,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             hintLabel.stringValue = "↩ start · ⇥ back\(voiceHint) · esc cancel"
         case .asking:
             let secs = Int(Date().timeIntervalSince(askStarted))
-            hintLabel.stringValue = "asking \(Ask.model) at \(Ask.effort) effort · \(secs) s · esc cancel"
+            hintLabel.stringValue = "asking \(askEngine.model) at \(askEngine.effort) effort · \(secs) s · esc cancel"
         case .answered:
             hintLabel.stringValue = "↩ select · esc back"
         case .laterBead:
@@ -686,6 +688,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         askRunner.onTranscript = { [weak self] text in self?.appendTranscript(text) }
         askRunner.onNote = { [weak self] text in self?.appendTranscript("\n· \(text)\n") }
         askRunner.onFinished = { [weak self] outcome in self?.finishAsk(outcome) }
+        askRunner.onRoute = { [weak self] engine, cli, arguments in
+            self?.askEngine = engine
+            self?.updateHint()
+            self?.appendTranscript("→ \(engine.rawValue): \(cli) " + arguments.map(Self.shellQuoted).joined(separator: " ") + "\n\n← ")
+        }
 
         wireVoice()
 
@@ -783,13 +790,13 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     }
 
     private func whereIsItem(_ query: WhereIsQuery, force: Bool = false) -> Item {
-        Item(title: "Ask \(Ask.model) where “\(query.question)” is",
+        Item(title: "Ask \(Ask.Engine.allCases[0].model) where “\(query.question)” is",
              kind: .whereIs(query), haystack: "", force: force)
     }
 
     private func whatsUpItem(force: Bool = false) -> Item {
         let title = whatsUpCache?.isEnabled == true
-            ? "What's up — workspace summaries from Claude"
+            ? "What's up — workspace summaries from \(Ask.Engine.allCases[0].model)"
             : "What's up — monitoring off (enable in the mcmonad menu)"
         return Item(title: title,
              kind: .whatsUp, haystack: "what's up whats up sup summary workspaces overview",
@@ -1000,8 +1007,8 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         confirmingCloudSearch = true
         removeKeyMonitor()
         let alert = NSAlert()
-        alert.messageText = "Send window information to Claude for this search?"
-        alert.informativeText = "Your question, workspace names, app names, window titles and excerpts of recognised screen text from visible and hidden workspaces — including lines and titles those windows, and windows closed today, showed earlier today — will be sent to Anthropic through your Claude CLI. This authorises one search; it does not enable background monitoring."
+        alert.messageText = "Send window information to OpenAI for this search?"
+        alert.informativeText = "Your question, workspace names, app names, window titles and excerpts of recognised screen text from visible and hidden workspaces — including lines and titles those windows, and windows closed today, showed earlier today — will be sent to OpenAI through your Codex CLI, and, if Codex gives no answer, to Anthropic through your Claude CLI. This authorises one search; it does not enable background monitoring."
         alert.addButton(withTitle: "Send this search")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: panel) { [weak self] response in
@@ -1052,6 +1059,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         appendTranscript("· reading every window first…\n")
         reindexContinuation = then
         askStarted = Date()
+        askEngine = Ask.Engine.allCases[0]
         askTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.askTick() }
         }
@@ -1071,7 +1079,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         guard let cache = whatsUpCache else { return }
         guard cache.isEnabled else {
             spinner.stop()
-            filtered = [hintItem("What's up monitoring is off. No background summaries are sent to Claude."),
+            filtered = [hintItem("What's up monitoring is off. No background summaries are sent to OpenAI or Anthropic."),
                         hintItem("Enable it from the mcmonad menu to share window titles and screen text.")]
             showResults()
             return
@@ -1124,6 +1132,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         showingWhatsUp = false
         state = .asking
         askStarted = Date()
+        askEngine = Ask.Engine.allCases[0]
         askTicker?.invalidate()
         askTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.askTick() }
@@ -1164,14 +1173,11 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         )
         askClosed = Dictionary(uniqueKeysWithValues: (manifold.closedWindows ?? []).map { ($0.id, $0) })
         let request = makeRequest(manifold)
-        let cli = AskRunner.locateCLI() ?? "claude"
         let windows = manifold.workspaces.reduce(0) { $0 + $1.windows.count }
         let withText = manifold.workspaces.flatMap(\.windows).filter { !($0.text ?? "").isEmpty }.count
         let withEarlier = manifold.workspaces.flatMap(\.windows).filter { !($0.earlier ?? []).isEmpty }.count
         Self.logger.info("ask evidence: \(windows, privacy: .public) windows, \(withText, privacy: .public) with screen text, \(withEarlier, privacy: .public) with history, \(manifold.closedWindows?.count ?? 0, privacy: .public) closed")
-        appendTranscript("→ SDK route: \(cli) " + request.arguments.map(Self.shellQuoted).joined(separator: " ")
-                         + "\n  (the Messages API answers only if this cannot, and only with a key source in ~/.config/mcmonad/claude.json)\n\n")
-        appendTranscript("→ stdin (\(request.prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces, \(withEarlier) with earlier text, \(manifold.closedWindows?.count ?? 0) closed):\n\(request.prompt)\n\n← ")
+        appendTranscript("→ stdin (\(request.prompt.count) chars, \(windows) windows on \(manifold.workspaces.count) workspaces, \(withEarlier) with earlier text, \(manifold.closedWindows?.count ?? 0) closed):\n\(request.prompt)\n\n")
         askRunner.start(request)
     }
 

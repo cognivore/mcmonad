@@ -65,7 +65,7 @@ enum WhereIs {
     {"type":"object","properties":{"matches":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"reason":{"type":"string"}},"required":["id","reason"],"additionalProperties":false}}},"required":["matches"],"additionalProperties":false}
     """#
 
-    static let arguments = Ask.arguments(schema: schemaJSON, systemPrompt: systemPrompt)
+    static let claudeArguments = Ask.arguments(schema: schemaJSON, systemPrompt: systemPrompt)
 
     struct Match: Equatable {
         let windowId: UInt32

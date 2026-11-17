@@ -1,0 +1,8 @@
+[package]
+name = "awake-guard"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+awake_core = { path = "../core" }
+libc = "0.2"

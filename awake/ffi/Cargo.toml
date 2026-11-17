@@ -1,0 +1,14 @@
+[package]
+name = "awake_ffi"
+version = "0.2.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "lib"] # staticlib for Swift; lib for cargo test and bindgen
+
+[dependencies]
+awake_core = { path = "../core" }
+uniffi.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

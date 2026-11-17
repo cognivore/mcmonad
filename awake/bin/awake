@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# AI-generated file: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+#
+# awake — ask the Awake menu-bar app to keep the Mac awake, locked and dark
+# with the lid closed, for a while. The app and its root guard do the work;
+# this only sends the request. No sudo.
+#
+#   awake 60              keep awake 60 minutes (battery floor 20%)
+#   awake 90 --floor 30   end early when the battery reaches 30%
+#   awake stop            end now; the Mac is not put to sleep
+set -euo pipefail
+
+app="$HOME/Applications/Awake.app"
+usage() { echo "usage: awake <minutes> [--floor <percent>] | awake stop" >&2; exit "${1:-1}"; }
+
+if [[ ! -d "$app" ]]; then
+  echo "awake: $app is not installed; build it with ~/Github/awake/build.sh --install" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help) usage 0 ;;
+  stop) exec /usr/bin/open -g "awake://stop" ;;
+  ''|*[!0-9]*) usage ;;
+esac
+minutes=$1; shift
+floor=20
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --floor) floor=${2:?--floor needs a percent}; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[[ "$floor" =~ ^[0-9]+$ ]] || usage
+/usr/bin/open -g "awake://start?minutes=$minutes&floor=$floor"
+echo "awake: asked for $minutes minutes (floor $floor%). The menu-bar cup shows the state; the log is ~/Library/Logs/awake.log."

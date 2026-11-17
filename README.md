@@ -28,9 +28,10 @@ runs, every five seconds:
 The menu also lists other processes that keep the Mac or its display
 awake, such as a forgotten `caffeinate -d`.
 
-The lock uses the screen saver, so turn on *System Settings → Lock Screen →
-Require password after screen saver begins: Immediately*. The menu warns if
-the screen stays unlocked with the lid closed.
+The lock is macOS's own Lock Screen, the one in the Apple menu, so it needs a
+password at once whatever the screen-saver password delay is. A session
+whose lock does not take within five seconds does not start. The menu warns
+if the screen stays unlocked with the lid closed.
 
 ## How it is built
 

@@ -6,8 +6,8 @@
 //!
 //! Swift implements [`Mac`]: it observes the machine (battery, heat, lid,
 //! display, lock) and renders [`MenuState`]s. Rust owns everything else: the
-//! session loop and its clock, the lease the guard reads, locking (by
-//! starting the screen saver), turning the display off, reading `pmset`,
+//! session loop and its clock, the lease the guard reads, locking (with
+//! macOS's own Lock Screen), turning the display off, reading `pmset`,
 //! and the one log. Every decision is `awake_core`'s.
 
 use std::fmt::Debug;
@@ -136,15 +136,41 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The Lock Screen that the Apple menu and Ctrl-Cmd-Q use. It locks at once,
+/// whatever the "Require password after screen saver" delay, and needs no
+/// Accessibility. The screen saver tried before only locked after that delay,
+/// so a nudged mouse dismissed it. The function is private to macOS, so it is
+/// looked up when called and its absence is an error, never a silent no-op.
+fn lock_screen() -> Result<(), String> {
+    use std::ffi::{c_char, c_int, c_void};
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    const RTLD_LAZY: c_int = 1;
+    // SAFETY: the path is a NUL-terminated literal.
+    let login = unsafe { dlopen(c"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login".as_ptr(), RTLD_LAZY) };
+    if login.is_null() {
+        return Err("macOS has no login.framework to lock with".into());
+    }
+    // SAFETY: the handle is live and the name is a NUL-terminated literal.
+    let symbol = unsafe { dlsym(login, c"SACLockScreenImmediate".as_ptr()) };
+    if symbol.is_null() {
+        return Err("login.framework has no SACLockScreenImmediate".into());
+    }
+    // SAFETY: SACLockScreenImmediate is `int (void)`. Its result is not a
+    // documented status, so the session checks the lock took instead.
+    let lock = unsafe { std::mem::transmute::<*mut c_void, extern "C" fn() -> c_int>(symbol) };
+    lock();
+    Ok(())
+}
+
 impl Effects for Native {
     fn now(&self) -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
     }
     fn lock(&self) -> Result<(), String> {
-        // The keystroke route needs Accessibility, which macOS refused to the
-        // old script every time; the screen saver locks when "Require
-        // password immediately" is on, and the session loop checks it did.
-        run("/usr/bin/open", &["-a", "/System/Library/CoreServices/ScreenSaverEngine.app"]).map(drop)
+        lock_screen()
     }
     fn display_off(&self) -> Result<(), String> {
         run("/usr/bin/pmset", &["displaysleepnow"]).map(drop)
@@ -226,6 +252,9 @@ struct Pace {
 }
 
 const NATIVE_PACE: Pace = Pace { every: Duration::from_secs(5), guard_grace: 3, lock_settle: Duration::from_secs(1) };
+
+/// How many `lock_settle` waits a lock has to show up before the start fails.
+const LOCK_CHECKS: u32 = 5;
 
 #[derive(uniffi::Object)]
 pub struct Awake {
@@ -313,8 +342,16 @@ impl Awake {
             reason,
         })?;
         record(&*self.fx, "start", "info", &session);
-        self.effect("lock", self.fx.lock());
-        tokio::time::sleep(self.pace.lock_settle).await;
+        if let Err(reason) = self.lock_and_confirm().await {
+            if let Err(e) = self.fx.lease(None) {
+                record(&*self.fx, "start", "error", &e);
+            }
+            return Err(AwakeError::Effect {
+                what: "locking the screen".into(),
+                incident: record(&*self.fx, "lock", "error", &reason),
+                reason,
+            });
+        }
         self.effect("display off", self.fx.display_off());
         let me = Arc::clone(&self);
         let handle = RT.spawn(async move { me.watch(session).await });
@@ -322,6 +359,19 @@ impl Awake {
             *r = Some(handle);
         }
         Ok(())
+    }
+
+    /// Lock, then wait until macOS reports the screen locked. A session never
+    /// starts on a lock that did not take.
+    async fn lock_and_confirm(&self) -> Result<(), String> {
+        self.fx.lock()?;
+        for _ in 0..LOCK_CHECKS {
+            tokio::time::sleep(self.pace.lock_settle).await;
+            if self.look().await.is_ok_and(|o| o.locked) {
+                return Ok(());
+            }
+        }
+        Err("macOS still reports the screen unlocked".into())
     }
 
     fn effect(&self, what: &str, r: Result<(), String>) -> Option<String> {
@@ -364,10 +414,7 @@ impl Awake {
                     if lock {
                         warning = self.effect("lock", self.fx.lock());
                         if ticks > 1 {
-                            warning = Some(
-                                "the lid is closed but the screen is not locked: turn on Require password immediately"
-                                    .into(),
-                            );
+                            warning = Some("the lid is closed but the screen did not lock".into());
                         }
                     }
                     if display_off {
@@ -499,6 +546,22 @@ mod tests {
         assert_eq!(leases(&fx).last(), Some(&None), "lease removed, no sleep asked");
         let views = m.views.lock().map(|v| v.clone()).unwrap_or_default();
         assert!(views.last().is_some_and(|v| v.line.contains("Login Items")), "{views:?}");
+    }
+
+    #[test]
+    fn a_lock_that_does_not_take_starts_nothing() {
+        let m = mac(80);
+        if let Ok(mut s) = m.state.lock() {
+            s.locked = false;
+        }
+        let fx = Arc::new(FakeFx::default());
+        fx.guard.store(true, Ordering::Relaxed);
+        let a = Awake::with(m, fx.clone(), FAST);
+        let r = RT.block_on(Arc::clone(&a).start(30, 20));
+        assert!(matches!(r, Err(AwakeError::Effect { .. })), "{r:?}");
+        assert_eq!(leases(&fx).last(), Some(&None), "the lease is taken back");
+        let again = RT.block_on(Arc::clone(&a).start(30, 20));
+        assert!(matches!(again, Err(AwakeError::Effect { .. })), "no session is left running: {again:?}");
     }
 
     #[test]

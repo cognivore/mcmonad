@@ -1,8 +1,12 @@
 import AppKit
 import os
+import ServiceManagement
 
 // AI-assisted update (the "Questions to Claude" submenu, addAsks; Codex
 // first, Claude as fallback): model claude-opus-5-5; reasoning effort
+// unavailable (not exposed by the harness).
+// AI-assisted update (Keep awake: addAwake, its actions, and "Open Login
+// Items…" under Permissions): model claude-opus-5-5; reasoning effort
 // unavailable (not exposed by the harness).
 
 /// The mcmonad-core menubar item.
@@ -38,6 +42,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     var recentAsks: (() -> ([Ask.Receipt], Ask.Retention))?
     var whatsUpMonitoringEnabled: (() -> Bool)?
     var onSetWhatsUpMonitoring: ((Bool) -> Void)?
+    /// Keep awake; nil when this MCMonadCore.app has no `awake`.
+    var awake: AwakeController?
 
     /// Fires when the user clicks the "Debug frame overlays" item.
     /// The main module wires this to send `menuToggleDebug` to Haskell.
@@ -223,6 +229,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         if let (receipts, retention) = recentAsks?() {
             addAsks(receipts, retention: retention, to: menu)
         }
+        if let awake {
+            addAwake(awake, to: menu)
+        }
         menu.addItem(NSMenuItem.separator())
 
         // Fuzzy window search — opens the keyboard-driven dropdown.
@@ -324,6 +333,55 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(item)
     }
 
+    /// "Keep awake": the running session's line and Stop, or the lengths
+    /// to start one with. Everything shown is awake's own words.
+    private func addAwake(_ awake: AwakeController, to menu: NSMenu) {
+        let sub = NSMenu()
+        func note(_ title: String) {
+            let row = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            sub.addItem(row)
+        }
+        let title: String
+        if awake.isRunning {
+            let report = awake.report
+            title = "Keep awake: \(report?.line ?? "starting…")\(report?.warning == nil ? "" : " ⚠")"
+            if let warning = report?.warning { note("⚠ \(warning)") }
+            if let holders = report?.holders, !holders.isEmpty {
+                note("Also keeping the Mac awake:")
+                for h in holders { note("   \(h.process) (pid \(h.pid)): \(h.what)") }
+            }
+            sub.addItem(NSMenuItem.separator())
+            let stop = NSMenuItem(title: "Stop (normal sleep comes back)", action: #selector(stopAwakeClicked(_:)), keyEquivalent: "")
+            stop.target = self
+            sub.addItem(stop)
+        } else {
+            title = "Keep awake"
+            note("Locked and dark with the lid closed; then the Mac sleeps")
+            for choice in AwakeController.choices {
+                let item = NSMenuItem(title: choice.title, action: #selector(startAwakeClicked(_:)), keyEquivalent: "")
+                item.target = self
+                item.tag = choice.minutes
+                sub.addItem(item)
+            }
+            if let outcome = awake.outcome {
+                sub.addItem(NSMenuItem.separator())
+                note("Last: \(outcome)")
+            }
+        }
+        let status = AwakeController.guardService.status
+        if status != .enabled {
+            sub.addItem(NSMenuItem.separator())
+            note("⚠ Guard \(AwakeController.describe(status))")
+            let open = NSMenuItem(title: "Open Login Items…", action: #selector(openLoginItemsClicked(_:)), keyEquivalent: "")
+            open.target = self
+            sub.addItem(open)
+        }
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.submenu = sub
+        menu.addItem(item)
+    }
+
     private func addPermissions(to menu: NSMenu) {
         let lines = PermissionAudit.take()
         let missing = lines.contains { $0.ok == false }
@@ -344,6 +402,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let open = NSMenuItem(title: "Open Privacy & Security…", action: #selector(openPrivacyClicked(_:)), keyEquivalent: "")
         open.target = self
         submenu.addItem(open)
+        if awake != nil {
+            let loginItems = NSMenuItem(title: "Open Login Items…", action: #selector(openLoginItemsClicked(_:)), keyEquivalent: "")
+            loginItems.target = self
+            submenu.addItem(loginItems)
+        }
         let copy = NSMenuItem(title: "Copy audit", action: #selector(copyAuditClicked(_:)), keyEquivalent: "")
         copy.target = self
         submenu.addItem(copy)
@@ -488,6 +551,18 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    @objc private func startAwakeClicked(_ sender: NSMenuItem) {
+        awake?.start(minutes: sender.tag)
+    }
+
+    @objc private func stopAwakeClicked(_ sender: Any?) {
+        awake?.stop()
+    }
+
+    @objc private func openLoginItemsClicked(_ sender: Any?) {
+        SMAppService.openSystemSettingsLoginItems()
     }
 
     @objc private func copyAuditClicked(_ sender: Any?) {

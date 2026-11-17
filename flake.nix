@@ -101,6 +101,12 @@
                 Tests/LaterChecks.swift \
                 -o .build/later-checks
               .build/later-checks
+              /usr/bin/swiftc -swift-version 6 \
+                Sources/MCMonadCore/Awake/AwakeReport.swift \
+                Sources/MCMonadCore/Awake/AwakeController.swift \
+                Tests/AwakeChecks.swift \
+                -o .build/awake-checks
+              .build/awake-checks
               runHook postCheck
             '';
             installPhase = ''
@@ -118,6 +124,36 @@
             ];
           };
 
+          # AI-assisted update (awake: this package, its place in mcmonad-app
+          # and the dev shell's Rust): model claude-opus-5-5; reasoning effort
+          # unavailable (not exposed by the harness).
+          #
+          # `awake` and `awake-guard` (./awake, Rust): keep the Mac awake,
+          # locked and dark with the lid closed, for a while. Always built
+          # into MCMonadCore.app/Contents/Helpers.
+          awake = pkgs.rustPlatform.buildRustPackage {
+            pname = "awake";
+            version = "0.3.0";
+            src = pkgs.lib.cleanSource ./awake;
+            cargoLock.lockFile = ./awake/Cargo.lock;
+            # The libc crate links iconv; take macOS's own, so the binaries
+            # carry no /nix/store path into MCMonadCore.app. The fixup phase
+            # re-signs them afterwards.
+            postInstall = ''
+              for b in $out/bin/awake $out/bin/awake-guard; do
+                old=$(otool -L "$b" | awk '/\/nix\/store\/.*libiconv/ { print $1 }')
+                if [ -n "$old" ]; then
+                  install_name_tool -change "$old" /usr/lib/libiconv.2.dylib "$b"
+                fi
+              done
+            '';
+            meta = {
+              description = "Keep the Mac awake, locked and dark with the lid closed, for a while";
+              mainProgram = "awake";
+              platforms = pkgs.lib.platforms.darwin;
+            };
+          };
+
           default = if pkgs.stdenv.isDarwin then
             pkgs.symlinkJoin {
               name = "mcmonad";
@@ -132,7 +168,7 @@
           # Built without the later inbox; `mcmonad-app.override { later = …; }`
           # (services.mcmonad.later in home-manager) builds it in.
           mcmonad-app = pkgs.callPackage ./nix/app-bundle.nix {
-            inherit mcmonad mcmonad-core mcmonad-ghc;
+            inherit mcmonad mcmonad-core mcmonad-ghc awake;
             later = null;
           };
         };
@@ -153,6 +189,9 @@
             ]))
             hsPkgs.cabal-install
             hsPkgs.haskell-language-server
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
             pkgs.jq
             pkgs.socat
             pkgs.gh

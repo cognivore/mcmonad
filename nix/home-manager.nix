@@ -21,6 +21,14 @@ let
   # render. Nested inside MCMonad.app it was attributed to com.mcmonad.app (the
   # bash launcher → kTCCErrorDomain Code=5, no prompt). The launcher `open`s it.
   coreBundlePath = "${homeDir}/Applications/MCMonadCore.app";
+  # AI-assisted update (awake: this command and the helpers' signatures):
+  # model claude-opus-5-5; reasoning effort unavailable (not exposed by the
+  # harness).
+  # `awake` in a terminal runs the copy inside MCMonadCore.app, because the
+  # guard there honours only the `awake` beside it.
+  awakeCommand = pkgs.writeShellScriptBin "awake" ''
+    exec ${lib.escapeShellArg "${coreBundlePath}/Contents/Helpers/awake"} "$@"
+  '';
   configIsDir = cfg.config != null && builtins.readFileType cfg.config == "directory";
   # mcmonad.hs itself: inline text, a single file, or the root of a directory
   # (the directory as a whole is handled separately, below).
@@ -148,7 +156,7 @@ in
       }
     ];
 
-    home.packages = lib.mkIf (cfg.later != null) [ cfg.later ];
+    home.packages = [ awakeCommand ] ++ lib.optional (cfg.later != null) cfg.later;
 
     home.file.".config/mcmonad/mcmonad.hs" = lib.mkIf (mcmonadHsFile != null) mcmonadHsFile;
     home.file.".config/mcmonad" = lib.mkIf configIsDir {
@@ -196,11 +204,15 @@ in
         # by the launcher) is what lets the Spotlight voice input reach the
         # microphone.
         if [ -n "$mcmonad_sign_id" ]; then
-            # The later helper is nested code in core's bundle: signed before it.
+            # The helpers (later, awake, awake-guard) are nested code in core's
+            # bundle: signed before it, with the same identity, which is also
+            # what SMAppService needs to run the guard for the app.
             for f in \
                 "$mcmonad_app_contents/Frameworks/"*.dylib \
                 "$mcmonad_app_contents/MacOS/mcmonad" \
-                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/later; do
+                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/later \
+                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/awake \
+                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/awake-guard; do
                 [ -e "$f" ] || continue
                 /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$f" 2>/dev/null || \
                     echo "mcmonad: codesign $f with '$mcmonad_sign_id' failed; leaving adhoc" >&2

@@ -292,4 +292,15 @@ collapsed every workspace after a rollback. So:
   `retention.receipts` is `"memory"`.
   (AI-assisted update of this paragraph: model claude-opus-5-5; reasoning
   effort unavailable, not exposed by the harness.)
+- Login Items (Keep awake): awake's root guard, `awake-guard` in
+  `MCMonadCore.app/Contents/Helpers` with its plist in
+  `Contents/Library/LaunchDaemons`, is registered by mcmonad-core with
+  `SMAppService.daemon` and must be allowed once in Login Items &
+  Extensions; `PermissionAudit` lists it. It disables sleep only while a
+  live `awake` beside it holds an unexpired lease. awake (`awake/`, Rust)
+  owns every decision about a session; mcmonad-core runs `awake --json`,
+  shows its protocol-1 lines (`Awake/AwakeReport.swift`), and holds the
+  session's stdin so the session ends when the daemon does.
+  (AI-assisted update of this item: model claude-opus-5-5; reasoning
+  effort unavailable, not exposed by the harness.)
 - No other explicit permissions needed.

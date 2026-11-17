@@ -666,6 +666,15 @@ struct MCMonadCoreApp {
         }
         later.onChanged = { [weak spotlight] in spotlight?.laterUpdated() }
 
+        // Keep awake: `awake` (./awake) runs each session and decides
+        // everything; this registers its root guard (an approval in Login
+        // Items, listed under Permissions) and gives the menu its entry.
+        // AI-assisted update (Keep awake): model claude-opus-5-5; reasoning
+        // effort unavailable (not exposed by the harness).
+        let awake = AwakeController.inBundle().map { AwakeController(cli: $0) }
+        awake?.registerGuard()
+        statusBar.awake = awake
+
         // TimerController is a pure renderer/clock; its state arrives via the
         // set-timers command, and every user action flows back to the brain.
         executor.onSetTimers = { [weak timerController] timers in
@@ -861,7 +870,7 @@ struct MCMonadCoreApp {
         _keepAlive = (statusBar, hotkeyManager, displayManager, overlayManager,
                       socketServer, queryServer, executor, eventBridge, dragHandler,
                       mouseDownMonitor, spotlight, timerController, screenIndex,
-                      whatsUpCache, terminationWatch, later)
+                      whatsUpCache, terminationWatch, later, awake)
     }
 
     // Static storage to prevent ARC from deallocating services

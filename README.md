@@ -162,7 +162,8 @@ role is never held by two displays.
 
 **Permissions, audited from the inside.** The menubar dropdown's
 *Permissions* section shows what the daemon itself sees: Accessibility,
-Screen Recording, Microphone and Speech Recognition as granted or not, the
+Screen Recording, Microphone and Speech Recognition as granted or not,
+whether the keep-awake guard is allowed in Login Items (below), the
 identifier and team the running code is signed with (what macOS keys every
 grant to), the bundle path, and whether the executable on disk has been
 replaced since this process launched. That last line explains most phantom
@@ -393,6 +394,38 @@ purpose**: the screenshot and the window's text, in the inbox
 anywhere. Capturing needs the same *Screen & System Audio Recording*
 permission as the index; without it the note is saved without them, and the
 bead says why. Logs record bead ids and outcomes, never notes or text.
+
+_AI-assisted update (Keep awake, below): model claude-opus-5-5; reasoning
+effort unavailable (not exposed by the harness)._
+
+**Keep awake: close the lid, and everything keeps running, locked and
+dark.** *Keep awake* in the menubar dropdown (30 minutes to 4 hours), or
+`awake 60` in a terminal, locks the screen with macOS's own Lock Screen (a
+password is needed at once, whatever your screen-saver delay) and turns the
+display off. The Mac then stays awake, even with the lid closed and on
+battery, until time is up, the battery reaches 20% (`awake 60 --floor 30`
+for another floor) or macOS reports serious thermal pressure; then it goes
+to sleep. A session whose lock does not take within five seconds does not
+start. While one runs, the dropdown shows the time and charge left, any
+warning, the other processes holding the Mac awake (a forgotten
+`caffeinate`), and *Stop*, which brings normal sleep back without sleeping.
+`awake check` shows what it sees and what it would do; `awake stop` ends a
+terminal session from elsewhere.
+
+Only root can keep a Mac with its lid closed awake, so a small root guard
+does that one thing, and only while a live session asks it to: if the
+session ends, crashes, or mcmonad-core exits, normal sleep is back within two
+seconds, and the Mac sleeps at once if its lid is closed. The guard is
+registered when mcmonad-core starts; **allow MCMonadCore once in *System
+Settings → General → Login Items & Extensions*** (the dropdown links there,
+and *Permissions* shows it). Until you do, a session ends after fifteen
+seconds and says why.
+
+awake is its own program, in [`awake/`](awake/README.md) (Rust): it decides
+everything and mcmonad shows its words. Both of its programs are built into
+`MCMonadCore.app/Contents/Helpers`; home-manager puts `awake` on your PATH
+and signs them with `services.mcmonad.signingIdentity`, which the guard
+needs to run (it must share the app's team).
 
 **Voice input — on by default.** The launcher starts listening the moment it
 opens: just speak. "timer 15 check on agents", "chrome", "librewolf". The first

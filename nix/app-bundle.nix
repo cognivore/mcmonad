@@ -2,15 +2,24 @@
 # MCMonadCore.app and its signature): model claude-opus-5-5; reasoning effort
 # unavailable (not exposed by the harness).
 #
+# AI-assisted update (awake: its two programs and the guard's launchd plist
+# in MCMonadCore.app, and their signatures): model claude-opus-5-5; reasoning
+# effort unavailable (not exposed by the harness).
+#
 # `later` (beads-mcmonad) is the later inbox's program. Given, it goes into
 # MCMonadCore.app/Contents/Helpers, where the daemon looks for it: an app
 # built with it has the inbox, one built without it does not.
-{ pkgs, mcmonad, mcmonad-core, mcmonad-ghc, later ? null }:
+#
+# `awake` (./awake) is always there: `awake` and `awake-guard` go into
+# Contents/Helpers, and the guard's plist into Contents/Library/LaunchDaemons,
+# where mcmonad-core registers it with SMAppService.
+{ pkgs, mcmonad, mcmonad-core, mcmonad-ghc, awake, later ? null }:
 
 let
   resourceDir = ../core/Sources/MCMonadCore/Resources;
   launcherScript = ../scripts/mcmonad-launcher;
   coreEntitlements = ../core/mcmonad-core.entitlements;
+  awakeGuardPlist = ../core/LaunchDaemons/com.mcmonad.core.awake-guard.plist;
 in
 
 pkgs.stdenv.mkDerivation {
@@ -60,8 +69,11 @@ pkgs.stdenv.mkDerivation {
     mkdir -p "$CORE_APP/MacOS"
     cp ${mcmonad-core}/bin/mcmonad-core "$CORE_APP/MacOS/mcmonad-core"
     chmod +x "$CORE_APP/MacOS/mcmonad-core"
+    mkdir -p "$CORE_APP/Helpers" "$CORE_APP/Library/LaunchDaemons"
+    cp ${awake}/bin/awake ${awake}/bin/awake-guard "$CORE_APP/Helpers/"
+    chmod +x "$CORE_APP/Helpers/awake" "$CORE_APP/Helpers/awake-guard"
+    cp ${awakeGuardPlist} "$CORE_APP/Library/LaunchDaemons/com.mcmonad.core.awake-guard.plist"
     ${pkgs.lib.optionalString (later != null) ''
-      mkdir -p "$CORE_APP/Helpers"
       cp ${pkgs.lib.getExe later} "$CORE_APP/Helpers/later"
       chmod +x "$CORE_APP/Helpers/later"
     ''}
@@ -463,7 +475,8 @@ GHCWRAPPER
     echo ""
     echo "Verifying no remaining /nix/store references in binaries..."
     REMAINING=0
-    ALL_BINARIES=("$APP/MacOS/mcmonad" "MCMonadCore.app/Contents/MacOS/mcmonad-core")
+    ALL_BINARIES=("$APP/MacOS/mcmonad" "MCMonadCore.app/Contents/MacOS/mcmonad-core"
+                  "MCMonadCore.app/Contents/Helpers/awake" "MCMonadCore.app/Contents/Helpers/awake-guard")
     [ -e "MCMonadCore.app/Contents/Helpers/later" ] && ALL_BINARIES+=("MCMonadCore.app/Contents/Helpers/later")
     for tool in "$GHC_BUNDLE/bin/"*; do
       [ -f "$tool" ] && [ -x "$tool" ] && ALL_BINARIES+=("$tool")
@@ -568,9 +581,11 @@ PLIST
     # and persist the mic/speech grant. home-manager re-signs this bundle with a
     # stable cert so the grant survives rebuilds.
     # Nested code is signed before the bundle that seals it.
-    if [ -e "MCMonadCore.app/Contents/Helpers/later" ]; then
-      /usr/bin/codesign --force --sign - "MCMonadCore.app/Contents/Helpers/later"
-    fi
+    for helper in later awake awake-guard; do
+      if [ -e "MCMonadCore.app/Contents/Helpers/$helper" ]; then
+        /usr/bin/codesign --force --sign - "MCMonadCore.app/Contents/Helpers/$helper"
+      fi
+    done
     /usr/bin/codesign --force --sign - --entitlements ${coreEntitlements} \
       "MCMonadCore.app"
     for tool in "$GHC_BUNDLE/bin/"*; do

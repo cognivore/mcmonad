@@ -1,13 +1,7 @@
 # AI-generated file: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 [workspace]
 resolver = "3"
-members = ["core", "ffi", "guard", "bindgen"]
-
-[workspace.dependencies]
-uniffi = "=0.32.2" # scaffolding and bindgen must be the same exact version
-thiserror = "2"
-async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+members = ["core", "native"]
 
 [profile.release]
 panic = "unwind"

@@ -16,3 +16,6 @@ result-*
 .DS_Store
 example-configs/*.hi
 example-configs/*.o
+
+# awake (Rust)
+awake/target/

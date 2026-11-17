@@ -3,25 +3,46 @@
 //! AI-generated module: model Claude Opus 5.5 (`claude-opus-5-5`); reasoning
 //! effort unavailable (not exposed by the harness).
 //!
+//! AI-assisted update (mcmonad merge: the battery and heat readings, the
+//! report lines mcmonad reads, and "session" for "app"): model Claude Opus
+//! 5.5 (`claude-opus-5-5`); reasoning effort unavailable (not exposed by the
+//! harness).
+//!
 //! Two programs live here. [`tick`] decides, from one observation of the Mac,
 //! what a running session does next: go on (and lock or darken the display
 //! if needed) or end. [`guard_step`] decides what the root guard does with
-//! the Mac's sleep setting, from the lease the app wrote. The app and the
-//! guard are interpreters: they observe, call these, and carry out the
-//! answer. Parsers for the text `pmset` and `ioreg` print are here too, so
-//! that what they accept is tested.
+//! the Mac's sleep setting, from the lease a session wrote. The `awake`
+//! program and the guard are interpreters: they observe, call these, and
+//! carry out the answer. Parsers for the text `pmset` and `ioreg` print are
+//! here too, so that what they accept is tested, and so is [`Report`], the
+//! line `awake --json` prints for mcmonad.
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
 use alloc::{format, string::String, vec::Vec};
 
-/// macOS's thermal pressure, as `ProcessInfo.thermalState` reports it.
+/// macOS's thermal pressure, in `ProcessInfo.thermalState`'s words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Thermal {
     Nominal,
     Fair,
     Serious,
     Critical,
+}
+
+impl Thermal {
+    /// From the state of the `kOSThermalNotificationPressureLevelName`
+    /// notification (`OSThermalPressureLevel` on macOS: nominal 0, moderate
+    /// 1, heavy 2, trapping 3, sleeping 4), mapped as `ProcessInfo` maps it.
+    /// A level this does not know is taken as the worst.
+    pub fn from_pressure_level(level: u64) -> Self {
+        match level {
+            0 => Self::Nominal,
+            1 => Self::Fair,
+            2 => Self::Serious,
+            _ => Self::Critical,
+        }
+    }
 }
 
 /// One look at the Mac.
@@ -147,7 +168,7 @@ pub fn tick(s: &Session, o: &Observation) -> Tick {
     }
 }
 
-/// What the app asks of the guard, in the lease file.
+/// What a session asks of the guard, in the lease file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
     /// Keep the Mac awake until `until`.
@@ -156,7 +177,7 @@ pub enum Want {
     Sleep,
 }
 
-/// The lease the app writes and the guard reads: one line,
+/// The lease a session writes and the guard reads: one line,
 /// `awake1 <pid> <until> awake|sleep`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
@@ -198,8 +219,8 @@ pub struct GuardSight {
     pub now: u64,
     /// The lease, if a well-formed one is there.
     pub lease: Option<Lease>,
-    /// The lease's pid is alive and runs the app beside the guard.
-    pub holder_is_app: bool,
+    /// The lease's pid is alive and runs the `awake` beside the guard.
+    pub holder_is_awake: bool,
     /// `pmset -g` says SleepDisabled 1.
     pub sleep_disabled: bool,
     /// The guard set SleepDisabled itself, by its marker file. A setting
@@ -217,14 +238,14 @@ pub struct GuardPlan {
     pub sleep_now: bool,
 }
 
-/// The guard's rule: SleepDisabled is 1 exactly while a live app holds an
-/// unexpired lease wanting it awake. Losing that restores normal sleep, and
-/// sleeps at once when the app asked to, or when the session was lost while
-/// the lid is closed (an app that died in a bag must not leave it awake).
+/// The guard's rule: SleepDisabled is 1 exactly while a live `awake` holds
+/// an unexpired lease wanting it awake. Losing that restores normal sleep,
+/// and sleeps at once when the session asked to, or when it was lost while
+/// the lid is closed (a session that died in a bag must not leave it awake).
 pub fn guard_step(g: &GuardSight) -> GuardPlan {
     let valid = g
         .lease
-        .filter(|l| g.holder_is_app && g.now < l.until && l.until <= g.now + MAX_SECONDS + 60);
+        .filter(|l| g.holder_is_awake && g.now < l.until && l.until <= g.now + MAX_SECONDS + 60);
     let keep_awake = matches!(valid, Some(Lease { want: Want::Awake, .. }));
     let asked_sleep = matches!(valid, Some(Lease { want: Want::Sleep, .. }));
     let mut plan = GuardPlan::default();
@@ -257,6 +278,19 @@ pub fn parse_clamshell(ioreg: &str) -> Option<bool> {
         let (_, v) = l.split_once("\"AppleClamshellState\" = ")?;
         Some(v.trim() == "Yes")
     })
+}
+
+/// The charge in percent (`None` without a battery) and whether the Mac
+/// runs on mains power, from `pmset -g batt`. `None` when the text says
+/// neither which source is in use nor anything about a battery.
+pub fn parse_battery(pmset_batt: &str) -> Option<(Option<u8>, bool)> {
+    let source = pmset_batt.lines().find_map(|l| l.split_once("Now drawing from '").map(|(_, rest)| rest))?;
+    let on_ac = source.starts_with("AC Power");
+    let charge = pmset_batt.lines().filter(|l| l.contains("InternalBattery")).find_map(|l| {
+        let (_, rest) = l.split_once('\t')?;
+        rest.split_once('%')?.0.trim().parse::<u8>().ok()
+    });
+    Some((charge, on_ac))
 }
 
 /// A process holding the display or the system awake, from
@@ -304,6 +338,83 @@ pub fn describe(s: &Session, o: &Observation) -> String {
         None => String::from("no battery"),
     };
     format!("{}:{:02} left · {battery} · floor {}%", left / 3600, (left % 3600) / 60, s.floor)
+}
+
+/// Where a session stands, as `awake --json` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Keeping the Mac awake; `line` says for how long and on what charge.
+    Running,
+    /// Over; `line` says why and whether the Mac goes to sleep.
+    Ended,
+    /// Never started: the request or the Mac's state did not allow it.
+    Refused,
+    /// Never started: something it needed failed, such as the lock.
+    Failed,
+}
+
+/// One line of `awake --json`, protocol 1, for mcmonad's menu:
+/// `{"awake":1,"phase":"running","line":"…","warning":null|"…",
+/// "holders":[{"pid":1,"process":"…","what":"…"}]}`. A reader refuses
+/// any other `awake` version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    pub phase: Phase,
+    pub line: String,
+    pub warning: Option<String>,
+    /// Other processes keeping the Mac or its display awake.
+    pub holders: Vec<Holder>,
+}
+
+/// The protocol version [`Report::encode`] writes.
+pub const REPORT_PROTOCOL: u32 = 1;
+
+impl Report {
+    pub fn encode(&self) -> String {
+        let phase = match self.phase {
+            Phase::Running => "running",
+            Phase::Ended => "ended",
+            Phase::Refused => "refused",
+            Phase::Failed => "failed",
+        };
+        let warning = self.warning.as_deref().map_or_else(|| String::from("null"), json_string);
+        let holders: Vec<String> = self
+            .holders
+            .iter()
+            .map(|h| {
+                format!(
+                    "{{\"pid\":{},\"process\":{},\"what\":{}}}",
+                    h.pid,
+                    json_string(&h.process),
+                    json_string(&format!("{} ({})", h.kind, h.name))
+                )
+            })
+            .collect();
+        format!(
+            "{{\"awake\":{REPORT_PROTOCOL},\"phase\":\"{phase}\",\"line\":{},\"warning\":{warning},\"holders\":[{}]}}",
+            json_string(&self.line),
+            holders.join(",")
+        )
+    }
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -385,7 +496,7 @@ mod tests {
         GuardSight {
             now: 1_000,
             lease: Some(Lease { pid: 7, until: 2_000, want: Want::Awake }),
-            holder_is_app: true,
+            holder_is_awake: true,
             sleep_disabled: false,
             owned: false,
             lid_closed: true,
@@ -401,7 +512,7 @@ mod tests {
 
     #[test]
     fn guard_restores_and_sleeps_when_the_app_dies_in_a_bag() {
-        let dead = GuardSight { holder_is_app: false, sleep_disabled: true, owned: true, ..sight() };
+        let dead = GuardSight { holder_is_awake: false, sleep_disabled: true, owned: true, ..sight() };
         assert_eq!(guard_step(&dead), GuardPlan { set_disabled: Some(false), remove_lease: true, sleep_now: true });
         let at_desk = GuardSight { lid_closed: false, ..dead };
         assert_eq!(
@@ -456,5 +567,41 @@ mod tests {
     #[test]
     fn describes_the_session() {
         assert_eq!(describe(&session(), &obs()), "1:00 left · 80% · floor 20%");
+    }
+
+    #[test]
+    fn battery_and_heat_are_read_as_this_mac_prints_them() {
+        let on_battery = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=25624675)\t85%; discharging; 2:50 remaining present: true\n";
+        assert_eq!(parse_battery(on_battery), Some((Some(85), false)));
+        let on_ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=25624675)\t100%; charged; 0:00 remaining present: true\n";
+        assert_eq!(parse_battery(on_ac), Some((Some(100), true)));
+        assert_eq!(parse_battery("Now drawing from 'AC Power'\n"), Some((None, true)), "a Mac without a battery");
+        assert_eq!(parse_battery(""), None);
+        assert_eq!(Thermal::from_pressure_level(0), Thermal::Nominal);
+        assert_eq!(Thermal::from_pressure_level(1), Thermal::Fair);
+        assert_eq!(Thermal::from_pressure_level(2), Thermal::Serious);
+        assert_eq!(Thermal::from_pressure_level(4), Thermal::Critical);
+        assert_eq!(Thermal::from_pressure_level(77), Thermal::Critical, "unknown is the worst");
+    }
+
+    #[test]
+    fn reports_are_one_line_of_escaped_json() {
+        let r = Report {
+            phase: Phase::Running,
+            line: String::from("0:29 left · 85% · floor 20%"),
+            warning: Some(String::from("a \"quote\"\nand a\tback\\slash")),
+            holders: alloc::vec![Holder {
+                pid: 7,
+                process: String::from("caffeinate"),
+                kind: String::from("PreventUserIdleSystemSleep"),
+                name: String::from("caffeinate command-line tool"),
+            }],
+        };
+        assert_eq!(
+            r.encode(),
+            "{\"awake\":1,\"phase\":\"running\",\"line\":\"0:29 left · 85% · floor 20%\",\"warning\":\"a \\\"quote\\\"\\nand a\\tback\\\\slash\",\"holders\":[{\"pid\":7,\"process\":\"caffeinate\",\"what\":\"PreventUserIdleSystemSleep (caffeinate command-line tool)\"}]}"
+        );
+        let ended = Report { phase: Phase::Ended, line: String::from("x\u{1}"), warning: None, holders: Vec::new() };
+        assert_eq!(ended.encode(), "{\"awake\":1,\"phase\":\"ended\",\"line\":\"x\\u0001\",\"warning\":null,\"holders\":[]}");
     }
 }

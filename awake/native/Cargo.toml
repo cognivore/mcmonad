@@ -1,0 +1,25 @@
+# AI-generated file: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+#
+# The macOS interpreter of awake_core: `awake`, which runs a session, and
+# `awake-guard`, the root part. mcmonad ships both in
+# MCMonadCore.app/Contents/Helpers.
+[package]
+name = "awake"
+version = "0.3.0"
+edition = "2024"
+
+[lib]
+name = "awake_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "awake"
+path = "src/main.rs"
+
+[[bin]]
+name = "awake-guard"
+path = "src/bin/awake-guard.rs"
+
+[dependencies]
+awake_core = { path = "../core" }
+libc = "0.2"

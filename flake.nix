@@ -26,6 +26,11 @@
           };
         };
       in {
+        # Rust for the core, the FFI and the guard. Swift is the system
+        # Xcode's, called outside this shell by build.sh.
+        devShells.default = pkgs.mkShell {
+          packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt ];
+        };
         packages = {
           default = awake;
           awake = awake;

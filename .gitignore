@@ -1,3 +1,9 @@
 result
 result-*
 .direnv/
+/target
+/build
+/host/.build
+/host/Sources/AwakeFFI/
+/host/Sources/awake_ffiFFI/
+.DS_Store

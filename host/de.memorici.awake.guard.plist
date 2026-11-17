@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- AI-generated file: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+     The root guard, sealed in the bundle at Contents/Library/LaunchDaemons and registered by the app
+     with SMAppService.daemon. KeepAlive: the guard is what restores sleep, so it must always run. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>de.memorici.awake.guard</string>
+    <key>BundleProgram</key><string>Contents/MacOS/awake-guard</string>
+    <key>ProgramArguments</key><array><string>awake-guard</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/var/log/de.memorici.awake.guard.log</string>
+    <key>StandardErrorPath</key><string>/var/log/de.memorici.awake.guard.log</string>
+    <key>AssociatedBundleIdentifiers</key><array><string>de.memorici.awake</string></array>
+</dict>
+</plist>

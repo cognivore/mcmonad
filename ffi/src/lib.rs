@@ -5,7 +5,7 @@
 //! effort unavailable (not exposed by the harness).
 //!
 //! Swift implements [`Mac`]: it observes the machine (battery, heat, lid,
-//! display, lock) and renders [`View`]s. Rust owns everything else: the
+//! display, lock) and renders [`MenuState`]s. Rust owns everything else: the
 //! session loop and its clock, the lease the guard reads, locking (by
 //! starting the screen saver), turning the display off, reading `pmset`,
 //! and the one log. Every decision is `awake_core`'s.
@@ -80,7 +80,7 @@ pub struct HolderView {
 
 /// Everything the menu shows, already worded.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct View {
+pub struct MenuState {
     pub phase: Phase,
     pub line: String,
     pub warning: Option<String>,
@@ -92,7 +92,7 @@ pub struct View {
 #[async_trait::async_trait]
 pub trait Mac: Send + Sync {
     async fn observe(&self) -> Result<MacState, HostError>;
-    fn render(&self, view: View);
+    fn render(&self, view: MenuState);
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -280,14 +280,14 @@ impl Awake {
             record(&*self.fx, "stop", "error", &e);
         }
         record(&*self.fx, "stop", "info", &"stopped from the menu");
-        self.mac.render(View { phase: Phase::Idle, line: "Not running".into(), warning: None, holders: holders(&*self.fx) });
+        self.mac.render(MenuState { phase: Phase::Idle, line: "Not running".into(), warning: None, holders: holders(&*self.fx) });
     }
 
     /// The idle view, with what currently holds the Mac or its display awake.
-    pub async fn idle_view(&self) -> View {
+    pub async fn idle_menu(&self) -> MenuState {
         let fx = Arc::clone(&self.fx);
         let hs = RT.spawn(async move { holders(&*fx) }).await.unwrap_or_default();
-        View { phase: Phase::Idle, line: "Not running".into(), warning: None, holders: hs }
+        MenuState { phase: Phase::Idle, line: "Not running".into(), warning: None, holders: hs }
     }
 
     /// Check a request against the Mac now, without starting anything.
@@ -373,7 +373,7 @@ impl Awake {
                     if display_off {
                         warning = self.effect("display off", self.fx.display_off()).or(warning);
                     }
-                    self.mac.render(View {
+                    self.mac.render(MenuState {
                         phase: Phase::Running,
                         line: awake_core::describe(&session, &o),
                         warning,
@@ -392,7 +392,7 @@ impl Awake {
             record(&*self.fx, "end", "error", &e);
         }
         record(&*self.fx, "end", "info", &why);
-        self.mac.render(View { phase: Phase::Ended, line: format!("Ended: {why}"), warning: None, holders: Vec::new() });
+        self.mac.render(MenuState { phase: Phase::Ended, line: format!("Ended: {why}"), warning: None, holders: Vec::new() });
     }
 }
 
@@ -406,14 +406,14 @@ mod tests {
 
     struct FakeMac {
         state: Mutex<MacState>,
-        views: Mutex<Vec<View>>,
+        views: Mutex<Vec<MenuState>>,
     }
     #[async_trait::async_trait]
     impl Mac for FakeMac {
         async fn observe(&self) -> Result<MacState, HostError> {
             Ok(self.state.lock().map_err(|e| HostError::Unexpected { reason: e.to_string() })?.clone())
         }
-        fn render(&self, view: View) {
+        fn render(&self, view: MenuState) {
             if let Ok(mut v) = self.views.lock() {
                 v.push(view);
             }

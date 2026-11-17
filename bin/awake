@@ -1,126 +1,36 @@
 #!/usr/bin/env bash
-# awake — keep a MacBook awake with the lid closed for a bounded duration,
-# then put it cleanly back to sleep.
+# AI-generated file: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 #
-# Disables `pmset disablesleep`, blocks idle sleep with `caffeinate -s -i`,
-# locks the session via Ctrl+Cmd+Q (the macOS Lock Screen shortcut), and
-# turns off the backlight with `pmset displaysleepnow`. Restores defaults
-# on exit (whether timed-out, Ctrl-C'd, or killed). Durations over 45
-# minutes require --force because the laptop heats up in a closed bag.
-
+# awake — ask the Awake menu-bar app to keep the Mac awake, locked and dark
+# with the lid closed, for a while. The app and its root guard do the work;
+# this only sends the request. No sudo.
+#
+#   awake 60              keep awake 60 minutes (battery floor 20%)
+#   awake 90 --floor 30   end early when the battery reaches 30%
+#   awake stop            end now; the Mac is not put to sleep
 set -euo pipefail
 
-MINUTES=""
-FORCE=false
+app="$HOME/Applications/Awake.app"
+usage() { echo "usage: awake <minutes> [--floor <percent>] | awake stop" >&2; exit "${1:-1}"; }
 
+if [[ ! -d "$app" ]]; then
+  echo "awake: $app is not installed; build it with ~/Github/awake/build.sh --install" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help) usage 0 ;;
+  stop) exec /usr/bin/open -g "awake://stop" ;;
+  ''|*[!0-9]*) usage ;;
+esac
+minutes=$1; shift
+floor=20
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --force) FORCE=true; shift ;;
-    -h|--help)
-      echo "Usage: awake <minutes> [--force]"
-      echo "  Keeps your MacBook awake with the lid closed for the specified duration."
-      echo "  Durations over 45 minutes require --force (heat risk in a closed bag)."
-      exit 0 ;;
-    *)
-      if [[ -z "$MINUTES" ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
-        MINUTES="$1"; shift
-      else
-        echo "Usage: awake <minutes> [--force]" >&2; exit 1
-      fi ;;
+    --floor) floor=${2:?--floor needs a percent}; shift 2 ;;
+    *) usage ;;
   esac
 done
-
-if [[ -z "$MINUTES" ]]; then
-  echo "Usage: awake <minutes> [--force]" >&2
-  echo "  Keeps your MacBook awake with the lid closed for the specified duration." >&2
-  echo "  Durations over 45 minutes require --force (heat risk in a closed bag)." >&2
-  exit 1
-fi
-
-if [[ "$MINUTES" -gt 45 ]] && [[ "$FORCE" != true ]]; then
-  echo "ERROR: Duration over 45 minutes requires --force flag." >&2
-  echo "  Your laptop will get hot in a closed bag. Are you sure?" >&2
-  echo "  Usage: awake $MINUTES --force" >&2
-  exit 1
-fi
-
-echo ""
-echo "=== AWAKE PLAN ==="
-echo ""
-echo "  Duration:     $MINUTES minutes"
-echo "  Lid sleep:    DISABLED  (pmset -b disablesleep 1)"
-echo "  System sleep: BLOCKED   (caffeinate -s -i)"
-echo "  Screen:       LOCKED    (Ctrl+Cmd+Q, then pmset displaysleepnow)"
-echo ""
-echo "After $MINUTES minutes, all settings will be restored to safe defaults."
-echo ""
-echo "NOTE: The first run needs Accessibility permission for your terminal"
-echo "      (System Settings > Privacy & Security > Accessibility). Without"
-echo "      it, awake falls back to the screen saver, which only locks if"
-echo "      'Require password after screen saver begins' is enabled."
-echo ""
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "ERROR: awake must be run as root (sudo awake ...)" >&2
-  exit 1
-fi
-
-echo "Press ENTER to start. Your screen will lock and everything keeps running."
-read -r
-
-CAFF_PID=""
-
-cleanup() {
-  # Disable errexit inside the trap: pkill returns 1 when nothing matches,
-  # kill returns 1 on an already-dead pid, etc. We want every restore step
-  # to run regardless of earlier ones failing.
-  set +e
-  if [[ -n "$CAFF_PID" ]]; then
-    kill "$CAFF_PID" 2>/dev/null
-    wait "$CAFF_PID" 2>/dev/null
-  fi
-  pkill -P $$ caffeinate 2>/dev/null
-  pmset -b disablesleep 0
-  echo ""
-  echo "Restored safe defaults."
-}
-
-trap cleanup EXIT
-
-pmset -b disablesleep 1
-
-CONSOLE_USER="${SUDO_USER:-$(stat -f%Su /dev/console)}"
-CONSOLE_UID="$(id -u "$CONSOLE_USER")"
-
-lock_screen() {
-  # Ctrl+Cmd+Q is macOS's real Lock Screen shortcut — it engages the
-  # loginwindow immediately, independent of "Require password after
-  # sleep" timings. `pmset displaysleepnow` only kills the backlight
-  # and does not, on its own, lock the session.
-  if launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" osascript -e \
-       'tell application "System Events" to keystroke "q" using {control down, command down}' \
-       >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "WARN: Ctrl+Cmd+Q failed — grant Accessibility to your terminal for instant lock." >&2
-  echo "      Falling back to screen saver (locks only if 'Require password' is enabled)." >&2
-  launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
-    open -a /System/Library/CoreServices/ScreenSaverEngine.app || true
-}
-
-echo "Awake mode ACTIVE. Locking screen now..."
-lock_screen
-sleep 1
-pmset displaysleepnow
-
-caffeinate -s -i -t $((MINUTES * 60)) &
-CAFF_PID=$!
-
-wait "$CAFF_PID" 2>/dev/null || true
-
-echo ""
-echo "Timer expired after $MINUTES minutes. Putting machine to sleep..."
-# `pmset sleepnow` is denied while `disablesleep=1` (IOKit returns
-# kIOReturnNotPermitted, 0xe00002e2). Restore defaults FIRST, then sleep.
-trap - EXIT
-cleanup
-pmset sleepnow
+[[ "$floor" =~ ^[0-9]+$ ]] || usage
+/usr/bin/open -g "awake://start?minutes=$minutes&floor=$floor"
+echo "awake: asked for $minutes minutes (floor $floor%). The menu-bar cup shows the state; the log is ~/Library/Logs/awake.log."

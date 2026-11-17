@@ -1,60 +1,63 @@
 # awake
 
-Bounded macOS lid-closed-awake mode that cleanly puts the machine back to sleep when the timer expires.
+*AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).*
 
-## What it does
+Close the lid, put the Mac in a bag, and everything keeps running, locked and
+dark, until a time limit, a battery floor or the heat ends it. Then the Mac
+goes to sleep.
 
-- Disables lid-close sleep (`pmset -b disablesleep 1`)
-- Blocks idle sleep (`caffeinate -s -i`)
-- Locks the session (sends Ctrl+Cmd+Q — the macOS Lock Screen shortcut — via osascript) and turns off the backlight (`pmset displaysleepnow`)
-- Restores defaults on exit — whether the timer expires, you Ctrl-C, or the process is killed
-- After the timer expires, puts the machine to sleep (`pmset sleepnow`)
+## Using it
 
-> First run only: macOS will prompt your terminal (Terminal.app / iTerm / Ghostty / …) for **Accessibility** permission so it can send the lock keystroke. Approve it in *System Settings → Privacy & Security → Accessibility*, then re-run. Without it, awake falls back to invoking the screen saver, which only locks if you have "Require password after screen saver begins" enabled.
-
-### Why not just `pmset displaysleepnow`?
-
-`pmset displaysleepnow` turns off the backlight; it does **not** lock the session. macOS only engages the lock after the "Require password after sleep or screen saver begins" delay (often 5s–1min), and that timer doesn't always fire when the system is being held awake by `caffeinate`. Opening the lid inside that window leaves you logged in. Ctrl+Cmd+Q locks the session immediately and unconditionally.
-
-Useful for transferring a laptop in a backpack between buildings without losing in-flight work, or letting a long-running task finish while the machine is closed.
-
-## Usage
+The cup in the menu bar starts and stops a session. From a terminal:
 
 ```sh
-sudo awake 30          # 30 minutes
-sudo awake 90 --force  # > 45 min requires --force (heat risk in a closed bag)
+awake 60              # keep awake 60 minutes; ends early at 20% battery
+awake 90 --floor 30   # end early at 30%
+awake stop            # end now; the Mac is not put to sleep
 ```
 
-Must run as root because `pmset -b disablesleep` requires it.
+A session locks the screen and turns the display off at once. While it
+runs, every five seconds:
 
-## Install
+- time up, battery at the floor (on battery), or the Mac running hot
+  (thermal state serious or worse) ends it and puts the Mac to sleep;
+- with the lid closed, the screen is locked again and the display turned
+  off again if either changed;
+- with the lid open, nothing is forced: you are at the Mac.
 
-### As a flake package
+The menu also lists other processes that keep the Mac or its display
+awake, such as a forgotten `caffeinate -d`.
 
-```nix
-{
-  inputs.awake.url = "github:cognivore/awake";
+The lock uses the screen saver, so turn on *System Settings → Lock Screen →
+Require password after screen saver begins: Immediately*. The menu warns if
+the screen stays unlocked with the lid closed.
 
-  outputs = { nixpkgs, awake, ... }: {
-    # ... use awake.packages.${system}.default
-  };
-}
-```
+## How it is built
 
-### Standalone
+| Part | What it does |
+| --- | --- |
+| `core/` | Every decision, in pure Rust (`no_std`), with tests |
+| `ffi/` | The UniFFI boundary and the session loop; runs `pmset`, writes the lease, logs to `~/Library/Logs/awake.log` |
+| `guard/` | `awake-guard`, the only root part, run by launchd from inside the app |
+| `host/` | The Swift menu-bar app: reads the Mac, shows the menu, registers the guard |
+| `bin/awake` | The command above; it sends `awake://` requests to the app |
+
+Only root can disable sleep, so the guard does it, and it follows one rule:
+sleep is disabled exactly while a live Awake holds an unexpired lease
+(`/Users/Shared/de.memorici.awake/lease`). If the app quits, crashes or is
+killed, the guard restores normal sleep within two seconds, and puts the Mac
+to sleep if the lid is closed. It never undoes a setting it did not make.
+Its log is `/var/log/de.memorici.awake.guard.log`.
+
+## Building
 
 ```sh
-nix run github:cognivore/awake -- 30
+./build.sh            # test, build, sign, selftest: build/Awake.app
+./build.sh --install  # and install to ~/Applications/Awake.app, then open it
 ```
 
-## Why this exists
+The first time it opens, macOS asks you to allow the guard in *System
+Settings → General → Login Items*. Until you do, a session ends after
+fifteen seconds and says why.
 
-`caffeinate` alone doesn't survive a lid-close — macOS overrides the assertion. `pmset disablesleep` does work, but if you forget to turn it off your laptop runs hot until reboot. `awake` ties the two together with a bounded timer and a cleanup trap, so the machine always ends up in a safe state.
-
-## Platform
-
-macOS only. The `pmset` and `caffeinate` invocations are Darwin-specific.
-
-## License
-
-MIT.
+Needs Xcode, Nix and a Developer ID Application identity (`SIGN_IDENTITY`).

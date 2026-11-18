@@ -1,6 +1,5 @@
 import AppKit
 import os
-import ServiceManagement
 
 // AI-assisted update (the "Questions to Claude" submenu, addAsks; Codex
 // first, Claude as fallback): model claude-opus-5-5; reasoning effort
@@ -369,10 +368,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 note("Last: \(outcome)")
             }
         }
-        let status = AwakeController.guardService.status
-        if status != .enabled {
+        // The standing macOS last gave; asking again happens off the main thread.
+        AwakeController.refreshGuard(register: false)
+        if AwakeController.guardStatus != .enabled {
             sub.addItem(NSMenuItem.separator())
-            note("⚠ Guard \(AwakeController.describe(status))")
+            note("⚠ Guard \(AwakeController.guardLine)")
             let open = NSMenuItem(title: "Open Login Items…", action: #selector(openLoginItemsClicked(_:)), keyEquivalent: "")
             open.target = self
             sub.addItem(open)
@@ -562,7 +562,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openLoginItemsClicked(_ sender: Any?) {
-        SMAppService.openSystemSettingsLoginItems()
+        AwakeController.openLoginItems()
     }
 
     @objc private func copyAuditClicked(_ sender: Any?) {

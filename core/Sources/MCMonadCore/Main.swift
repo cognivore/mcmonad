@@ -671,8 +671,10 @@ struct MCMonadCoreApp {
         // Items, listed under Permissions) and gives the menu its entry.
         // AI-assisted update (Keep awake): model claude-opus-5-5; reasoning
         // effort unavailable (not exposed by the harness).
+        // Registering goes to macOS's service-management daemon, which can
+        // take any time to answer, so it never holds up the start.
         let awake = AwakeController.inBundle().map { AwakeController(cli: $0) }
-        awake?.registerGuard()
+        if awake != nil { AwakeController.refreshGuard(register: true) }
         statusBar.awake = awake
 
         // TimerController is a pure renderer/clock; its state arrives via the

@@ -15,7 +15,7 @@ import ServiceManagement
 /// normal sleep.
 @MainActor
 final class AwakeController {
-    private static let logger = Logger(subsystem: "com.mcmonad.core", category: "Awake")
+    private nonisolated static let logger = Logger(subsystem: "com.mcmonad.core", category: "Awake")
     nonisolated static let guardPlist = "com.mcmonad.core.awake-guard.plist"
     /// What the menu offers, in minutes.
     static let choices: [(title: String, minutes: Int)] =
@@ -41,20 +41,49 @@ final class AwakeController {
     var isRunning: Bool { session != nil }
 
     // MARK: The guard
+    //
+    // Every SMAppService call is a request to macOS's service-management
+    // daemon that can go unanswered for hours (one did, at startup, on the
+    // main thread, and mcmonad-core never finished starting). So they all
+    // run on one background queue, one at a time, and the main actor only
+    // ever reads the last answer.
 
-    nonisolated static var guardService: SMAppService { SMAppService.daemon(plistName: guardPlist) }
+    /// The guard's last known standing; nil until macOS has answered once.
+    static private(set) var guardStatus: SMAppService.Status?
+    /// A guard request is with macOS; another is not sent meanwhile.
+    private static var guardBusy = false
+    private static let guardQueue = DispatchQueue(label: "com.mcmonad.core.awake-guard", qos: .utility)
 
-    /// Register the guard unless macOS already knows it. The first
-    /// registration asks the user to allow it in Login Items.
-    func registerGuard() {
-        let service = Self.guardService
-        guard service.status == .notRegistered || service.status == .notFound else { return }
-        do {
-            try service.register()
-            Self.logger.info("awake guard registered: \(Self.describe(service.status), privacy: .public)")
-        } catch {
-            Self.logger.error("awake guard registration failed: \(error.localizedDescription, privacy: .public)")
+    /// Ask macOS for the guard's standing, registering it unless macOS
+    /// already knows it (the first registration asks the user to allow it in
+    /// Login Items). Returns at once.
+    static func refreshGuard(register: Bool) {
+        guard !guardBusy else { return }
+        guardBusy = true
+        guardQueue.async {
+            let service = SMAppService.daemon(plistName: guardPlist)
+            var status = service.status
+            if register, status == .notRegistered || status == .notFound {
+                do {
+                    try service.register()
+                    status = service.status
+                    logger.info("awake guard registered: \(describe(status), privacy: .public)")
+                } catch {
+                    logger.error("awake guard registration failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guardStatus = status
+                    guardBusy = false
+                }
+            }
         }
+    }
+
+    /// The last known standing in words.
+    static var guardLine: String {
+        guardStatus.map(describe) ?? "checking…"
     }
 
     nonisolated static func describe(_ status: SMAppService.Status) -> String {
@@ -65,6 +94,11 @@ final class AwakeController {
         case .notFound: return "missing from MCMonadCore.app"
         @unknown default: return "unknown"
         }
+    }
+
+    /// Opening System Settings goes through the same daemon.
+    static func openLoginItems() {
+        guardQueue.async { SMAppService.openSystemSettingsLoginItems() }
     }
 
     // MARK: Sessions

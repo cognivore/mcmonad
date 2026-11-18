@@ -2,7 +2,6 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import Security
-import ServiceManagement
 import Speech
 
 // AI-assisted update (the keep-awake guard's line): model claude-opus-5-5;
@@ -76,16 +75,18 @@ enum PermissionAudit {
         let time = DateFormatter()
         time.dateFormat = "HH:mm:ss"
         // awake's root guard (Login Items & Extensions) holds sleep off for
-        // Keep awake; without it a session ends after fifteen seconds.
-        let awakeGuard = AwakeController.inBundle() == nil ? nil : AwakeController.guardService.status
+        // Keep awake; without it a session ends after fifteen seconds. Its
+        // last known standing: asking macOS can block, so it is never asked
+        // here.
+        let awakeGuard: Line? = AwakeController.inBundle() == nil ? nil : Line(
+            label: "Keep-awake guard", value: AwakeController.guardLine,
+            ok: AwakeController.guardStatus.map { $0 == .enabled })
         return [
             Line(label: "Accessibility", value: ax ? "granted" : "NOT granted", ok: ax),
             Line(label: "Screen Recording", value: screen ? "granted" : "NOT granted", ok: screen),
             Line(label: "Microphone", value: describe(mic), ok: mic == .authorized),
             Line(label: "Speech Recognition", value: describe(speech), ok: speech == .authorized),
-        ] + (awakeGuard.map {
-            [Line(label: "Keep-awake guard", value: AwakeController.describe($0), ok: $0 == .enabled)]
-        } ?? []) + [
+        ] + (awakeGuard.map { [$0] } ?? []) + [
             Line(label: "Signed as", value: "\(identifier) · team \(team)", ok: nil),
             Line(label: "Bundle", value: Bundle.main.bundlePath, ok: nil),
             Line(label: "Executable on disk",

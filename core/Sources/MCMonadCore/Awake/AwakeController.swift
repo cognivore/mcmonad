@@ -54,16 +54,17 @@ final class AwakeController {
     private static var guardBusy = false
     private static let guardQueue = DispatchQueue(label: "com.mcmonad.core.awake-guard", qos: .utility)
 
-    /// Ask macOS for the guard's standing, registering it unless macOS
-    /// already knows it (the first registration asks the user to allow it in
-    /// Login Items). Returns at once.
-    static func refreshGuard(register: Bool) {
+    /// Ask macOS for the guard's standing, registering it whenever macOS has
+    /// no record of it (the first registration asks the user to allow it in
+    /// Login Items; a deploy that re-signs the app can briefly lose the
+    /// record, so every look repairs it). Returns at once.
+    static func refreshGuard() {
         guard !guardBusy else { return }
         guardBusy = true
         guardQueue.async {
             let service = SMAppService.daemon(plistName: guardPlist)
             var status = service.status
-            if register, status == .notRegistered || status == .notFound {
+            if status == .notRegistered || status == .notFound {
                 do {
                     try service.register()
                     status = service.status

@@ -369,7 +369,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             }
         }
         // The standing macOS last gave; asking again happens off the main thread.
-        AwakeController.refreshGuard(register: false)
+        AwakeController.refreshGuard()
         if AwakeController.guardStatus != .enabled {
             sub.addItem(NSMenuItem.separator())
             note("⚠ Guard \(AwakeController.guardLine)")

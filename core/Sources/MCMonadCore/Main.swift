@@ -674,7 +674,7 @@ struct MCMonadCoreApp {
         // Registering goes to macOS's service-management daemon, which can
         // take any time to answer, so it never holds up the start.
         let awake = AwakeController.inBundle().map { AwakeController(cli: $0) }
-        if awake != nil { AwakeController.refreshGuard(register: true) }
+        if awake != nil { AwakeController.refreshGuard() }
         statusBar.awake = awake
 
         // TimerController is a pure renderer/clock; its state arrives via the

@@ -162,14 +162,34 @@ final class CommandExecutor {
             }
         }
 
+        // A window that would arrive at its target still at its old size,
+        // reaching onto another display, is resized at a staging point
+        // first (see 'stagingOrigin'): position there, size, position,
+        // size. It is never treated as growing, whose order would move it
+        // to the target before any size write.
+        let allScreens = displayManager.currentScreens()
+        var staged: [UInt32: CGPoint] = [:]
+        for (a, _) in resolved {
+            guard let cur = preMoveBounds[a.windowId],
+                  let screen = displayManager.screen(forFrame: a.frame)
+            else { continue }
+            let others = allScreens.map(\.frame).filter { $0 != screen.frame }
+            if let origin = stagingOrigin(target: a.frame, current: cur.size,
+                                          screen: screen.frame, others: others) {
+                staged[a.windowId] = origin
+                growing.remove(a.windowId)
+            }
+        }
+
         skylight.disableUpdate()
 
-        func writePosition(_ a: FrameAssignment, _ ax: AXUIElement, phase: Int) {
-            var pos = CGPoint(x: a.frame.origin.x, y: a.frame.origin.y)
+        func writePosition(_ a: FrameAssignment, _ ax: AXUIElement, phase: Int, at origin: CGPoint? = nil) {
+            var pos = origin ?? CGPoint(x: a.frame.origin.x, y: a.frame.origin.y)
             if let v = AXValueCreate(.cgPoint, &pos) {
                 let err = AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, v)
                 FrameLog.emit(source: .cmdAxPos,
-                              windowId: a.windowId, pid: a.pid, rect: a.frame,
+                              windowId: a.windowId, pid: a.pid,
+                              rect: CGRect(origin: pos, size: a.frame.size),
                               tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
                               extra: "phase=\(phase) axStatus=\(err.rawValue)")
@@ -185,6 +205,13 @@ final class CommandExecutor {
                               tHash: TitleHash.hash(windowId: a.windowId, pid: a.pid),
                               result: err == .success ? "ok" : "err",
                               extra: "phase=\(phase) axStatus=\(err.rawValue)")
+            }
+        }
+
+        // Phase 0: staged windows go to their staging point.
+        for (a, ax) in resolved {
+            if let origin = staged[a.windowId] {
+                writePosition(a, ax, phase: 0, at: origin)
             }
         }
 

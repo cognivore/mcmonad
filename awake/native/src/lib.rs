@@ -54,6 +54,10 @@ pub trait Host {
     fn display_off(&self) -> Result<(), String>;
     /// Write the lease, or remove it with `None`.
     fn lease(&self, lease: Option<Lease>) -> Result<(), String>;
+    /// Wait until the guard has taken the lease (removed it), at most
+    /// `within`. The guard acts only on a lease whose holder is alive, so a
+    /// session that asks for sleep stays until it has.
+    fn lease_taken(&self, within: Duration) -> bool;
     fn sleep_disabled(&self) -> Result<bool, String>;
     fn holders(&self) -> Vec<Holder>;
     /// The pid of another live session holding the lease, if there is one.
@@ -247,15 +251,27 @@ fn stopped(host: &impl Host, why: Interrupt) -> Outcome {
     Outcome::Ended
 }
 
-/// End a session: `sleep` asks the guard to restore and sleep now;
-/// otherwise the lease is removed and normal sleep returns.
+/// How long a session waits for the guard to act on its request to sleep.
+const GUARD_ANSWER: Duration = Duration::from_secs(10);
+
+/// End a session: `sleep` asks the guard to restore and sleep now, and
+/// waits for it to; otherwise the lease is removed and normal sleep returns.
 fn end(host: &impl Host, session: &Session, why: String, sleep: bool) -> Outcome {
-    let lease = sleep.then_some(Lease { pid: std::process::id(), until: session.until, want: Want::Sleep });
-    if let Err(e) = host.lease(lease) {
-        host.log(&format!("lease {e}"));
+    let mut warning = None;
+    if sleep {
+        let asked = host.lease(Some(Lease { pid: std::process::id(), until: session.until, want: Want::Sleep }));
+        if let Err(e) = &asked {
+            host.log(&format!("lease {e}"));
+        }
+        if asked.is_err() || !host.lease_taken(GUARD_ANSWER) {
+            take_back(host);
+            warning = Some(String::from("the guard did not answer: normal sleep is back, but the Mac was not put to sleep"));
+        }
+    } else {
+        take_back(host);
     }
-    host.log(&format!("end {why}"));
-    host.report(&Report { phase: Phase::Ended, line: why, warning: None, holders: Vec::new() });
+    host.log(&format!("end {why}{}", warning.as_deref().map_or_else(String::new, |w| format!(" ({w})"))));
+    host.report(&Report { phase: Phase::Ended, line: why, warning, holders: Vec::new() });
     Outcome::Ended
 }
 
@@ -373,6 +389,16 @@ impl Host for Native {
                 std::fs::rename(&tmp, path).map_err(|e| format!("{LEASE}: {e}"))
             }
         }
+    }
+    fn lease_taken(&self, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        while Path::new(LEASE).exists() {
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        true
     }
     fn sleep_disabled(&self) -> Result<bool, String> {
         awake_core::parse_sleep_disabled(&run(PMSET, &["-g"])?).ok_or_else(|| "pmset -g has no SleepDisabled".into())
@@ -589,6 +615,7 @@ mod tests {
         reports: Mutex<Vec<Report>>,
         locks: Mutex<u32>,
         guard: AtomicBool,
+        guard_takes_sleep: bool,
         lock_takes: bool,
         other: Option<u32>,
         interrupt_at: Option<(u32, Interrupt)>,
@@ -615,6 +642,7 @@ mod tests {
             reports: Mutex::new(Vec::new()),
             locks: Mutex::new(0),
             guard: AtomicBool::new(true),
+            guard_takes_sleep: true,
             lock_takes: true,
             other: None,
             interrupt_at: None,
@@ -642,6 +670,12 @@ mod tests {
         fn lease(&self, lease: Option<Lease>) -> Result<(), String> {
             self.leases.lock().unwrap().push(lease);
             Ok(())
+        }
+        fn lease_taken(&self, _: Duration) -> bool {
+            if self.guard_takes_sleep {
+                self.leases.lock().unwrap().push(None); // the guard removes it
+            }
+            self.guard_takes_sleep
         }
         fn sleep_disabled(&self) -> Result<bool, String> {
             Ok(self.guard.load(Ordering::SeqCst))
@@ -687,11 +721,10 @@ mod tests {
         f.script.lock().unwrap().push((4, MacState { battery: Some(19), locked: true, ..mac() }));
         assert_eq!(run_session(&f, NATIVE_PACE, 30, 20), Outcome::Ended);
         assert_eq!(*f.locks.lock().unwrap(), 1, "locked once at start");
-        let l = f.leases();
-        assert!(matches!(l.first(), Some(Some(Lease { want: Want::Awake, .. }))));
-        assert!(matches!(l.last(), Some(Some(Lease { want: Want::Sleep, .. }))), "{l:?}");
+        assert_asked_sleep(&f);
         let r = f.last_report();
         assert_eq!((r.phase, r.line.as_str()), (Phase::Ended, "the battery fell to 19%; the Mac goes to sleep"));
+        assert_eq!(r.warning, None);
     }
 
     #[test]
@@ -699,7 +732,7 @@ mod tests {
         let f = fake();
         assert_eq!(run_session(&f, NATIVE_PACE, 1, 20), Outcome::Ended);
         assert!(f.last_report().line.starts_with("time is up"));
-        assert!(matches!(f.leases().last(), Some(Some(Lease { want: Want::Sleep, .. }))));
+        assert_asked_sleep(&f);
     }
 
     #[test]
@@ -749,6 +782,24 @@ mod tests {
         f.script.lock().unwrap().push((3, MacState { thermal: Thermal::Serious, locked: true, ..mac() }));
         assert_eq!(run_session(&f, NATIVE_PACE, 30, 20), Outcome::Ended);
         assert_eq!(f.last_report().line, "the Mac got hot (Serious); the Mac goes to sleep");
-        assert!(matches!(f.leases().last(), Some(Some(Lease { want: Want::Sleep, .. }))));
+        assert_asked_sleep(&f);
+    }
+
+    /// The session wrote a sleep request, and only the guard took it away.
+    fn assert_asked_sleep(f: &Fake) {
+        let l = f.leases();
+        assert!(matches!(l.first(), Some(Some(Lease { want: Want::Awake, .. }))), "{l:?}");
+        assert!(matches!(l[l.len() - 2], Some(Lease { want: Want::Sleep, .. })), "{l:?}");
+        assert_eq!(l.last(), Some(&None), "{l:?}");
+    }
+
+    #[test]
+    fn a_sleep_request_the_guard_never_takes_is_taken_back_and_said() {
+        let f = Fake { guard_takes_sleep: false, ..fake() };
+        f.script.lock().unwrap().push((3, MacState { thermal: Thermal::Critical, locked: true, ..mac() }));
+        assert_eq!(run_session(&f, NATIVE_PACE, 30, 20), Outcome::Ended);
+        let r = f.last_report();
+        assert!(r.warning.as_deref().is_some_and(|w| w.contains("not put to sleep")), "{r:?}");
+        assert_eq!(f.leases().last(), Some(&None), "the session removed its own request");
     }
 }

@@ -82,7 +82,10 @@ in
         Microphone, Speech Recognition) persist across rebuilds instead of
         resetting each time the ad-hoc signature's cdhash changes. When null,
         falls back to a self-signed `MCMonad` certificate if one is present,
-        otherwise the ad-hoc signature from the build is kept.
+        otherwise the ad-hoc signature from the build is kept. With an
+        identity, the bundles are signed before they are installed: if
+        signing fails the activation stops and the installed apps are left
+        as they were.
       '';
       example = "Apple Development: you@example.com (TEAMID)";
     };
@@ -164,69 +167,91 @@ in
       recursive = true;
     };
 
+    # AI-assisted update (installMcmonadApp, staging and signing): model
+    # claude-fable-5-2; reasoning effort unavailable (not exposed by the
+    # harness).
     home.activation.installMcmonadApp =
       lib.hm.dag.entryAfter [ "writeBoundary" ] ''
         run mkdir -p ${lib.escapeShellArg "${homeDir}/Applications"}
-        run ${pkgs.rsync}/bin/rsync \
-          --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
-          ${app}/Applications/MCMonad.app/ \
-          ${lib.escapeShellArg bundlePath}/
-        # mcmonad-core is a SEPARATE top-level app (own TCC identity).
-        run ${pkgs.rsync}/bin/rsync \
-          --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
-          ${app}/Applications/MCMonadCore.app/ \
-          ${lib.escapeShellArg coreBundlePath}/
 
-        # Re-sign the bundle with a stable code identity so TCC grants
-        # (Accessibility, Microphone, Speech Recognition) survive rebuilds.
-        # Every Nix rebuild produces an adhoc binary whose Identifier embeds a
-        # fresh content hash; TCC treats it as a brand-new client at the same
-        # path, so the grant doesn't carry over and windows stop placing /
-        # the mic stops working until you re-grant. A stable signature fixes
-        # the identity. Prefer an explicitly configured identity
-        # (services.mcmonad.signingIdentity — e.g. an Apple Development /
-        # Developer ID cert, by name or SHA-1); otherwise fall back to a
-        # self-signed `MCMonad` cert if present. Dylibs are signed first, then
-        # the executables, with the SAME identity, so library validation
-        # passes for the now-team-signed mcmonad-core. If neither is
-        # available the bundle keeps its adhoc signature.
+        # A stable code identity is what lets TCC grants (Accessibility,
+        # Screen Recording, Microphone, Speech Recognition) survive
+        # rebuilds. Every Nix rebuild produces an adhoc binary with a fresh
+        # content hash; TCC treats it as a brand-new client at the same
+        # path, so the grant does not carry over: mcmonad-core refuses to
+        # start and no window is placed until the user grants it again.
+        # The identity is services.mcmonad.signingIdentity (an Apple
+        # Development / Developer ID cert, by name or SHA-1), or else a
+        # self-signed `MCMonad` cert if the keychain has one. With neither,
+        # the bundles keep their adhoc signature.
         mcmonad_sign_id=${lib.escapeShellArg (if cfg.signingIdentity != null then cfg.signingIdentity else "")}
         if [ -z "$mcmonad_sign_id" ] && /usr/bin/security find-certificate -c MCMonad >/dev/null 2>&1; then
             mcmonad_sign_id=MCMonad
         fi
-        mcmonad_app_contents=${lib.escapeShellArg "${bundlePath}/Contents"}
 
-        # Re-sign with a stable identity so TCC grants (Accessibility,
-        # Microphone, Speech Recognition) survive rebuilds. Sign dylibs and the
-        # haskell binary first, then mcmonad-core LAST — with the microphone
-        # entitlement, after its dylib deps are signed. Core's stable identity
-        # as a SEPARATE TOP-LEVEL bundle (com.mcmonad.core, launched via `open`
-        # by the launcher) is what lets the Spotlight voice input reach the
-        # microphone.
-        if [ -n "$mcmonad_sign_id" ]; then
-            # The helpers (later, awake, awake-guard) are nested code in core's
-            # bundle: signed before it, with the same identity, which is also
-            # what SMAppService needs to run the guard for the app.
+        mcmonad_sync() {
+            run ${pkgs.rsync}/bin/rsync \
+              --archive --checksum --copy-unsafe-links --delete --chmod=u+w \
+              "$1/" "$2/"
+        }
+
+        if [ -z "$mcmonad_sign_id" ]; then
+            mcmonad_sync ${app}/Applications/MCMonad.app ${lib.escapeShellArg bundlePath}
+            # mcmonad-core is a SEPARATE top-level app (own TCC identity).
+            mcmonad_sync ${app}/Applications/MCMonadCore.app ${lib.escapeShellArg coreBundlePath}
+        else
+            # With an identity, the bundles are copied and signed in a
+            # staging directory, and replace the installed ones only once
+            # every signature is made. Signing in place meant a signing
+            # failure (the keychain locked, the key not reachable from the
+            # session running the switch) left the adhoc store copy
+            # installed: on 2026-11-18 that took mcmonad down for five
+            # hours and cost the user every grant. Now the activation stops
+            # and the installed, working apps are untouched.
+            mcmonad_stage=${lib.escapeShellArg "${homeDir}/Applications/.mcmonad-staging"}
+            run rm -rf "$mcmonad_stage"
+            run mkdir -p "$mcmonad_stage"
+            mcmonad_sync ${app}/Applications/MCMonad.app "$mcmonad_stage/MCMonad.app"
+            mcmonad_sync ${app}/Applications/MCMonadCore.app "$mcmonad_stage/MCMonadCore.app"
+
+            mcmonad_sign() {
+                if ! run /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$@"; then
+                    echo "mcmonad: signing with '$mcmonad_sign_id' failed (above); the installed apps are unchanged." >&2
+                    echo "mcmonad: unlock the login keychain and run the switch again from a session that can use it." >&2
+                    run rm -rf "$mcmonad_stage"
+                    exit 1
+                fi
+            }
+
+            # Dylibs and the haskell binary first, then the helpers, then
+            # mcmonad-core LAST, all with the SAME identity so library
+            # validation passes. The helpers (later, awake, awake-guard)
+            # are nested code in core's bundle: signed before it, with the
+            # same identity, which is also what SMAppService needs to run
+            # the guard for the app.
             for f in \
-                "$mcmonad_app_contents/Frameworks/"*.dylib \
-                "$mcmonad_app_contents/MacOS/mcmonad" \
-                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/later \
-                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/awake \
-                ${lib.escapeShellArg coreBundlePath}/Contents/Helpers/awake-guard; do
+                "$mcmonad_stage/MCMonad.app/Contents/Frameworks/"*.dylib \
+                "$mcmonad_stage/MCMonad.app/Contents/MacOS/mcmonad" \
+                "$mcmonad_stage/MCMonadCore.app/Contents/Helpers/later" \
+                "$mcmonad_stage/MCMonadCore.app/Contents/Helpers/awake" \
+                "$mcmonad_stage/MCMonadCore.app/Contents/Helpers/awake-guard"; do
                 [ -e "$f" ] || continue
-                /usr/bin/codesign --force --sign "$mcmonad_sign_id" "$f" 2>/dev/null || \
-                    echo "mcmonad: codesign $f with '$mcmonad_sign_id' failed; leaving adhoc" >&2
+                mcmonad_sign "$f"
             done
-            # Sign core's SEPARATE TOP-LEVEL bundle (MCMonadCore.app) — sealing
-            # the bundle is what gives com.mcmonad.core a stable, computable
-            # designated code requirement, so TCC can present and persist the
-            # mic/speech grant across rebuilds. (Top-level placement is what lets
-            # TCC attribute the request to com.mcmonad.core at all; nested inside
-            # MCMonad.app it resolved to com.mcmonad.app → Code=5, no prompt.)
-            /usr/bin/codesign --force --sign "$mcmonad_sign_id" \
-                --entitlements "$mcmonad_app_contents/Resources/mcmonad-core.entitlements" \
-                ${lib.escapeShellArg coreBundlePath} 2>/dev/null || \
-                echo "mcmonad: codesign MCMonadCore.app with '$mcmonad_sign_id' failed; leaving adhoc" >&2
+            # Sealing core's SEPARATE TOP-LEVEL bundle (MCMonadCore.app) is
+            # what gives com.mcmonad.core a stable, computable designated
+            # code requirement, so TCC can present and persist the grants
+            # across rebuilds. (Top-level placement is what lets TCC
+            # attribute the request to com.mcmonad.core at all; nested
+            # inside MCMonad.app it resolved to com.mcmonad.app -> Code=5,
+            # no prompt.)
+            mcmonad_sign \
+                --entitlements "$mcmonad_stage/MCMonad.app/Contents/Resources/mcmonad-core.entitlements" \
+                "$mcmonad_stage/MCMonadCore.app"
+
+            mcmonad_sync "$mcmonad_stage/MCMonad.app" ${lib.escapeShellArg bundlePath}
+            mcmonad_sync "$mcmonad_stage/MCMonadCore.app" ${lib.escapeShellArg coreBundlePath}
+            run rm -rf "$mcmonad_stage"
         fi
 
         # Register the top-level core app with LaunchServices so TCC resolves

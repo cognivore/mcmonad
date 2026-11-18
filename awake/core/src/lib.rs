@@ -69,6 +69,20 @@ pub struct Session {
     pub floor: u8,
 }
 
+/// How long a lease stays good past the moment it is about: the session
+/// ends first (it looks every few seconds) and asks for sleep itself; the
+/// guard's expiry is only the backstop for a session that hangs.
+pub const LEASE_GRACE: u64 = 60;
+
+impl Session {
+    /// The lease this session holds, written at `now`. It outlives the
+    /// session's end by [`LEASE_GRACE`], so a request to sleep made when
+    /// time is up is still good when the guard reads it.
+    pub fn lease(&self, pid: u32, want: Want, now: u64) -> Lease {
+        Lease { pid, until: now.max(self.until) + LEASE_GRACE, want }
+    }
+}
+
 /// No session is longer than this, whatever was asked.
 pub const MAX_SECONDS: u64 = 12 * 60 * 60;
 /// The default battery floor.
@@ -526,6 +540,21 @@ mod tests {
             ..sight()
         };
         assert_eq!(guard_step(&far).set_disabled, None, "a lease past the cap is not honoured");
+    }
+
+    #[test]
+    fn a_session_ends_before_its_lease_and_its_sleep_request_is_honoured() {
+        let s = session();
+        let awake = s.lease(7, Want::Awake, s.started);
+        let at_end = GuardSight { now: s.until, lease: Some(awake), sleep_disabled: true, owned: true, lid_closed: false, ..sight() };
+        assert_eq!(guard_step(&at_end), GuardPlan::default(), "the guard still holds when time is up");
+        assert_eq!(tick(&s, &Observation { now: s.until, ..obs() }), Tick::End(EndReason::TimeUp));
+        let asked = s.lease(7, Want::Sleep, s.until + 4);
+        let answer = GuardSight { now: s.until + 5, lease: Some(asked), ..at_end };
+        assert_eq!(guard_step(&answer), GuardPlan { set_disabled: Some(false), remove_lease: true, sleep_now: true });
+        let long = Session { until: s.started + MAX_SECONDS, ..s };
+        let capped = GuardSight { now: s.started, lease: Some(long.lease(7, Want::Awake, s.started)), ..sight() };
+        assert_eq!(guard_step(&capped).set_disabled, Some(true), "the longest session's lease is within the cap");
     }
 
     #[test]

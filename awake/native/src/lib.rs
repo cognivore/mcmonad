@@ -126,7 +126,7 @@ pub fn run_session(host: &impl Host, pace: Pace, minutes: u32, floor: u8) -> Out
         Ok(s) => s,
         Err(e) => return refuse(e.to_string()),
     };
-    if let Err(e) = host.lease(Some(Lease { pid: std::process::id(), until: session.until, want: Want::Awake })) {
+    if let Err(e) = host.lease(Some(session.lease(std::process::id(), Want::Awake, host.now()))) {
         return fail(format!("writing the lease failed: {e}"));
     }
     host.log(&format!("start {session:?}"));
@@ -160,35 +160,37 @@ pub fn run_session(host: &impl Host, pace: Pace, minutes: u32, floor: u8) -> Out
             }
             Err(_) => return end(host, &session, "could not look at the Mac three times in a row".into(), true),
         };
+        // The session's own end comes first: when time is up, the guard is
+        // still holding (the lease has LEASE_GRACE to run) and gets asked to
+        // sleep, instead of being blamed.
+        let (lock, display_off) = match awake_core::tick(&session, &o) {
+            Tick::End(reason) => return end(host, &session, ended(reason), true),
+            Tick::Continue { lock, display_off } => (lock, display_off),
+        };
         if ticks >= pace.guard_grace && !host.sleep_disabled().unwrap_or(false) {
             return end(host, &session, GUARD_MISSING.into(), false);
         }
-        match awake_core::tick(&session, &o) {
-            Tick::End(reason) => return end(host, &session, ended(reason), true),
-            Tick::Continue { lock, display_off } => {
-                warning = None;
-                if lock {
-                    warning = match host.lock() {
-                        Err(e) => Some(format!("the lid is closed and locking failed: {e}")),
-                        // Once is a lid closed since the last look; twice is a lock that does not take.
-                        Ok(()) if ticks > 1 => Some("the lid is closed but the screen did not lock".into()),
-                        Ok(()) => None,
-                    };
-                }
-                if display_off && let Err(e) = host.display_off() {
-                    warning = Some(format!("turning the display off failed: {e}"));
-                }
-                let now = Report {
-                    phase: Phase::Running,
-                    line: awake_core::describe(&session, &o),
-                    warning: warning.clone(),
-                    holders: host.holders(),
-                };
-                if now != last {
-                    host.report(&now);
-                    last = now;
-                }
-            }
+        warning = None;
+        if lock {
+            warning = match host.lock() {
+                Err(e) => Some(format!("the lid is closed and locking failed: {e}")),
+                // Once is a lid closed since the last look; twice is a lock that does not take.
+                Ok(()) if ticks > 1 => Some("the lid is closed but the screen did not lock".into()),
+                Ok(()) => None,
+            };
+        }
+        if display_off && let Err(e) = host.display_off() {
+            warning = Some(format!("turning the display off failed: {e}"));
+        }
+        let now = Report {
+            phase: Phase::Running,
+            line: awake_core::describe(&session, &o),
+            warning: warning.clone(),
+            holders: host.holders(),
+        };
+        if now != last {
+            host.report(&now);
+            last = now;
         }
     }
 }
@@ -259,7 +261,7 @@ const GUARD_ANSWER: Duration = Duration::from_secs(10);
 fn end(host: &impl Host, session: &Session, why: String, sleep: bool) -> Outcome {
     let mut warning = None;
     if sleep {
-        let asked = host.lease(Some(Lease { pid: std::process::id(), until: session.until, want: Want::Sleep }));
+        let asked = host.lease(Some(session.lease(std::process::id(), Want::Sleep, host.now())));
         if let Err(e) = &asked {
             host.log(&format!("lease {e}"));
         }
@@ -785,11 +787,15 @@ mod tests {
         assert_asked_sleep(&f);
     }
 
-    /// The session wrote a sleep request, and only the guard took it away.
+    /// The session wrote a sleep request that is still good, and only the
+    /// guard took it away.
     fn assert_asked_sleep(f: &Fake) {
         let l = f.leases();
         assert!(matches!(l.first(), Some(Some(Lease { want: Want::Awake, .. }))), "{l:?}");
-        assert!(matches!(l[l.len() - 2], Some(Lease { want: Want::Sleep, .. })), "{l:?}");
+        match l[l.len() - 2] {
+            Some(Lease { want: Want::Sleep, until, .. }) => assert!(until > f.now(), "an expired request: {l:?}"),
+            other => panic!("no sleep request: {other:?} in {l:?}"),
+        }
         assert_eq!(l.last(), Some(&None), "{l:?}");
     }
 

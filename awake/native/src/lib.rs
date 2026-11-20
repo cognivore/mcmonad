@@ -104,7 +104,7 @@ impl Outcome {
 const GUARD_MISSING: &str = "the guard is not keeping the Mac awake: allow MCMonadCore in System Settings > General > Login Items & Extensions";
 
 /// Run one session to its end.
-pub fn run_session(host: &impl Host, pace: Pace, minutes: u32, floor: u8) -> Outcome {
+pub fn run_session(host: &impl Host, pace: Pace, minutes: u64, floor: u8) -> Outcome {
     let refuse = |why: String| {
         host.log(&format!("refused {why}"));
         host.report(&Report { phase: Phase::Refused, line: why, warning: None, holders: Vec::new() });
@@ -122,7 +122,7 @@ pub fn run_session(host: &impl Host, pace: Pace, minutes: u32, floor: u8) -> Out
         Ok(m) => observation(host.now(), &m),
         Err(e) => return fail(format!("could not look at the Mac: {e}")),
     };
-    let session = match awake_core::start(&o, u64::from(minutes), floor) {
+    let session = match awake_core::start(&o, minutes, floor) {
         Ok(s) => s,
         Err(e) => return refuse(e.to_string()),
     };
@@ -195,12 +195,24 @@ pub fn run_session(host: &impl Host, pace: Pace, minutes: u32, floor: u8) -> Out
     }
 }
 
-/// Look at the Mac and say what a session would do now, changing nothing:
-/// no lease, no lock, no display change.
-pub fn check(host: &impl Host, minutes: u32, floor: u8) -> Result<String, String> {
-    let m = host.observe().map_err(|e| format!("could not look at the Mac: {e}"))?;
+/// What `awake check` found: a session's plan (phase `Ready`) or why there
+/// would be none (`Refused`, `Failed`), and what it saw of the Mac.
+pub struct Check {
+    pub report: Report,
+    /// The readings, in words; none when the Mac could not be read.
+    pub seen: Option<String>,
+}
+
+/// Look at the Mac and say what a session of `length` would do now,
+/// changing nothing: no lease, no lock, no display change.
+pub fn check(host: &impl Host, length: &str, floor: u8) -> Check {
+    let answer = |phase, line: String, seen| Check { report: Report { phase, line, warning: None, holders: Vec::new() }, seen };
+    let m = match host.observe() {
+        Ok(m) => m,
+        Err(e) => return answer(Phase::Failed, format!("could not look at the Mac: {e}"), None),
+    };
     let o = observation(host.now(), &m);
-    let seen = format!(
+    let seen = Some(format!(
         "battery {}{}, heat {:?}, lid {}, display {}, screen {}",
         m.battery.map_or_else(|| String::from("none"), |b| format!("{b}%")),
         if m.on_ac { " on power" } else { " on battery" },
@@ -208,13 +220,17 @@ pub fn check(host: &impl Host, minutes: u32, floor: u8) -> Result<String, String
         if m.lid_closed { "closed" } else { "open" },
         if m.display_asleep { "asleep" } else { "on" },
         if m.locked { "locked" } else { "unlocked" },
-    );
-    let verdict = match host.other_session() {
-        Some(pid) => format!("refused: a session is already running (pid {pid})"),
-        None => awake_core::start(&o, u64::from(minutes), floor)
-            .map_or_else(|e| format!("refused: {e}"), |s| format!("would run: {}", awake_core::describe(&s, &o))),
-    };
-    Ok(format!("{seen}\n{verdict}"))
+    ));
+    if let Some(pid) = host.other_session() {
+        return answer(Phase::Refused, format!("a session is already running (pid {pid}); `awake stop` ends it"), seen);
+    }
+    let planned = awake_core::parse_minutes(length)
+        .map_err(|e| e.to_string())
+        .and_then(|minutes| awake_core::start(&o, minutes, floor).map_err(|e| e.to_string()));
+    match planned {
+        Ok(session) => answer(Phase::Ready, awake_core::describe_plan(&session, &o), seen),
+        Err(why) => answer(Phase::Refused, why, seen),
+    }
 }
 
 enum Stop {
@@ -440,6 +456,7 @@ impl Host for Native {
             Output::Json => r.encode(),
             Output::Words => {
                 let mut s = match r.phase {
+                    Phase::Ready => format!("awake: would run: {}", r.line),
                     Phase::Running => format!("awake: {}", r.line),
                     Phase::Ended => format!("awake: ended: {}", r.line),
                     Phase::Refused => format!("awake: refused: {}", r.line),
@@ -776,6 +793,21 @@ mod tests {
             assert_eq!(f.leases().last(), Some(&None), "{why:?}: lease removed, no sleep asked");
             assert!(f.last_report().line.starts_with(words), "{why:?}");
         }
+    }
+
+    #[test]
+    fn a_check_plans_or_refuses_in_awake_s_words_and_changes_nothing() {
+        let f = fake();
+        let c = check(&f, "1h30m", 20);
+        assert_eq!((c.report.phase, c.report.line.as_str()), (Phase::Ready, "1:30 · 80% · floor 20%"));
+        assert!(c.seen.is_some_and(|s| s.contains("lid closed")));
+        let bad = check(&f, "2x", 20);
+        assert_eq!(bad.report.phase, Phase::Refused);
+        assert!(bad.report.line.contains("not a length of time"), "{:?}", bad.report);
+        assert_eq!(check(&f, "13h", 20).report.phase, Phase::Refused, "longer than allowed");
+        let busy = Fake { other: Some(4242), ..fake() };
+        assert!(check(&busy, "30", 20).report.line.contains("4242"));
+        assert!(f.leases().is_empty() && *f.locks.lock().unwrap() == 0, "a check writes no lease and locks nothing");
     }
 
     #[test]

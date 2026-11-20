@@ -88,6 +88,46 @@ pub const MAX_SECONDS: u64 = 12 * 60 * 60;
 /// The default battery floor.
 pub const DEFAULT_FLOOR: u8 = 20;
 
+/// A length of time that is not one awake can read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LengthError {
+    pub said: String,
+}
+
+impl core::fmt::Display for LengthError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?} is not a length of time: say minutes (90), hours (2h) or both (1h30m)", self.said)
+    }
+}
+
+/// Minutes from a length of time as a person types it: minutes (`90`,
+/// `90m`, `90min`), hours (`2h`) or both (`1h30m`, `1h30`, `1h 30m`), in
+/// whole numbers, any case. Whether that many minutes is allowed is
+/// [`start`]'s to say.
+pub fn parse_minutes(said: &str) -> Result<u64, LengthError> {
+    let bad = || LengthError { said: said.into() };
+    let w: String = said.split_whitespace().collect::<String>().to_ascii_lowercase();
+    let number = |digits: &str| -> Result<u64, LengthError> {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        digits.parse().map_err(|_| bad())
+    };
+    let (hours, rest) = match w.split_once('h') {
+        Some((h, rest)) => (Some(number(h)?), rest),
+        None => (None, w.as_str()),
+    };
+    let minutes = match rest.strip_suffix("min").or_else(|| rest.strip_suffix('m')) {
+        Some(m) => Some(number(m)?),
+        None if rest.is_empty() => None,
+        None => Some(number(rest)?),
+    };
+    if hours.is_none() && minutes.is_none() {
+        return Err(bad());
+    }
+    hours.unwrap_or(0).checked_mul(60).and_then(|h| h.checked_add(minutes.unwrap_or(0))).ok_or_else(bad)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartError {
     ZeroLength,
@@ -346,17 +386,33 @@ pub fn parse_holders(assertions: &str) -> Vec<Holder> {
 
 /// The menu's one-line state.
 pub fn describe(s: &Session, o: &Observation) -> String {
-    let left = s.until.saturating_sub(o.now);
+    format!("{} left · {}", clock(s.until.saturating_sub(o.now)), conditions(s, o))
+}
+
+/// What a session would be if started now, for a preview.
+pub fn describe_plan(s: &Session, o: &Observation) -> String {
+    format!("{} · {}", clock(s.until.saturating_sub(s.started)), conditions(s, o))
+}
+
+/// `h:mm`.
+fn clock(seconds: u64) -> String {
+    format!("{}:{:02}", seconds / 3600, (seconds % 3600) / 60)
+}
+
+fn conditions(s: &Session, o: &Observation) -> String {
     let battery = match o.battery {
         Some(b) => format!("{b}%{}", if o.on_ac { " on power" } else { "" }),
         None => String::from("no battery"),
     };
-    format!("{}:{:02} left · {battery} · floor {}%", left / 3600, (left % 3600) / 60, s.floor)
+    format!("{battery} · floor {}%", s.floor)
 }
 
 /// Where a session stands, as `awake --json` reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    /// `awake check`: a session would start; `line` says for how long and
+    /// on what charge.
+    Ready,
     /// Keeping the Mac awake; `line` says for how long and on what charge.
     Running,
     /// Over; `line` says why and whether the Mac goes to sleep.
@@ -386,6 +442,7 @@ pub const REPORT_PROTOCOL: u32 = 1;
 impl Report {
     pub fn encode(&self) -> String {
         let phase = match self.phase {
+            Phase::Ready => "ready",
             Phase::Running => "running",
             Phase::Ended => "ended",
             Phase::Refused => "refused",
@@ -596,6 +653,40 @@ mod tests {
     #[test]
     fn describes_the_session() {
         assert_eq!(describe(&session(), &obs()), "1:00 left · 80% · floor 20%");
+    }
+
+    #[test]
+    fn lengths_are_read_as_people_type_them() {
+        for (said, minutes) in [
+            ("90", 90),
+            ("90m", 90),
+            ("90min", 90),
+            ("2h", 120),
+            ("2H", 120),
+            ("1h30m", 90),
+            ("1h30", 90),
+            ("1h 30m", 90),
+            (" 45 ", 45),
+            ("0", 0),
+        ] {
+            assert_eq!(parse_minutes(said), Ok(minutes), "{said:?}");
+        }
+        for said in ["", "h", "m", "2x", "1.5h", "-5", "1h2h", "1hm", "h30", "m30", "99999999999999999999h"] {
+            assert_eq!(parse_minutes(said), Err(LengthError { said: said.into() }), "{said:?}");
+        }
+        assert_eq!(
+            LengthError { said: "2x".into() }.to_string(),
+            "\"2x\" is not a length of time: say minutes (90), hours (2h) or both (1h30m)"
+        );
+        assert_eq!(start(&obs(), parse_minutes("0").unwrap_or(0), 20), Err(StartError::ZeroLength), "zero is start's to refuse");
+    }
+
+    #[test]
+    fn a_plan_says_how_long_and_on_what_charge() {
+        assert_eq!(describe_plan(&session(), &obs()), "1:00 · 80% · floor 20%");
+        let later = Observation { now: 1_000 + 600, ..obs() };
+        assert_eq!(describe_plan(&session(), &later), "1:00 · 80% · floor 20%", "a plan is the whole length");
+        assert_eq!(describe(&session(), &later), "0:50 left · 80% · floor 20%");
     }
 
     #[test]

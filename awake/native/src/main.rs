@@ -4,64 +4,74 @@
 //! AI-generated module: model Claude Opus 5.5 (`claude-opus-5-5`); reasoning
 //! effort unavailable (not exposed by the harness).
 //!
+//! AI-assisted update (lengths such as 2h and 1h30m, and `check --json` for
+//! mcmonad's launcher): model Claude Opus 5.5 (`claude-opus-5-5`); reasoning
+//! effort unavailable (not exposed by the harness).
+//!
 //! ```text
-//! awake <minutes> [--floor <percent>] [--json]
-//! awake check [<minutes>] [--floor <percent>]
+//! awake <length> [--floor <percent>] [--json]
+//! awake check [<length>] [--floor <percent>] [--json]
 //! awake stop
 //! ```
 //!
-//! A session runs in the foreground until time, the battery floor (default
-//! 20%) or the heat ends it, and then puts the Mac to sleep. Ctrl-C, or
-//! `awake stop` from elsewhere, ends it early without sleeping. With
-//! `--json` it prints protocol-1 report lines for mcmonad and also ends
-//! when stdin closes. `awake check` prints what it sees of the Mac and what
-//! a session would do, and changes nothing. The root guard beside this program in
-//! MCMonadCore.app is what actually holds sleep off; it honours only the
-//! `awake` beside it.
+//! A length is minutes (`90`), hours (`2h`) or both (`1h30m`); it may span
+//! words (`1h 30m`). A session runs in the foreground until time, the
+//! battery floor (default 20%) or the heat ends it, and then puts the Mac to
+//! sleep. Ctrl-C, or `awake stop` from elsewhere, ends it early without
+//! sleeping. With `--json` it prints protocol-1 report lines for mcmonad and
+//! also ends when stdin closes. `awake check` says what it sees of the Mac
+//! and what a session would do (with `--json`, one report in phase `ready`,
+//! `refused` or `failed`), and changes nothing. The root guard beside this
+//! program in MCMonadCore.app is what actually holds sleep off; it honours
+//! only the `awake` beside it.
 
-use awake_core::DEFAULT_FLOOR;
+use awake_core::{DEFAULT_FLOOR, Phase, Report};
 use awake_native::{
-    NATIVE_PACE, Native, Output, check, read_lease, run_session, runs, stop_on_signals, stop_when_stdin_closes, this_exe,
+    Host as _, NATIVE_PACE, Native, Output, check, read_lease, run_session, runs, stop_on_signals, stop_when_stdin_closes,
+    this_exe,
 };
 
-const USAGE: &str = "usage: awake <minutes> [--floor <percent>] [--json] | awake check [<minutes>] [--floor <percent>] | awake stop";
+const USAGE: &str = "usage: awake <length> [--floor <percent>] [--json] | awake check [<length>] [--floor <percent>] [--json] | awake stop\n       a length is minutes (90), hours (2h) or both (1h30m)";
+
+/// What `awake check` plans when no length is given.
+const CHECK_LENGTH: &str = "30";
 
 enum Command {
-    Session { minutes: u32, floor: u8, json: bool },
-    Check { minutes: u32, floor: u8 },
+    Session { length: String, floor: u8, json: bool },
+    Check { length: String, floor: u8, json: bool },
     Stop,
 }
 
 fn parse(args: &[String]) -> Result<Command, String> {
-    let mut it = args.iter();
-    let first = it.next().ok_or("say how many minutes")?;
-    if first == "stop" {
-        return if it.next().is_none() { Ok(Command::Stop) } else { Err("`stop` takes nothing more".into()) };
-    }
-    let checking = first == "check";
-    let mut rest: Vec<&String> = it.collect();
-    let minutes_word = if checking {
-        if rest.first().is_some_and(|w| !w.starts_with("--")) { Some(rest.remove(0)) } else { None }
-    } else {
-        Some(first)
+    let (checking, rest) = match args.split_first() {
+        Some((first, rest)) if first == "check" => (true, rest),
+        Some((first, rest)) if first == "stop" => {
+            return if rest.is_empty() { Ok(Command::Stop) } else { Err("`stop` takes nothing more".into()) };
+        }
+        Some(_) => (false, args),
+        None => return Err("say how long, for example `awake 90` or `awake 2h`".into()),
     };
-    let minutes = match minutes_word {
-        Some(w) => w.parse::<u32>().map_err(|_| format!("{w:?} is not a number of minutes"))?,
-        None => 30,
-    };
+    let mut length: Vec<&str> = Vec::new();
     let (mut floor, mut json) = (DEFAULT_FLOOR, false);
-    let mut it = rest.into_iter();
+    let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--json" if !checking => json = true,
+            "--json" => json = true,
             "--floor" => {
                 let p = it.next().ok_or("--floor needs a percent")?;
                 floor = p.parse::<u8>().map_err(|_| format!("{p:?} is not a percent"))?;
             }
-            other => return Err(format!("{other:?} is not an option")),
+            option if option.starts_with("--") => return Err(format!("{option:?} is not an option")),
+            word => length.push(word),
         }
     }
-    Ok(if checking { Command::Check { minutes, floor } } else { Command::Session { minutes, floor, json } })
+    let length = length.join(" ");
+    Ok(match (checking, length.is_empty()) {
+        (true, true) => Command::Check { length: CHECK_LENGTH.into(), floor, json },
+        (true, false) => Command::Check { length, floor, json },
+        (false, true) => return Err("say how long, for example `awake 90` or `awake 2h`".into()),
+        (false, false) => Command::Session { length, floor, json },
+    })
 }
 
 fn main() {
@@ -77,21 +87,31 @@ fn main() {
             std::process::exit(64);
         }
     };
+    let output = |json| if json { Output::Json } else { Output::Words };
     match command {
         Command::Stop => std::process::exit(stop()),
-        Command::Check { minutes, floor } => match check(&Native::new(Output::Words), minutes, floor) {
-            Ok(text) => println!("{text}"),
-            Err(e) => {
-                eprintln!("awake: {e}");
-                std::process::exit(1);
+        Command::Check { length, floor, json } => {
+            let host = Native::new(output(json));
+            let c = check(&host, &length, floor);
+            if !json && let Some(seen) = &c.seen {
+                println!("{seen}");
             }
-        },
-        Command::Session { minutes, floor, json } => {
+            host.report(&c.report);
+            std::process::exit(if c.report.phase == Phase::Ready { 0 } else { 2 });
+        }
+        Command::Session { length, floor, json } => {
+            let host = Native::new(output(json));
+            let minutes = match awake_core::parse_minutes(&length) {
+                Ok(m) => m,
+                Err(e) => {
+                    host.report(&Report { phase: Phase::Refused, line: e.to_string(), warning: None, holders: Vec::new() });
+                    std::process::exit(2);
+                }
+            };
             stop_on_signals();
             if json {
                 stop_when_stdin_closes();
             }
-            let host = Native::new(if json { Output::Json } else { Output::Words });
             std::process::exit(run_session(&host, NATIVE_PACE, minutes, floor).code());
         }
     }

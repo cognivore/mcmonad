@@ -1,11 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Properties where
 
+-- AI-assisted update (confirmed-focus regression): model GPT-5; reasoning
+-- effort unavailable (not exposed by the harness).
+
 import Test.QuickCheck
 import qualified XMonad.StackSet as W
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Rectangle(..)
-    , updateAffinities, visibleAffinities, resolveFocusedWindow, resolveFrontApp
+    , updateAffinities, visibleAffinities, resolveFocusedWindow
     , FocusIntent(..), armingIntent, isFocusIntentTarget
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
     , withinSettleWindow
@@ -13,7 +16,7 @@ import MCMonad.Core
     , PendingWindow(..), Timer(..), LayoutClass(..)
     )
 import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent, OverlayScreenEntry(..), OverlayIgnoredWindow(..), parseIgnoredFact)
-import MCMonad.Main (onHiddenWorkspace, pairBurst)
+import MCMonad.Main (onHiddenWorkspace, pairBurst, confirmedFocusTarget)
 import MCMonad.Affinity
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (parseMaybe)
@@ -313,7 +316,7 @@ prop_viewOnScreen_places_workspace ss =
                 let ss' = viewOnScreen sid tag ss
                 in W.currentTag ss' == tag
 
--- === FOCUS RESOLUTION (resolveFocusedWindow / resolveFrontApp) ===
+-- === FOCUS RESOLUTION ===
 --
 -- These properties guard the multi-window-per-app focus fix. The historic
 -- bug was that on every FrontAppChanged event, focus would jump to
@@ -355,20 +358,11 @@ brokenPidOnlyFocus pid ws =
         Just wr | W.peek ws /= Just wr -> Just (W.focusWindow wr ws)
         _                              -> Nothing
 
--- | Windows on the CURRENT workspace — the only set
--- 'resolveFocusedWindow' / 'resolveFrontApp' are allowed to act on.
--- Mirror of 'MCMonad.Core.currentWorkspaceWindows' kept here so the
--- tests don't depend on it being exported.
+-- | Windows on the current workspace, used to generate exact-window
+-- focus cases without depending on StackSet's internal ordering.
 currentWorkspaceWindowsForTest :: TestStackSet -> [WindowRef]
 currentWorkspaceWindowsForTest ss =
     W.integrate' (W.stack (W.workspace (W.current ss)))
-
--- Mirror of 'MCMonad.Core.visibleScreenWindows': everything displayed on
--- some monitor. This is the reach of the focus resolvers.
-visibleScreenWindowsForTest :: TestStackSet -> [WindowRef]
-visibleScreenWindowsForTest ss =
-    concatMap (W.integrate' . W.stack . W.workspace)
-              (W.current ss : W.visible ss)
 
 -- Windows parked on a hidden workspace. Permanently out of reach: no
 -- macOS focus signal may change *what is displayed*.
@@ -472,93 +466,16 @@ prop_brokenPidOnly_indistinguishable (SharedPidWindows ss w1 w2) =
         focused2 = maybe (W.peek ss) W.peek r2
     in focused1 === focused2
 
--- resolveFrontApp is a no-op when focus is already in that PID — the
--- precise AX-driven focus inside the app must survive.
-prop_frontApp_noop_within :: TestStackSet -> Property
-prop_frontApp_noop_within ss = case W.peek ss of
-    Nothing -> property True
-    Just wr -> property $ isNothing (resolveFrontApp (wrPid wr) ss)
-
--- resolveFrontApp switches focus when the user crossed app boundaries
--- *within the current workspace*. PID-only events for apps whose
--- windows are all on other workspaces (hidden or visible-secondary)
--- must NOT switch workspaces — that's the new-window-lands-on-the-
--- wrong-screen and Mod-j-leaks-to-the-other-monitor regression
--- sentinel.
-prop_frontApp_switches_within_workspace :: TestStackSet -> Property
-prop_frontApp_switches_within_workspace ss = case W.peek ss of
-    Nothing -> property True
-    Just wr ->
-        let curPids = L.nub
-                    $ filter (/= wrPid wr)
-                    $ map wrPid (currentWorkspaceWindowsForTest ss)
-        in case curPids of
-            [] -> property True
-            (p:_) -> case resolveFrontApp p ss of
-                Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
-                Nothing  -> property False  -- a current-workspace window of pid p exists; must switch
-
--- resolveFrontApp never displays a workspace that wasn't displayed. As
--- with the AX path it may move the current screen, but only among
--- monitors that are already showing those workspaces.
-prop_frontApp_never_changes_displayed_set :: TestStackSet -> Property
-prop_frontApp_never_changes_displayed_set ss =
-    let pids = L.nub $ map wrPid (W.allWindows ss)
-    in case pids of
-        [] -> property True
-        _  -> forAll (elements pids) $ \p ->
-            case resolveFrontApp p ss of
-                Nothing  -> property True
-                Just ss' -> displayedTags ss' === displayedTags ss
-  where
-    displayedTags s =
-        L.sort (map (W.tag . W.workspace) (W.current s : W.visible s))
-
--- An app whose windows are ALL on hidden workspaces is never followed:
--- activating it must not haul a hidden workspace onto a monitor.
-prop_frontApp_ignores_hidden_only_app :: TestStackSet -> Property
-prop_frontApp_ignores_hidden_only_app ss =
-    let visiblePids = map wrPid (visibleScreenWindowsForTest ss)
-        hiddenOnly  = L.nub [ wrPid w | w <- hiddenWindowsForTest ss
-                            , wrPid w `notElem` visiblePids ]
-    in case hiddenOnly of
-        [] -> property True
-        ps -> forAll (elements ps) $ \p ->
-            property $ isNothing (resolveFrontApp p ss)
-
--- A PID says nothing about *which* window was activated, so an app with
--- a window on the current screen resolves to that one — activating
--- LibreWolf must not fling the current screen to whichever monitor
--- happens to hold LibreWolf's first window in stack order.
-prop_frontApp_prefers_current_screen :: TestStackSet -> Property
-prop_frontApp_prefers_current_screen ss =
-    let here = currentWorkspaceWindowsForTest ss
-        candidates = L.nub [ wrPid w | w <- here
-                           , Just (wrPid w) /= fmap wrPid (W.peek ss) ]
-    in case candidates of
-        [] -> property True
-        ps -> forAll (elements ps) $ \p ->
-            case resolveFrontApp p ss of
-                Nothing  -> property False  -- an app window is right here
-                Just ss' -> W.currentTag ss' === W.currentTag ss
-
--- ...but when the app has no window on this screen at all, focus does
--- follow it to the monitor that has one.
-prop_frontApp_follows_to_other_screen :: TestStackSet -> Property
-prop_frontApp_follows_to_other_screen ss =
-    let herePids = map wrPid (currentWorkspaceWindowsForTest ss)
-        elsewhere = L.nub
-            [ wrPid w
-            | scr <- W.visible ss
-            , w <- W.integrate' (W.stack (W.workspace scr))
-            , wrPid w `notElem` herePids
-            ]
-    in case elsewhere of
-        [] -> property True
-        ps -> forAll (elements ps) $ \p ->
-            case resolveFrontApp p ss of
-                Nothing  -> property False  -- displayed app must resolve
-                Just ss' -> property (fmap wrPid (W.peek ss') === Just p)
+-- The FrontAppChanged handler refines its PID to one exact AX-focused
+-- identity before acting. The decision must preserve that identity rather
+-- than return whichever same-PID window happens to occur first.
+prop_confirmedFocusTarget_preserves_exact :: SharedPidWindows -> Property
+prop_confirmedFocusTarget_preserves_exact (SharedPidWindows ss w1 w2) =
+    conjoin
+        [ confirmedFocusTarget w1 ss === Just w1
+        , confirmedFocusTarget w2 ss === Just w2
+        , confirmedFocusTarget (WindowRef 4294967290 (-12345)) ss === Nothing
+        ]
 
 -- === FOCUS AUTHORITY (FocusIntent / armingIntent / isFocusIntentTarget) ===
 --
@@ -1706,6 +1623,27 @@ prop_focusByRole_visible_moves_nothing =
         shown x = L.sort (map (\s -> (W.screen s, W.tag (W.workspace s))) (W.screens x))
     in W.peek ws == Just w && W.screen (W.current ws) == S 2 && shown ws == shown ws0
 
+-- A front-app notification starts with only a PID, but the AX query that
+-- follows returns one exact WindowRef. Once refined, two windows sharing a
+-- PID must remain distinguishable even when one is on the current screen.
+prop_focusByRole_confirmed_window_beats_same_pid :: Bool
+prop_focusByRole_confirmed_window_beats_same_pid =
+    let tags      = ["1", "2"]
+        samePid   = 7
+        here      = WindowRef 70 samePid
+        confirmed = WindowRef 71 samePid
+        otherApp  = WindowRef 72 8
+        base      = W.new 0 tags (take 2 (map snd threeScreens)) :: TestStackSet
+        withHere  = W.insertUp here base
+        withOther = W.insertUp otherApp withHere
+        ws0       = W.view "1" (W.insertUp confirmed (W.view "2" withOther))
+        ws        = focusByRole [] (Map.fromList [(S 0, Primary), (S 1, Secondary)])
+                                Map.empty tags confirmed ws0
+    in W.peek ws == Just confirmed
+       && W.screen (W.current ws) == S 1
+       && W.lookupWorkspace (S 0) ws == Just "1"
+       && W.lookupWorkspace (S 1) ws == Just "2"
+
 -- The state kept beside the main file survives its JSON form.
 prop_extras_round_trip :: [(String, NonNegative Int)] -> [(WindowRef, ScreenDetail)] -> Property
 prop_extras_round_trip learned natives =
@@ -2036,6 +1974,7 @@ allProperties =
     , ("affinity: place pulls back a stranded role-mate", property prop_place_pulls_back_stranded_role_mate)
     , ("affinity: focusing a hidden window lands on its role screen", property prop_focusByRole_hidden_lands_on_role_screen)
     , ("affinity: focusing a visible window moves no workspace", property prop_focusByRole_visible_moves_nothing)
+    , ("affinity: confirmed focus beats a same-PID window", property prop_focusByRole_confirmed_window_beats_same_pid)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("state extras: JSON round trip", property prop_extras_round_trip)
     , ("state extras: other version refused", property prop_extras_other_version_refused)
@@ -2105,13 +2044,7 @@ allProperties =
     , ("focusedWindow unknown is no-op",             property prop_focusedWindow_unknown_noop)
     , ("focusedWindow distinguishes shared-PID",     property prop_focusedWindow_distinguishes_shared_pid)
     , ("broken PID-only is indistinguishable",       property prop_brokenPidOnly_indistinguishable)
-    , ("frontApp no-op within app",                  property prop_frontApp_noop_within)
-    , ("frontApp switches within workspace",         property prop_frontApp_switches_within_workspace)
-    , ("frontApp keeps displayed set",               property prop_frontApp_never_changes_displayed_set)
-    , ("frontApp ignores hidden-only app",           property prop_frontApp_ignores_hidden_only_app)
-    , ("frontApp prefers current screen",            property prop_frontApp_prefers_current_screen)
-    , ("frontApp follows to other screen",           property prop_frontApp_follows_to_other_screen)
-
+    , ("confirmed focus preserves exact identity",   property prop_confirmedFocusTarget_preserves_exact)
     , ("armingIntent arms with target",                property prop_armingIntent_arms_when_target)
     , ("armingIntent Nothing arms target-less",        property prop_armingIntent_nothing_arms_targetless)
     , ("target-less intent never confirms",            property prop_targetless_never_confirms)

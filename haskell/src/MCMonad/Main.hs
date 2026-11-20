@@ -3,7 +3,11 @@ module MCMonad.Main
     , launch
     , onHiddenWorkspace
     , pairBurst
+    , confirmedFocusTarget
     ) where
+
+-- AI-assisted update (confirmed-focus routing): model GPT-5; reasoning
+-- effort unavailable (not exposed by the harness).
 
 import Control.Concurrent (myThreadId, threadDelay)
 import Control.Exception (finally, throwTo)
@@ -713,7 +717,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- intent from macOS' AX bounce echoes after a 'FocusWindow'
             -- IPC command, so disarm 'focusIntent' unconditionally and
             -- let the next AX / NSWorkspace event flow through to
-            -- 'resolveFocusedWindow' / 'resolveFrontApp' normally. Same
+            -- the exact-window focus paths normally. Same
             -- reasoning disarms 'emptyWorkspaceGuardUntil': an actual
             -- click always wins over the extra scrutiny it adds.
             modify $ \s -> s { focusIntent = Nothing, emptyWorkspaceGuardUntil = Nothing }
@@ -1008,19 +1012,13 @@ confirmFrontAppChange pid = queryFocusedWindow $ \wr -> do
 applyFrontAppChange :: WindowRef -> M ()
 applyFrontAppChange focused = do
     ws <- gets windowset
-    case resolveFrontApp (wrPid focused) ws of
-        Just ws' ->
-            -- Must go through 'windows', not a bare 'modify': for a
-            -- focus-dependent layout (e.g. 'Full'), which window
-            -- gets a rect depends on which one is focused, so a
-            -- pure state update leaves frames stale.
-            windows (const ws')
-        Nothing ->
-            -- The app has no window on any screen. If the window macOS
-            -- focused is one of ours on a hidden workspace, bring that
-            -- workspace up on its own screen. (This is the only signal
-            -- for apps whose AX focus notifications do not fire.)
-            when (W.member focused ws) $ focusWindowAnywhere focused
+    -- The AX query refined the PID-only notification into an exact,
+    -- currently focused WindowRef. Preserve that fact all the way into
+    -- the transition: choosing another window by PID here made the result
+    -- depend on StackSet order when an app had windows on several screens.
+    -- focusWindowAnywhere handles both displayed and hidden workspaces and
+    -- keeps affinity placement as the one authoritative focus policy.
+    whenJust (confirmedFocusTarget focused ws) focusWindowAnywhere
     -- The first front-app change after a native-fullscreen Space
     -- transition is the earliest reliable moment to heal the silent
     -- un-park sweep (see the WindowFrameChanged handler) — the sweep
@@ -1032,6 +1030,17 @@ applyFrontAppChange focused = do
     -- frame yet, making the "already parked" skip in executeHideWindows
     -- miss and re-send a real, visible second park sweep for no reason.
     reassertHiddenWindows
+
+-- | Preserve the exact identity learned from the AX focus query. The
+-- membership check excludes unmanaged native windows; a managed answer is
+-- returned unchanged, so another window sharing its PID cannot replace it.
+confirmedFocusTarget
+    :: WindowRef
+    -> W.StackSet i l WindowRef sid sd
+    -> Maybe WindowRef
+confirmedFocusTarget focused ws
+    | W.member focused ws = Just focused
+    | otherwise           = Nothing
 
 -- ---------------------------------------------------------------------------
 -- Helpers

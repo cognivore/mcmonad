@@ -45,7 +45,6 @@ module MCMonad.Core
     , visibleAffinities
       -- * Focus resolution
     , resolveFocusedWindow
-    , resolveFrontApp
     , visibleScreenWindows
       -- * Focus authority
     , FocusIntent(..)
@@ -59,6 +58,9 @@ module MCMonad.Core
     , isSettlingPidEcho
     , withinSettleWindow
     ) where
+
+-- AI-assisted update (confirmed-focus contract): model GPT-5; reasoning
+-- effort unavailable (not exposed by the harness).
 
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, catch)
@@ -723,22 +725,10 @@ visibleAffinities ws = Map.fromList
 -- ---------------------------------------------------------------------------
 -- Focus resolution
 --
--- These pure helpers translate a focus-change *signal* from Swift (either
--- a precise AX-derived (wid, pid) or a PID-only NSWorkspace/SkyLight
--- frontmost-app change) into a state transition on the 'WindowSet'. They
--- live here so the bug-prone PID-only path can be exercised by tests
--- alongside the precise per-window path.
-
--- | Windows on the current workspace's stack — and *only* the
--- current workspace.
---
--- The conservative end of the scope scale, used by 'resolveFrontApp'
--- as its first choice: a PID-only signal cannot say *which* window of
--- a multi-window app the user meant, so when the app has a window on
--- the screen the user is already looking at, that is the answer.
-currentWorkspaceWindows :: W.StackSet i l a sid sd -> [a]
-currentWorkspaceWindows ws =
-    W.integrate' (W.stack (W.workspace (W.current ws)))
+-- This pure helper translates a precise AX-derived @(wid, pid)@ signal
+-- from Swift into a state transition on the 'WindowSet'. A PID-only
+-- front-app notification is first refined by querying macOS for this exact
+-- identity; it must not reconstruct a window choice from the PID.
 
 -- | Windows on every screen's workspace — current *and* secondary
 -- monitors — but never a hidden workspace.
@@ -806,39 +796,6 @@ resolveFocusedWindow wid pid ws =
   where
     match w = wrWindowId w == wid && wrPid w == pid
 
--- | Resolve focus from a PID-only front-app-changed event.
---
--- Returns the updated StackSet only when the user actually switched to
--- a *different* app. When focus is already inside that app, we leave
--- it alone.
---
--- The candidate search is deliberately two-tiered. A PID says nothing
--- about *which* window of a multi-window app was activated, so a
--- same-app window on the current screen wins outright — otherwise
--- activating LibreWolf would fling the current screen to whichever
--- monitor happened to hold the first LibreWolf window in stack order.
--- Only when the app has no window here at all do we look at the other
--- screens, which is the case that genuinely means "the user is now
--- working over there".
---
--- Either way the precise 'resolveFocusedWindow' event follows within
--- milliseconds (macOS emits NSWorkspace activation first, then the AX
--- focused-window change) and corrects any within-app mis-pick.
-resolveFrontApp
-    :: (Eq i, Eq sid)
-    => Int32
-    -> W.StackSet i l WindowRef sid sd
-    -> Maybe (W.StackSet i l WindowRef sid sd)
-resolveFrontApp pid ws = case W.peek ws of
-    Just w | wrPid w == pid -> Nothing
-    _ -> case find ofApp (currentWorkspaceWindows ws) of
-        Just wr -> Just (W.focusWindow wr ws)
-        Nothing -> case find ofApp (visibleScreenWindows ws) of
-            Just wr -> Just (W.focusWindow wr ws)
-            Nothing -> Nothing
-  where
-    ofApp = (== pid) . wrPid
-
 -- ---------------------------------------------------------------------------
 -- macOS focus authority
 --
@@ -902,7 +859,7 @@ resolveFrontApp pid ws = case W.peek ws of
 -- (CGEventTap on .leftMouseDown\/.rightMouseDown\/.otherMouseDown in
 -- core; the handler in 'MCMonad.Main' clears 'focusIntent'
 -- unconditionally on receipt, so the very next AX\/NSWorkspace event
--- flows through 'resolveFocusedWindow' \/ 'resolveFrontApp' as
+-- flows through 'resolveFocusedWindow' or the confirmed exact-window path as
 -- authoritative). DO NOT remove the 'UserMouseDown' arm without
 -- supplying an equivalent out-of-band physical-input channel — without
 -- one, the "mouse clicks need to be repeated" regression returns.

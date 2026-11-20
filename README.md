@@ -399,8 +399,14 @@ _AI-assisted update (Keep awake, below): model claude-opus-5-5; reasoning
 effort unavailable (not exposed by the harness)._
 
 **Keep awake: close the lid, and everything keeps running, locked and
-dark.** *Keep awake* in the menubar dropdown (30 minutes to 4 hours), or
-`awake 60` in a terminal, locks the screen with macOS's own Lock Screen (a
+dark.** Type `awake 2h` in the launcher, in either mode (`Opt+P` or
+`Opt+Shift+P`), and press Return; or choose *Keep awake* in the menubar
+dropdown (30 minutes to 4 hours), or run `awake 2h` in a terminal. A length
+is minutes (`awake 90`), hours (`awake 2h`) or both (`awake 1h30m`), and
+dictation's "awake 2 hours" works too. Before you press Return the launcher
+shows what awake will do ("2:00 · 64% · floor 20%") or why it will not; while
+a session runs, `awake` offers *Stop*. A session locks the screen with
+macOS's own Lock Screen (a
 password is needed at once, whatever your screen-saver delay) and turns the
 display off. The Mac then stays awake, even with the lid closed and on
 battery, until time is up, the battery reaches 20% (`awake 60 --floor 30`

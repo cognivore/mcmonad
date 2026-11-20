@@ -1,6 +1,10 @@
 import AppKit
 import os
 
+// AI-assisted update (the `awake` verb: its rows, activation, icon and
+// refresh): model claude-opus-5-5; reasoning effort unavailable (not exposed
+// by the harness).
+
 /// A borderless panel that becomes key so its embedded search field can
 /// receive keystrokes. mcmonad-core runs as an `.accessory` app, so we
 /// also `NSApp.activate` before showing it.
@@ -70,6 +74,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
     /// settings: then there is no Later mode and no later rows.
     var later: LaterController?
 
+    /// Keep awake (wired by Main); nil when MCMonadCore.app has no `awake`.
+    var awake: AwakeController?
+
     // MARK: - Modes
 
     enum Mode: Int, CaseIterable {
@@ -134,6 +141,9 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case viewWorkspace(tag: String)
         case setScreenRole(uuid: String, role: ScreenRole)
         case later(LaterAction)
+        /// A length awake said it would run.
+        case startAwake(length: String)
+        case stopAwake
         case hint
     }
 
@@ -784,6 +794,37 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         Item(title: text, kind: .hint, haystack: "")
     }
 
+    /// `awake …`: the running session and Stop, or awake's own answer for
+    /// the length typed (asked in the background; the rows refresh when it
+    /// comes). Only a length awake said it would run can be chosen.
+    private func awakeItems(_ q: String) -> [Item] {
+        guard let awake, let length = AwakeVerb.words(in: q) else { return [] }
+        if awake.isRunning {
+            return [Item(title: "Stop keeping awake — \(awake.report?.line ?? "starting…")",
+                         kind: .stopAwake, haystack: AwakeVerb.verb)]
+        }
+        var rows: [Item]
+        if length.isEmpty {
+            rows = [hintItem("Keep awake: type how long — awake 30, awake 2h, awake 1h30m")]
+        } else {
+            switch awake.preview(length) {
+            case .asking:
+                rows = [hintItem("Keep awake \(length): asking awake…")]
+            case .answer(let r) where r.phase == .ready:
+                rows = [Item(title: "Keep awake \(r.line) — locks the screen now",
+                             kind: .startAwake(length: length), haystack: AwakeVerb.verb)]
+            case .answer(let r):
+                rows = [hintItem("Keep awake \(length): \(r.line)")]
+            case .unreadable(let why):
+                rows = [hintItem("Keep awake \(length): \(why)")]
+            }
+        }
+        if let outcome = awake.outcome {
+            rows.append(hintItem("Last session: \(outcome)"))
+        }
+        return rows
+    }
+
     private func screenshotItem(_ command: ScreenshotCommand) -> Item {
         Item(title: command.title, kind: .screenshot(command), haystack: "screenshot",
              recentKey: RecentUse.screenshot)
@@ -854,6 +895,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
                 }
             }
             items += laterCommandItems(q)
+            items += awakeItems(q)
             switch mode {
             case .command:
                 // Don't show builtin commands twice when a parsed row is present.
@@ -957,6 +999,12 @@ final class SpotlightController: NSObject, NSWindowDelegate,
             onSetScreenRole?(uuid, role)
         case .later(let action):
             activateLater(action)
+        case .startAwake(let length):
+            finish()
+            awake?.start(length: length)
+        case .stopAwake:
+            finish()
+            awake?.stop()
         case .launchApp(let app):
             finish()
             appIndex.launch(app)
@@ -1468,6 +1516,17 @@ final class SpotlightController: NSObject, NSWindowDelegate,
 
     /// The inbox changed: redraw whatever shows it, keeping the selection
     /// where it still lands on a row that can be chosen.
+    /// awake answered a preview: redraw its rows if they are on screen.
+    func awakeUpdated() {
+        guard let panel, panel.isVisible, state == .browsing,
+              AwakeVerb.words(in: searchField.stringValue) != nil else { return }
+        let keep = tableView.selectedRow
+        applyFilter(searchField.stringValue)
+        if keep >= 0, keep < filtered.count, filtered[keep].activatable {
+            tableView.selectRowIndexes(IndexSet(integer: keep), byExtendingSelection: false)
+        }
+    }
+
     func laterUpdated() {
         guard let panel, panel.isVisible else { return }
         let query = searchField.stringValue
@@ -1764,6 +1823,7 @@ final class SpotlightController: NSObject, NSWindowDelegate,
         case .viewWorkspace:            return symbolIcon("rectangle.3.group")
         case .setScreenRole:            return symbolIcon("display.2")
         case .later:                    return item.symbol.flatMap { symbolIcon($0) }
+        case .startAwake, .stopAwake:   return symbolIcon("cup.and.saucer")
         case .hint:                     return symbolIcon("info.circle")
         }
     }

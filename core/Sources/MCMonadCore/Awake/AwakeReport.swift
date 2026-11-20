@@ -1,11 +1,32 @@
 import Foundation
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (the launcher verb and the "ready" phase): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+
+/// The launcher's `awake` verb: `awake 2h`, `Awake: 90`. Recognising the word
+/// is the launcher's; what the rest means is awake's to say.
+enum AwakeVerb {
+    static let verb = "awake"
+
+    /// The words after the verb (a length for awake to read, possibly
+    /// empty); nil when `query` is not an awake request.
+    static func words(in query: String) -> String? {
+        let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard let first = words.first,
+              first.lowercased().trimmingCharacters(in: .punctuationCharacters) == verb
+        else { return nil }
+        return words.dropFirst().joined(separator: " ")
+    }
+}
 
 /// One line `awake --json` prints: protocol 1, `awake_core::Report` in
 /// awake/core. awake decides everything; mcmonad shows these words.
 struct AwakeReport: Decodable, Equatable, Sendable {
     enum Phase: String, Decodable, Sendable {
+        /// `awake check`: a session would start; `line` says for how long
+        /// and on what charge.
+        case ready
         /// Keeping the Mac awake; `line` says for how long and on what charge.
         case running
         /// Over; `line` says why and whether the Mac goes to sleep.

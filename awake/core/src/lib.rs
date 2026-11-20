@@ -100,13 +100,19 @@ impl core::fmt::Display for LengthError {
     }
 }
 
-/// Minutes from a length of time as a person types it: minutes (`90`,
-/// `90m`, `90min`), hours (`2h`) or both (`1h30m`, `1h30`, `1h 30m`), in
-/// whole numbers, any case. Whether that many minutes is allowed is
-/// [`start`]'s to say.
+/// Minutes from a length of time as a person types or dictates it: minutes
+/// (`90`, `90m`, `90 minutes`), hours (`2h`, `2 hours`) or both (`1h30m`,
+/// `1h30`, `1 hour 30 minutes`), in whole numbers, any case. Whether that
+/// many minutes is allowed is [`start`]'s to say.
 pub fn parse_minutes(said: &str) -> Result<u64, LengthError> {
     let bad = || LengthError { said: said.into() };
-    let w: String = said.split_whitespace().collect::<String>().to_ascii_lowercase();
+    let mut w: String = said.split_whitespace().collect::<String>().to_ascii_lowercase();
+    // Spelt-out units, longest first so "minutes" is not read as "min" + "utes".
+    for (word, unit) in
+        [("hours", "h"), ("hour", "h"), ("hrs", "h"), ("hr", "h"), ("minutes", "m"), ("minute", "m"), ("mins", "m")]
+    {
+        w = w.replace(word, unit);
+    }
     let number = |digits: &str| -> Result<u64, LengthError> {
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return Err(bad());
@@ -667,11 +673,16 @@ mod tests {
             ("1h30", 90),
             ("1h 30m", 90),
             (" 45 ", 45),
+            ("2 hours", 120),
+            ("1 hour 30 minutes", 90),
+            ("90 Minutes", 90),
+            ("45 mins", 45),
+            ("1 hr", 60),
             ("0", 0),
         ] {
             assert_eq!(parse_minutes(said), Ok(minutes), "{said:?}");
         }
-        for said in ["", "h", "m", "2x", "1.5h", "-5", "1h2h", "1hm", "h30", "m30", "99999999999999999999h"] {
+        for said in ["", "h", "m", "2x", "1.5h", "-5", "1h2h", "1hm", "h30", "m30", "99999999999999999999h", "two hours", "2 days"] {
             assert_eq!(parse_minutes(said), Err(LengthError { said: said.into() }), "{said:?}");
         }
         assert_eq!(

@@ -357,10 +357,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         } else {
             title = "Keep awake"
             note("Locked and dark with the lid closed; then the Mac sleeps")
+            note("Or type “awake 2h” in the launcher")
             for choice in AwakeController.choices {
                 let item = NSMenuItem(title: choice.title, action: #selector(startAwakeClicked(_:)), keyEquivalent: "")
                 item.target = self
-                item.tag = choice.minutes
+                item.representedObject = choice.length
                 sub.addItem(item)
             }
             if let outcome = awake.outcome {
@@ -554,7 +555,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func startAwakeClicked(_ sender: NSMenuItem) {
-        awake?.start(minutes: sender.tag)
+        guard let length = sender.representedObject as? String else { return }
+        awake?.start(length: length)
     }
 
     @objc private func stopAwakeClicked(_ sender: Any?) {

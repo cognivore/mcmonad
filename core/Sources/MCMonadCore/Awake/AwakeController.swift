@@ -3,6 +3,9 @@ import os
 import ServiceManagement
 
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (lengths in awake's words, and previews for the
+// launcher): model claude-opus-5-5; reasoning effort unavailable (not exposed
+// by the harness).
 
 /// Keep awake. awake (./awake in this repository) owns everything about it:
 /// what a session does, the lease, the lock, when the Mac sleeps. This runs
@@ -17,9 +20,9 @@ import ServiceManagement
 final class AwakeController {
     private nonisolated static let logger = Logger(subsystem: "com.mcmonad.core", category: "Awake")
     nonisolated static let guardPlist = "com.mcmonad.core.awake-guard.plist"
-    /// What the menu offers, in minutes.
-    static let choices: [(title: String, minutes: Int)] =
-        [("30 minutes", 30), ("1 hour", 60), ("2 hours", 120), ("4 hours", 240)]
+    /// What the menu offers, as lengths in awake's words.
+    static let choices: [(title: String, length: String)] =
+        [("30 minutes", "30"), ("1 hour", "1h"), ("2 hours", "2h"), ("4 hours", "4h")]
 
     let cli: String
     private var session: Session?
@@ -112,11 +115,13 @@ final class AwakeController {
         let stdout = Pipe()
     }
 
-    func start(minutes: Int) {
+    /// Start a session of `length`, as the person typed it: awake reads it,
+    /// and refuses in its own words what it cannot.
+    func start(length: String) {
         guard session == nil else { return }
         let s = Session()
         s.process.executableURL = URL(fileURLWithPath: cli)
-        s.process.arguments = [String(minutes), "--json"]
+        s.process.arguments = Self.words(length) + ["--json"]
         s.process.standardInput = s.stdin
         s.process.standardOutput = s.stdout
         s.process.standardError = FileHandle.nullDevice
@@ -130,7 +135,8 @@ final class AwakeController {
         session = s
         report = nil
         outcome = nil
-        Self.logger.info("awake: started for \(minutes) min, pid \(s.process.processIdentifier)")
+        lastPreview = nil
+        Self.logger.info("awake: started, pid \(s.process.processIdentifier)")
         // Lines, then the exit, in order, on the main queue.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let reader = s.stdout.fileHandleForReading
@@ -173,7 +179,98 @@ final class AwakeController {
         guard s === session else { return }
         session = nil
         report = nil
+        lastPreview = nil
         if outcome == nil { outcome = "awake stopped without saying why (status \(status))" }
         Self.logger.info("awake: exited \(status)")
+    }
+
+    // MARK: Previews for the launcher
+
+    /// What awake says a session of some length would do.
+    enum Preview: Equatable, Sendable {
+        /// Asked; no answer yet.
+        case asking
+        /// awake's answer: `ready`, or `refused`/`failed` with its reason.
+        case answer(AwakeReport)
+        /// awake gave no answer this mcmonad can read; why, in words.
+        case unreadable(String)
+    }
+
+    /// How long an answer stands for the same length; the battery moves.
+    private static let previewLife: TimeInterval = 10
+    /// The longest one `awake check` may take before it is stopped.
+    nonisolated private static let checkDeadline: TimeInterval = 5
+    private var lastPreview: (length: String, answer: Preview, at: Date)?
+    /// The length whose check is out, if one is.
+    private var previewAsking: String?
+    /// The newest other length typed while that check was out.
+    private var previewWanted: String?
+    /// Fires on the main actor when a new answer is in.
+    var onPreview: (() -> Void)?
+
+    /// awake's answer for `length` if it is in and fresh; otherwise ask
+    /// (one check at a time, the newest length wins) and say so.
+    func preview(_ length: String) -> Preview {
+        if let last = lastPreview, last.length == length, Date().timeIntervalSince(last.at) < Self.previewLife {
+            return last.answer
+        }
+        if previewAsking != length {
+            previewWanted = length
+            askNextPreview()
+        }
+        return .asking
+    }
+
+    private func askNextPreview() {
+        guard previewAsking == nil, let length = previewWanted else { return }
+        previewAsking = length
+        previewWanted = nil
+        let cli = self.cli
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let answer = Self.check(cli: cli, length: length)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.previewAsking = nil
+                    self.lastPreview = (length, answer, Date())
+                    self.askNextPreview()
+                    self.onPreview?()
+                }
+            }
+        }
+    }
+
+    /// One `awake check <length> --json`, waited for at most `checkDeadline`.
+    nonisolated static func check(cli: String, length: String) -> Preview {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cli)
+        p.arguments = ["check"] + words(length) + ["--json"]
+        let out = Pipe()
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+        } catch {
+            return .unreadable("awake could not start: \(error.localizedDescription)")
+        }
+        let stop = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + checkDeadline, execute: stop)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        stop.cancel()
+        var buffer = data + Data([0x0A])
+        guard let line = AwakeProtocol.takeLines(&buffer).first else {
+            return .unreadable("awake check said nothing (status \(p.terminationStatus))")
+        }
+        switch AwakeProtocol.decode(line) {
+        case .success(let report): return .answer(report)
+        case .failure(let why): return .unreadable("awake check said something this mcmonad cannot read (\(why))")
+        }
+    }
+
+    /// A length as separate arguments; awake joins them again.
+    nonisolated private static func words(_ length: String) -> [String] {
+        length.split(whereSeparator: \.isWhitespace).map(String.init)
     }
 }

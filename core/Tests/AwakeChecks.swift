@@ -1,4 +1,6 @@
 // AI-generated text: model claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
+// AI-assisted update (the launcher verb, lengths and previews): model
+// claude-opus-5-5; reasoning effort unavailable (not exposed by the harness).
 //
 // Compiled with Awake/AwakeReport.swift and Awake/AwakeController.swift and
 // run by the Nix package checkPhase. The protocol fixtures are what
@@ -10,9 +12,11 @@ import Foundation
 @main
 enum AwakeChecks {
     static func main() async {
+        checkVerb()
         checkProtocol()
         checkLines()
         await checkSessions()
+        await checkPreviews()
         print("Awake checks passed")
     }
 
@@ -23,6 +27,16 @@ enum AwakeChecks {
         }
     }
 
+    static func checkVerb() {
+        expect(AwakeVerb.words(in: "awake 2h") == "2h", "awake + a length")
+        expect(AwakeVerb.words(in: "Awake: 1 hour 30 minutes") == "1 hour 30 minutes", "dictated, words kept for awake")
+        expect(AwakeVerb.words(in: "  awake  ") == "", "the verb alone")
+        expect(AwakeVerb.words(in: "awakening") == nil, "a longer word is not the verb")
+        expect(AwakeVerb.words(in: "keep awake 2h") == nil, "the verb must come first")
+        expect(AwakeVerb.words(in: "") == nil, "empty")
+    }
+
+    static let ready = #"{"awake":1,"phase":"ready","line":"2:00 · 100% on power · floor 20%","warning":null,"holders":[]}"#
     static let running = #"{"awake":1,"phase":"running","line":"0:29 left · 85% · floor 20%","warning":"a \"quote\"\nand a\tback\\slash","holders":[{"pid":7,"process":"caffeinate","what":"PreventUserIdleSystemSleep (caffeinate command-line tool)"}]}"#
     static let ended = #"{"awake":1,"phase":"ended","line":"stopped; normal sleep is back","warning":null,"holders":[]}"#
 
@@ -42,6 +56,10 @@ enum AwakeChecks {
         let odd = ended.replacingOccurrences(of: #""ended""#, with: #""napping""#)
         if case .failure(.malformed) = AwakeProtocol.decode(Data(odd.utf8)) {} else { expect(false, "an unknown phase is refused") }
         if case .failure(.malformed) = AwakeProtocol.decode(Data("awake: words".utf8)) {} else { expect(false, "words are refused") }
+        guard case .success(let plan) = AwakeProtocol.decode(Data(ready.utf8)) else {
+            return expect(false, "a ready report decodes")
+        }
+        expect(plan.phase == .ready && plan.line == "2:00 · 100% on power · floor 20%", "a check's plan")
     }
 
     static func checkLines() {
@@ -81,7 +99,7 @@ enum AwakeChecks {
             printf "%s\\n" \(shellQuoted(running))
             while :; do sleep 0.05; done
             """))
-        polite.start(minutes: 30)
+        polite.start(length: "30")
         expect(polite.isRunning, "running once started")
         await waitFor("the running report") { polite.report != nil }
         expect(polite.report?.line == "0:29 left · 85% · floor 20%", "the running line is shown")
@@ -92,25 +110,56 @@ enum AwakeChecks {
 
         // The arguments mcmonad passes, and a refusal in awake's words.
         let refusing = AwakeController(cli: standIn("""
-            [ "$1 $2" = "60 --json" ] || { echo "wrong arguments: $*" >&2; exit 9; }
+            [ "$*" = "1h 30m --json" ] || { echo '{"awake":1,"phase":"failed","line":"wrong arguments","warning":null,"holders":[]}'; exit 9; }
             echo '{"awake":1,"phase":"refused","line":"the battery is at 10%, already at or below the 20% floor","warning":null,"holders":[]}'
             exit 2
             """))
-        refusing.start(minutes: 60)
+        refusing.start(length: "1h 30m")
         await waitFor("the refusal") { !refusing.isRunning }
         expect(refusing.outcome == "Refused: the battery is at 10%, already at or below the 20% floor",
                "refused: \(refusing.outcome ?? "nil")")
 
         // Silence and a crash are reported as such.
         let silent = AwakeController(cli: standIn("exit 3"))
-        silent.start(minutes: 30)
+        silent.start(length: "30")
         await waitFor("the silent exit") { !silent.isRunning }
         expect(silent.outcome == "awake stopped without saying why (status 3)", "silent: \(silent.outcome ?? "nil")")
 
         // An awake that is not there.
         let missing = AwakeController(cli: "/nonexistent/awake")
-        missing.start(minutes: 30)
+        missing.start(length: "30")
         expect(!missing.isRunning && missing.outcome?.hasPrefix("awake could not start") == true, "a missing awake")
+    }
+
+    @MainActor
+    static func checkPreviews() async {
+        // The launcher's preview: `awake check <words> --json`, asked once
+        // per length, the answer kept for the same length.
+        let log = FileManager.default.temporaryDirectory.appendingPathComponent("awake-checks-\(getpid())-asked").path
+        let checker = AwakeController(cli: standIn("""
+            echo "$*" >> \(shellQuoted(log))
+            case "$*" in
+              "check 2h --json") printf "%s\\n" \(shellQuoted(ready)); exit 0 ;;
+              *) echo '{"awake":1,"phase":"refused","line":"\\"2x\\" is not a length of time","warning":null,"holders":[]}'; exit 2 ;;
+            esac
+            """))
+        var updates = 0
+        checker.onPreview = { updates += 1 }
+        expect(checker.preview("2h") == .asking, "the first look asks")
+        await waitFor("the ready answer") { checker.preview("2h") != .asking }
+        guard case .answer(let r) = checker.preview("2h") else { return expect(false, "an answer") }
+        expect(r.phase == .ready && r.line == "2:00 · 100% on power · floor 20%", "awake's plan, as it said it")
+        expect(updates == 1, "the launcher is told once: \(updates)")
+        _ = checker.preview("2x")
+        await waitFor("the refusal") { checker.preview("2x") != .asking }
+        guard case .answer(let no) = checker.preview("2x") else { return expect(false, "a refusal") }
+        expect(no.phase == .refused && no.line.contains("not a length"), "refused in awake's words")
+        let asked = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+        expect(asked == "check 2h --json\ncheck 2x --json\n", "each length asked once: \(asked.debugDescription)")
+        let broken = AwakeController(cli: standIn("echo nonsense"))
+        _ = broken.preview("30")
+        await waitFor("the unreadable answer") { broken.preview("30") != .asking }
+        if case .unreadable = broken.preview("30") {} else { expect(false, "nonsense is unreadable") }
     }
 
     static func shellQuoted(_ s: String) -> String {

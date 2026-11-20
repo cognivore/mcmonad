@@ -12,12 +12,14 @@ the guard's approval is one of mcmonad's permissions (see mcmonad's README).
 
 ## Using it
 
-From mcmonad's menu (*Keep awake ▸ 30 minutes …*), or from a terminal:
+From mcmonad's launcher (`awake 2h`, then Return), its menu (*Keep awake ▸
+30 minutes …*), or a terminal:
 
 ```sh
 awake 60              # keep awake 60 minutes; ends early at 20% battery
-awake 90 --floor 30   # end early at 30%
-awake check           # what it sees of the Mac and what a session would do
+awake 2h --floor 30   # two hours; end early at 30%
+awake 1h30m           # minutes (90), hours (2h) or both; "1 hour 30 minutes" too
+awake check 2h        # what it sees of the Mac and what a session would do
 awake stop            # end the running session; the Mac is not put to sleep
 ```
 
@@ -56,7 +58,10 @@ The guard's log is `/var/log/mcmonad-awake-guard.log`; sessions log to
 
 `awake --json` prints one line per change for mcmonad (protocol 1,
 `awake_core::Report`) and also ends when its stdin closes, so a session
-never outlives the mcmonad-core that started it.
+never outlives the mcmonad-core that started it. `awake check <length>
+--json` prints one report in phase `ready` (what a session would be),
+`refused` or `failed`, which the launcher shows before Return; the length is
+read by `awake_core::parse_minutes`, the only place that reads one.
 
 ## Building
 

@@ -676,6 +676,9 @@ struct MCMonadCoreApp {
         let awake = AwakeController.inBundle().map { AwakeController(cli: $0) }
         if awake != nil { AwakeController.refreshGuard() }
         statusBar.awake = awake
+        // The launcher's `awake 2h` verb, in every mode.
+        spotlight.awake = awake
+        awake?.onPreview = { [weak spotlight] in spotlight?.awakeUpdated() }
 
         // TimerController is a pure renderer/clock; its state arrives via the
         // set-timers command, and every user action flows back to the brain.

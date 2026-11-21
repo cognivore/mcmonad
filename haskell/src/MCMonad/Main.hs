@@ -6,9 +6,6 @@ module MCMonad.Main
     , confirmedFocusTarget
     ) where
 
--- AI-assisted update (confirmed-focus routing): model GPT-5; reasoning
--- effort unavailable (not exposed by the harness).
-
 import Control.Concurrent (myThreadId, threadDelay)
 import Control.Exception (finally, throwTo)
 import Control.Monad (forever, unless, void, when)
@@ -18,8 +15,10 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Int (Int32)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Data.Time.Clock (getCurrentTime)
+import GHC.Clock (getMonotonicTimeNSec)
+import System.IO (hWaitForInput)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode(..), exitSuccess)
 import System.Posix.Signals (Handler(..), installHandler, sigINT, sigTERM)
@@ -179,6 +178,7 @@ launch cfg = do
                        , nextTimerId = rsNextTimerId restored
                        , focusIntent = Nothing
                        , pendingFocusQueries = []
+                       , pendingWorkspaceFocus = Nothing
                        , suppressFrontAppUntil = Nothing
                        , emptyWorkspaceGuardUntil = Nothing
                        , unmanagedOrigin = Map.empty
@@ -456,8 +456,27 @@ eventLoop :: Bool -> MConfig Layout -> Map.Map Int (M ()) -> [Event] -> M ()
 eventLoop debug cfg hotkeyIdMap deferred = do
     mapM_ (userCodeDef () . handleEvent debug cfg hotkeyIdMap) deferred
     forever $ do
-        evt <- withConnection $ \conn -> io $ readEvent conn
-        dispatchFresh debug cfg hotkeyIdMap evt
+        let next = withConnection (io . readEvent) >>= dispatchFresh debug cfg hotkeyIdMap
+        pending <- gets pendingWorkspaceFocus
+        case pending of
+            Nothing -> next
+            Just check -> do
+                now <- io getMonotonicTimeNSec
+                let due = checkAfterNS check
+                if now >= due then do
+                    modify $ \s -> s { pendingWorkspaceFocus = Nothing }
+                    let target = checkTarget check
+                    queryNativeFocus $ \actual -> do
+                        ws <- gets windowset
+                        when (actual == target && W.member actual ws) $
+                            focusWindowAnywhere actual
+                else do
+                    -- Wait only for readability. Timing out a partial line
+                    -- read would lose its prefix. Check the monotonic deadline
+                    -- again after each event, even on a busy socket.
+                    let ms = fromIntegral ((due - now + 999_999) `div` 1_000_000)
+                    ready <- withConnection $ \c -> io $ hWaitForInput (connHandle c) ms
+                    when ready next
 
 -- | How long to wait, after a 'WindowCreated' or 'WindowDestroyed' for
 -- a tracked pid, to see whether the complementary half of a same-pid
@@ -656,7 +675,7 @@ handleEvent debug cfg hotkeyIdMap evt = do
             let wr0 = WindowRef wid pid
             if onHiddenWorkspace ws0 wr0
                 then followHiddenIfConfirmed wr0
-                else handleFocusedWindowChanged wid pid
+                else unlessFocusGuarded $ handleFocusedWindowChanged wid pid
             -- A should-be-hidden window receiving AX focus means the
             -- user reached it on screen — it drifted (fullscreen-
             -- transition sweep, app self-move) and is lying around as
@@ -720,7 +739,8 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- the exact-window focus paths normally. Same
             -- reasoning disarms 'emptyWorkspaceGuardUntil': an actual
             -- click always wins over the extra scrutiny it adds.
-            modify $ \s -> s { focusIntent = Nothing, emptyWorkspaceGuardUntil = Nothing }
+            modify $ \s -> s { focusIntent = Nothing, emptyWorkspaceGuardUntil = Nothing
+                             , suppressFrontAppUntil = Nothing, pendingWorkspaceFocus = Nothing }
 
         ScreensChanged scs ->
             rescreen scs
@@ -893,7 +913,10 @@ handleFocusedWindowChanged wid pid = do
     -- layout, its frame) brought in line, so this goes through 'windows'.
     applyClean = do
         ws <- gets windowset
-        whenJust (resolveFocusedWindow wid pid ws) (windows . const)
+        whenJust (resolveFocusedWindow wid pid ws) $ \ws' ->
+            if W.currentTag ws' == W.currentTag ws
+                then windows (const ws')
+                else considerNativeFocus (WindowRef wid pid)
     applyAndClearIntent = do
         modify $ \s -> s { focusIntent = Nothing }
         applyClean
@@ -917,9 +940,29 @@ followHiddenIfConfirmed wr = do
     let ourEcho = case fi of
             Just i  -> withinSettleWindow now i && isSettlingEcho (wrWindowId wr) (wrPid wr) i
             Nothing -> False
-    unless ourEcho $ queryFocusedWindow $ \focused -> do
-        ws <- gets windowset
-        when (focused == wr && W.member wr ws) $ focusWindowAnywhere wr
+    unless ourEcho $ unlessFocusGuarded $ considerNativeFocus wr
+
+-- An exact native focus notification can precede the destroy for the
+-- window being closed. Keep the old workspace active during this interval
+-- so unmanage can select its survivor. A genuine switch is confirmed
+-- against current AX focus when the interval expires. Duplicate AX and
+-- front-app notifications share one deadline.
+considerNativeFocus :: WindowRef -> M ()
+considerNativeFocus target = do
+    ws <- gets windowset
+    whenJust (W.findTag target ws) $ \tag ->
+        if tag == W.currentTag ws
+            then when (W.peek ws /= Just target) $ focusWindowAnywhere target
+            else do
+                pending <- gets pendingWorkspaceFocus
+                unless (fmap checkTarget pending == Just target) $ do
+                    now <- io getMonotonicTimeNSec
+                    modify $ \s -> s { pendingWorkspaceFocus =
+                        Just (WorkspaceFocusCheck target (now + closeNotificationGraceNS)) }
+
+-- The recorded front-app handoff preceded destruction by roughly 100 ms.
+closeNotificationGraceNS :: Word64
+closeNotificationGraceNS = 250_000_000
 
 -- | Hand the daemon's answer to the oldest outstanding
 -- 'queryFocusedWindow' caller. Answers arrive one per query, in order.
@@ -933,27 +976,14 @@ answerFocusQuery answer = do
             whenJust answer f
 
 handleFrontAppChanged :: Int32 -> M ()
-handleFrontAppChanged pid = do
+handleFrontAppChanged pid = unlessFocusGuarded (handleFrontAppChangedGenuine pid)
+
+unlessFocusGuarded :: M () -> M ()
+unlessFocusGuarded action = do
     now <- io getCurrentTime
     suppressUntil <- gets suppressFrontAppUntil
-    modify $ \s -> s { suppressFrontAppUntil = Nothing }
     guardUntil <- gets emptyWorkspaceGuardUntil
-    if shouldSuppressFrontApp now suppressUntil
-        then
-            -- 'MCMonad.Operations.kill' just closed the last window on a
-            -- workspace; this is macOS's own choice of what to activate
-            -- next, not a deliberate switch. Consumed either way (above),
-            -- so a later genuine switch to this same app isn't eaten too.
-            return ()
-        else if shouldSuppressFrontApp now guardUntil
-            then
-                -- 'MCMonad.Operations.windows' just left the current
-                -- workspace empty and is still waiting for whatever gets
-                -- spawned on it (or a real click) to show up; unlike the
-                -- guard above, not consumed here — see
-                -- 'emptyWorkspaceGuardUntil'.
-                return ()
-            else handleFrontAppChangedGenuine pid
+    unless (any (shouldSuppressFrontApp now) [suppressUntil, guardUntil]) action
 
 handleFrontAppChangedGenuine :: Int32 -> M ()
 handleFrontAppChangedGenuine pid = do
@@ -999,13 +1029,18 @@ handleFrontAppChangedGenuine pid = do
 -- previous app's window, since it really is frontmost by then -- and
 -- follows it anyway, missing the guard entirely.
 confirmFrontAppChange :: Int32 -> M ()
-confirmFrontAppChange pid = queryFocusedWindow $ \wr -> do
-    now <- io getCurrentTime
-    suppressUntil <- gets suppressFrontAppUntil
-    guardUntil <- gets emptyWorkspaceGuardUntil
-    let suppressed = shouldSuppressFrontApp now suppressUntil
-                   || shouldSuppressFrontApp now guardUntil
-    unless suppressed $ when (wrPid wr == pid) (applyFrontAppChange wr)
+confirmFrontAppChange pid = queryNativeFocus $ \wr ->
+    when (wrPid wr == pid) (applyFrontAppChange wr)
+
+-- The reply belongs to the workspace and focus that asked. A navigation
+-- or close while it was in flight supersedes it.
+queryNativeFocus :: (WindowRef -> M ()) -> M ()
+queryNativeFocus follow = unlessFocusGuarded $ do
+    let origin ws = (W.currentTag ws, W.peek ws)
+    before <- gets (origin . windowset)
+    queryFocusedWindow $ \actual -> unlessFocusGuarded $ do
+        after <- gets (origin . windowset)
+        when (before == after) $ follow actual
 
 -- | Follow a confirmed app switch: @focused@ is the window macOS says is
 -- focused, and it belongs to the app that came to the front.
@@ -1018,7 +1053,7 @@ applyFrontAppChange focused = do
     -- depend on StackSet order when an app had windows on several screens.
     -- focusWindowAnywhere handles both displayed and hidden workspaces and
     -- keeps affinity placement as the one authoritative focus policy.
-    whenJust (confirmedFocusTarget focused ws) focusWindowAnywhere
+    whenJust (confirmedFocusTarget focused ws) considerNativeFocus
     -- The first front-app change after a native-fullscreen Space
     -- transition is the earliest reliable moment to heal the silent
     -- un-park sweep (see the WindowFrameChanged handler) — the sweep

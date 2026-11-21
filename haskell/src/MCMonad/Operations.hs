@@ -343,6 +343,9 @@ windows f = do
     currentWS' <- gets windowset
     let oldFocus = W.peek old
         newFocus = W.peek currentWS'
+    when (newFocus /= oldFocus || W.currentTag currentWS' /= W.currentTag old) $
+        modify $ \s -> s { pendingWorkspaceFocus = Nothing
+                         , emptyWorkspaceGuardUntil = Nothing }
     -- Also after any raise: raising a window makes it its application's
     -- key window, so bringing up a workspace on another screen that holds
     -- a second window of the focused application would otherwise leave the
@@ -1082,6 +1085,8 @@ unmanage w = do
         -- genuinely new window of a running app belongs on the current
         -- workspace anyway.
         now <- io getCurrentTime
+        when (W.peek ws == Just w) $
+            modify $ \s -> s { suppressFrontAppUntil = Just (armKillChurnSuppression now) }
         let lastOfPid = not (any (\o -> o /= w && wrPid o == wrPid w)
                                  (W.allWindows ws))
         case W.findTag w ws of
@@ -1225,11 +1230,12 @@ kill :: M ()
 kill = queryFocusedWindow $ \w -> do
     conn <- asks connection
     ws <- gets windowset
-    when (W.member w ws) $ case W.peek (W.delete w ws) of
-        Just nw -> io $ sendCommand conn (FocusWindow (wrWindowId nw) (wrPid nw))
-        Nothing -> do
+    when (W.member w ws) $ do
+        when (W.peek ws == Just w) $ do
             now <- io getCurrentTime
             modify $ \s -> s { suppressFrontAppUntil = Just (armKillChurnSuppression now) }
+        whenJust (W.peek (W.delete w ws)) $ \nw ->
+            io $ sendCommand conn (FocusWindow (wrWindowId nw) (wrPid nw))
     io $ sendCommand conn (CloseWindow (wrWindowId w) (wrPid w))
 
 -- | Fetch the window macOS currently has focused and run an action on it,

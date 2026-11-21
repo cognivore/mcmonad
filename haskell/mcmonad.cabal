@@ -69,3 +69,12 @@ test-suite properties
     containers,
     text,
     time
+
+test-suite focus-close
+  type: exitcode-stdio-1.0
+  main-is: FocusClose.hs
+  hs-source-dirs: tests
+  default-language: GHC2021
+  ghc-options: -Wall -threaded
+  build-depends: base, mcmonad, aeson, bytestring, network, process, unix,
+                 directory, filepath, text

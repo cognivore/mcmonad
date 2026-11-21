@@ -47,7 +47,7 @@ module MCMonad.Core
     , resolveFocusedWindow
     , visibleScreenWindows
       -- * Focus authority
-    , FocusIntent(..)
+    , FocusIntent(..), WorkspaceFocusCheck(..)
     , armingIntent
     , isFocusIntentTarget
     , armKillChurnSuppression
@@ -58,9 +58,6 @@ module MCMonad.Core
     , isSettlingPidEcho
     , withinSettleWindow
     ) where
-
--- AI-assisted update (confirmed-focus contract): model GPT-5; reasoning
--- effort unavailable (not exposed by the harness).
 
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, catch)
@@ -80,7 +77,7 @@ import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 import Data.Time.Format (formatTime, defaultTimeLocale)
 import Data.Time.LocalTime (getZonedTime)
 import Data.Typeable (Typeable, cast)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import GHC.Generics (Generic)
 import System.IO (Handle, hPutStrLn, stderr)
 import Text.Read (Lexeme(..), Read(..), ReadPrec, lexP, parens, (+++))
@@ -455,6 +452,14 @@ data Connection = Connection
 -- ---------------------------------------------------------------------------
 -- The M monad
 
+-- | A native focus change that would leave the current workspace.
+-- Give destruction of the departing window time to arrive before asking
+-- the daemon whether this exact candidate still has focus.
+data WorkspaceFocusCheck = WorkspaceFocusCheck
+    { checkTarget :: !WindowRef
+    , checkAfterNS :: !Word64  -- monotonic nanoseconds
+    }
+
 -- | Mutable window manager state.
 data MState = MState
     { windowset         :: !WindowSet
@@ -583,14 +588,10 @@ data MState = MState
       -- and a close-window keypress that asked a moment earlier had its
       -- answer handed to the wrong caller. Callers ask because 'windowset'
       -- cannot tell them: it omits 'MCMonad.ManageHook.doIgnore'd windows.
+    , pendingWorkspaceFocus :: !(Maybe WorkspaceFocusCheck)
     , suppressFrontAppUntil :: !(Maybe UTCTime)
-      -- ^ Set by 'MCMonad.Operations.kill' when closing a window leaves
-      -- its workspace empty: there is nothing left to explicitly focus
-      -- (see 'MCMonad.Operations.kill'), so macOS's own choice of what to
-      -- activate next (typically whatever app was active before the
-      -- closed window) must not be read as a deliberate app switch.
-      -- Consumed by the first 'FrontAppChanged' that arrives, whether or
-      -- not it is still within the deadline.
+      -- ^ Native focus notifications and replies can repeat after the
+      -- focused window closes. A physical click clears this deadline.
     , emptyWorkspaceGuardUntil :: !(Maybe UTCTime)
       -- ^ Set by 'MCMonad.Operations.windows' whenever a pass leaves the
       -- current workspace empty (switching to one, or closing its last
@@ -599,8 +600,7 @@ data MState = MState
       -- stretch (observed anywhere from ~150ms to ~700ms) while the new
       -- app's process hands off to its real one, and that bounce passes
       -- 'MCMonad.Main.confirmFrontAppChange's AX check just as readily
-      -- as a genuine switch. Unlike 'suppressFrontAppUntil', not
-      -- consumed by the first 'FrontAppChanged' — a bounce can repeat —
+      -- as a genuine switch. A bounce can repeat. This deadline is
       -- cleared instead by whichever comes first: a 'WindowCreated' (the
       -- thing being waited for has shown up) or a 'UserMouseDown' (an
       -- actual physical click always wins), with the deadline itself

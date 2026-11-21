@@ -1,9 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Properties where
 
--- AI-assisted update (confirmed-focus regression): model GPT-5; reasoning
--- effort unavailable (not exposed by the harness).
-
 import Test.QuickCheck
 import qualified XMonad.StackSet as W
 import MCMonad.Core

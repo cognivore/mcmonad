@@ -20,6 +20,7 @@ module MCMonad.Layout
     ) where
 
 import qualified XMonad.StackSet as W
+import Text.Read (Lexeme(Ident), Read(..), lexP, parens, prec, step)
 
 import qualified XMonad.Layout as XMonad (Resize(..), IncMasterN(..), ChangeLayout(..))
 import MCMonad.Core
@@ -140,7 +141,11 @@ instance LayoutClass Full WindowRef where
 data Mirror l a = Mirror (l a)
     deriving (Show, Read)
 
-instance LayoutClass l WindowRef => LayoutClass (Mirror l) WindowRef where
+instance (LayoutClass l WindowRef, Read (l WindowRef)) => LayoutClass (Mirror l) WindowRef where
+    layoutReadPrec (Mirror l) = parens $ prec 10 $ do
+        Ident "Mirror" <- lexP
+        Mirror <$> step (layoutReadPrec l)
+
     runLayout (W.Workspace tag (Mirror l) s) rect = do
         (arranged, ml') <- runLayout (W.Workspace tag l s) (mirrorRect rect)
         return (map (\(w, r) -> (w, mirrorRect r)) arranged, Mirror <$> ml')
@@ -164,8 +169,12 @@ data CL = CL | CR
 data Choose l r a = Choose CL (l a) (r a)
     deriving (Show, Read)
 
-instance (LayoutClass l WindowRef, LayoutClass r WindowRef)
+instance (LayoutClass l WindowRef, Read (l WindowRef), LayoutClass r WindowRef, Read (r WindowRef))
     => LayoutClass (Choose l r) WindowRef where
+
+    layoutReadPrec (Choose _ l r) = parens $ prec 10 $ do
+        Ident "Choose" <- lexP
+        Choose <$> step readPrec <*> step (layoutReadPrec l) <*> step (layoutReadPrec r)
 
     runLayout (W.Workspace tag (Choose side l r) s) rect =
         case side of

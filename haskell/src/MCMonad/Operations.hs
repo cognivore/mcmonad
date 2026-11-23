@@ -126,7 +126,7 @@ import MCMonad.ManageHook (ManageHook, runManageHook)
 import MCMonad.Persistence
     ( SerialState(..), persistenceVersion, windowSetToSerial
     , mergePending, placePending
-    , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras
+    , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras, snapshotLayouts
     )
 
 -- ---------------------------------------------------------------------------
@@ -1440,6 +1440,7 @@ journalJumped lbl ws =
 currentSnapshot :: M StateSnapshot
 currentSnapshot = do
     ws   <- gets windowset
+    def  <- asks layoutDefault
     ts   <- gets timers
     nid  <- gets nextTimerId
     pend <- gets pendingRestore
@@ -1447,6 +1448,7 @@ currentSnapshot = do
     natives <- gets nativeFloatRects
     return StateSnapshot
         { snWindowSet   = ws
+        , snLayoutDefault = def
         , snAffinity    = visibleAffinities ws
         , snLearned     = learned
         , snNativeFloats = natives
@@ -1475,7 +1477,8 @@ saveStateIO snap = do
         extras = pruneExtras
             (S.fromList (map W.tag (W.workspaces ws)))
             (S.fromList (W.allWindows ws))
-            (StateExtras (snLearned snap) (snNativeFloats snap))
+            (StateExtras (snLearned snap) (snNativeFloats snap)
+                         (Just (snapshotLayouts (snLayoutDefault snap) ws)))
     sf <- getStateFile
     -- One writer at a time. The event loop, the deferred flush thread and
     -- the exit path all save, and they share the temporary files.

@@ -32,7 +32,7 @@ import MCMonad.IPC
 import MCMonad.Operations
 import MCMonad.Persistence
     ( SerialState(..), serialToWindowSet, partitionPending
-    , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras
+    , StateExtras(..), noExtras, pruneExtras, restoreLayouts
     )
 
 -- | Main entry point. Connect to the Swift daemon, initialise state, and
@@ -136,6 +136,7 @@ launch cfg = do
     snapRef  <- newIORef Nothing
     armedRef <- newIORef False
     let mconf = MConf { connection     = conn
+                      , layoutDefault  = T.pack (show (layoutHook cfg))
                       , latestSnapshot = snapRef
                       , saveArmed      = armedRef
                       }
@@ -311,7 +312,7 @@ restoreSnapshot cfg screens existingWindows = do
                     [ (S i, SD (siFrame si))
                     | (i, si) <- zip [0 :: Int ..] screens
                     ]
-                ws0 = serialToWindowSet
+                ws0 = restoreLayouts (layoutHook cfg) (seLayouts extrasRaw) $ serialToWindowSet
                         (layoutHook cfg)
                         (mcWorkspaces cfg)
                         screenTuples

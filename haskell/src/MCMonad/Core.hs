@@ -236,6 +236,7 @@ data PendingWindow a = PendingWindow
 -- the 'M' monad when the process is told to stop.
 data StateSnapshot = StateSnapshot
     { snWindowSet   :: !WindowSet
+    , snLayoutDefault :: !Text
     , snAffinity    :: !(Map.Map String ScreenId)
       -- ^ The workspace each attached screen shows. Restore reads it as
       -- "this screen had this workspace", so it holds visible workspaces only.
@@ -377,6 +378,11 @@ someMessage = XMonad.SomeMessage
 -- | The layout typeclass. Mirrors xmonad's LayoutClass but uses 'M' instead of 'X'.
 class (Show (layout a), Typeable layout) => LayoutClass layout a where
 
+    -- | Read saved state with the concrete layout from the user's config
+    -- as a witness. Combinators pass the witness down to boxed children.
+    layoutReadPrec :: Read (layout a) => layout a -> ReadPrec (layout a)
+    layoutReadPrec _ = readPrec
+
     -- | Run the layout on a workspace. Default delegates to 'doLayout' or
     -- 'emptyLayout' depending on whether the stack is empty.
     runLayout :: W.Workspace String (layout a) a -> Rectangle
@@ -414,9 +420,10 @@ class (Show (layout a), Typeable layout) => LayoutClass layout a where
 data Layout a = forall l. (LayoutClass l a, Read (l a)) => Layout (l a)
 
 instance Show (Layout a) where
-    show (Layout l) = show l
+    showsPrec p (Layout l) = showsPrec p l
 
 instance LayoutClass Layout WindowRef where
+    layoutReadPrec (Layout l) = Layout <$> layoutReadPrec l
     runLayout (W.Workspace tag (Layout l) s) r =
         fmap (fmap (fmap Layout)) $ runLayout (W.Workspace tag l s) r
     doLayout (Layout l) r s = fmap (fmap (fmap Layout)) $ doLayout l r s
@@ -426,8 +433,7 @@ instance LayoutClass Layout WindowRef where
     pureMessage (Layout l) m = Layout <$> pureMessage l m
     description (Layout l) = description l
 
--- We need a Read instance for Layout to satisfy StackSet constraints.
--- In practice it is never used (state is not serialized via Read/Show).
+-- Only the user's config supplies the concrete type needed by layoutReadPrec.
 instance Read (Layout a) where
     readsPrec _ _ = []
 
@@ -657,6 +663,7 @@ data MState = MState
 -- layout type, but the connection and resolved config are always present.
 data MConf = MConf
     { connection     :: !Connection
+    , layoutDefault  :: !Text
     , latestSnapshot :: !(IORef (Maybe StateSnapshot))
       -- ^ Mirror of the most recent complete state, refreshed on every
       -- save attempt (throttled or not). Read by the deferred save and

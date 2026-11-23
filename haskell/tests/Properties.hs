@@ -10,7 +10,7 @@ import MCMonad.Core
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
     , withinSettleWindow
     , armKillChurnSuppression, armEmptyWorkspaceGuard, shouldSuppressFrontApp
-    , PendingWindow(..), Timer(..), LayoutClass(..)
+    , PendingWindow(..), Timer(..), Layout(..), LayoutClass(..)
     )
 import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent, OverlayScreenEntry(..), OverlayIgnoredWindow(..), parseIgnoredFact)
 import MCMonad.Main (onHiddenWorkspace, pairBurst, confirmedFocusTarget)
@@ -24,6 +24,7 @@ import MCMonad.Persistence
     , windowSetToSerial
     , partitionPending, placePending, mergePending
     , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras
+    , SavedLayouts(..), snapshotLayouts, restoreLayouts
     )
 import MCMonad.Operations
     ( frameIsParked, reassignScreens
@@ -35,7 +36,7 @@ import MCMonad.Operations
     , replaceWindowIdentity
     )
 import MCMonad.Sway (viewOnScreen)
-import MCMonad.Layout (Full(..))
+import MCMonad.Layout (Full(..), Tall(..), Mirror(..), Choose(..), CL(..))
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -1645,7 +1646,7 @@ prop_focusByRole_confirmed_window_beats_same_pid =
 prop_extras_round_trip :: [(String, NonNegative Int)] -> [(WindowRef, ScreenDetail)] -> Property
 prop_extras_round_trip learned natives =
     let extras = StateExtras (Map.fromList [ (t, S n) | (t, NonNegative n) <- learned ])
-                             (Map.fromList [ (w, r) | (w, SD r) <- natives ])
+                             (Map.fromList [ (w, r) | (w, SD r) <- natives ]) Nothing
     in decodeExtras (encodeExtras extras) === Right extras
 
 -- An extras file from another version is refused, not half-read.
@@ -1662,8 +1663,38 @@ prop_extras_prune =
         r  = Rectangle 0 0 10 10
         extras = StateExtras (Map.fromList [("a", S 0), ("gone", S 1)])
                              (Map.fromList [(w1, r), (w2, r)])
+                             (Just (SavedLayouts "Full" (Map.singleton "gone" "old")))
     in pruneExtras (Set.fromList ["a", "b"]) (Set.fromList [w1]) extras
         == StateExtras (Map.fromList [("a", S 0)]) (Map.fromList [(w1, r)])
+                       (Just (SavedLayouts "Full" Map.empty))
+
+prop_workspace_layouts_survive_restart :: Property
+prop_workspace_layouts_survive_restart = forAll (choose (1, 95 :: Int)) $ \percent ->
+    let layout side fraction = Layout (Choose side Full (Mirror (Layout (Tall 1 0.03 fraction))))
+        def = layout CL 0.5
+        tags = ["b", "n", "other"]
+        original = W.new def tags (map snd twoScreens)
+        changed = W.mapWorkspace (\w ->
+            if W.tag w == "b" then w else w { W.layout = layout CR
+                (if W.tag w == "n" then 0.7 else fromIntegral percent / 100) }) original
+        saved = snapshotLayouts (Text.pack (show def)) changed
+        extras = noExtras { seLayouts = Just saved }
+        rebuilt = serialToWindowSet def tags twoScreens (windowSetToSerial changed Map.empty [] 1)
+        states = Map.fromList . map (\w -> (W.tag w, show (W.layout w))) . W.workspaces
+        damaged = saved { slOverrides = Map.insert "n" "invalid layout" (slOverrides saved) }
+        newDefault = layout CL 0.6
+        reconfigured = W.mapLayout (const newDefault) rebuilt
+        oldJson = "{\"version\":1,\"learnedAffinity\":[],\"nativeFloats\":[]}"
+        mixedJson = "{\"version\":1,\"learnedAffinity\":[{\"tag\":\"b\",\"screen\":1}],\"nativeFloats\":[],\"layouts\":{\"default\":\"Full\",\"workspaces\":{\"n\":false,\"b\":\"Full\"}}}"
+    in conjoin
+        [ fmap (\e -> states (restoreLayouts def (seLayouts e) rebuilt))
+               (decodeExtras (encodeExtras extras)) === Right (states changed)
+        , states (restoreLayouts def (Just damaged) rebuilt) === Map.insert "n" (show def) (states changed)
+        , states (restoreLayouts newDefault (Just saved) reconfigured) === states reconfigured
+        , decodeExtras oldJson === Right noExtras
+        , decodeExtras mixedJson === Right (StateExtras (Map.singleton "b" (S 1)) Map.empty
+                                               (Just (SavedLayouts "Full" (Map.singleton "b" "Full"))))
+        ]
 
 prop_role_names_round_trip :: Bool
 prop_role_names_round_trip =
@@ -1974,6 +2005,7 @@ allProperties =
     , ("affinity: confirmed focus beats a same-PID window", property prop_focusByRole_confirmed_window_beats_same_pid)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("state extras: JSON round trip", property prop_extras_round_trip)
+    , ("workspace layouts survive restart independently", prop_workspace_layouts_survive_restart)
     , ("state extras: other version refused", property prop_extras_other_version_refused)
     , ("state extras: prune to the main state", property prop_extras_prune)
     , ("ocr-index wire format", property prop_ocr_index_wire)

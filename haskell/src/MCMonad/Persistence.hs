@@ -70,6 +70,7 @@ module MCMonad.Persistence
     , mergePending
       -- * State kept beside the main file
     , StateExtras(..)
+    , SavedLayouts(..), snapshotLayouts, restoreLayouts
     , noExtras
     , extrasVersion
     , encodeExtras
@@ -77,19 +78,22 @@ module MCMonad.Persistence
     , pruneExtras
     ) where
 
-import Data.Aeson ((.=), (.:))
+import Data.Aeson ((.=), (.:), (.:?))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString.Lazy as LBS
+import Data.Char (isSpace)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
+import qualified Data.Text as Text
+import Text.Read (readPrec_to_S)
 import qualified XMonad.StackSet as W
 
 import MCMonad.Core
     ( WindowRef(..), ScreenId(..), ScreenDetail(..), Timer(..)
-    , PendingWindow(..), Rectangle
+    , PendingWindow(..), Rectangle, Layout, LayoutClass(layoutReadPrec), WindowSet
     )
 
 -- ---------------------------------------------------------------------------
@@ -403,11 +407,45 @@ data StateExtras = StateExtras
       -- last frame each had on screen. Without this a restart forgets
       -- that the window must never be sent a frame, and its placeholder
       -- floating rectangle (the whole screen) is applied to it.
+    , seLayouts :: !(Maybe SavedLayouts)
     } deriving (Eq, Show)
+
+-- | Only overrides of the configured default need storing. A change to the
+-- user's layout hook (including its initial parameters) starts a new set.
+data SavedLayouts = SavedLayouts
+    { slDefault :: !Text.Text
+    , slOverrides :: !(Map.Map String Text.Text)
+    } deriving (Eq, Show)
+
+instance Aeson.ToJSON SavedLayouts where
+    toJSON s = Aeson.object ["default" .= slDefault s, "workspaces" .= slOverrides s]
+
+instance Aeson.FromJSON SavedLayouts where
+    parseJSON = Aeson.withObject "workspace layouts" $ \o -> do
+        def <- o .: "default"
+        entries <- o .: "workspaces"
+        return (SavedLayouts def (Map.mapMaybe (Aeson.parseMaybe Aeson.parseJSON) entries))
+
+snapshotLayouts :: Text.Text -> WindowSet -> SavedLayouts
+snapshotLayouts def ws = SavedLayouts def $ Map.fromList
+    [ (W.tag wsp, state) | wsp <- W.workspaces ws
+    , let state = Text.pack (show (W.layout wsp)), state /= def ]
+
+-- | Each tag is decoded independently with the layout that would otherwise
+-- start there. A stale layout cannot discard another workspace's settings.
+restoreLayouts :: Layout WindowRef -> Maybe SavedLayouts -> WindowSet -> WindowSet
+restoreLayouts configured (Just saved) | Text.pack (show configured) == slDefault saved =
+    W.mapWorkspace $ \wsp -> case Map.lookup (W.tag wsp) (slOverrides saved) of
+        Nothing -> wsp
+        Just state -> case [ l | (l, rest) <- readPrec_to_S (layoutReadPrec configured) 0 (Text.unpack state)
+                               , all isSpace rest ] of
+            [layout] -> wsp { W.layout = layout }
+            _ -> wsp
+restoreLayouts _ _ = id
 
 -- | No extra state: what a brain has before it ever saved any.
 noExtras :: StateExtras
-noExtras = StateExtras Map.empty Map.empty
+noExtras = StateExtras Map.empty Map.empty Nothing
 
 -- | Version of the extras file. A file with another version is not read.
 extrasVersion :: Int
@@ -416,6 +454,7 @@ extrasVersion = 1
 encodeExtras :: StateExtras -> LBS.ByteString
 encodeExtras e = Aeson.encode $ Aeson.object
     [ "version" .= extrasVersion
+    , "layouts" .= seLayouts e
     , "learnedAffinity" .=
         [ Aeson.object ["tag" .= tag, "screen" .= n]
         | (tag, S n) <- Map.toList (seLearnedAffinity e) ]
@@ -434,7 +473,9 @@ decodeExtras bytes = Aeson.eitherDecode bytes >>= Aeson.parseEither parser
             else do
                 learned <- v .: "learnedAffinity" >>= mapM learnedEntry
                 natives <- v .: "nativeFloats" >>= mapM nativeEntry
-                return (StateExtras (Map.fromList learned) (Map.fromList natives))
+                rawLayouts <- v .:? "layouts"
+                let layouts = rawLayouts >>= Aeson.parseMaybe Aeson.parseJSON
+                return (StateExtras (Map.fromList learned) (Map.fromList natives) layouts)
     learnedEntry = Aeson.withObject "learnedAffinity entry" $ \o ->
         (\tag n -> (tag, S n)) <$> o .: "tag" <*> o .: "screen"
     nativeEntry = Aeson.withObject "nativeFloats entry" $ \o ->
@@ -447,4 +488,5 @@ pruneExtras :: Set.Set String -> Set.Set WindowRef -> StateExtras -> StateExtras
 pruneExtras tags windows' e = StateExtras
     { seLearnedAffinity = Map.filterWithKey (\t _ -> Set.member t tags) (seLearnedAffinity e)
     , seNativeFloats    = Map.filterWithKey (\w _ -> Set.member w windows') (seNativeFloats e)
+    , seLayouts         = (\s -> s { slOverrides = Map.restrictKeys (slOverrides s) tags }) <$> seLayouts e
     }

@@ -1167,7 +1167,8 @@ replaceWindowIdentity old new ws
 -- not establish that correspondence itself, only acts on it.
 --
 -- Skips the manage hook: the window is inheriting the old window's
--- placement, which already went through the hook once.
+-- placement, which already went through the hook once. The old window is
+-- not a native float; the caller sends those through the hook.
 handleManagedReplacement :: WindowRef -> WindowInfo -> M ()
 handleManagedReplacement old winfo = do
     ws <- gets windowset
@@ -1177,9 +1178,6 @@ handleManagedReplacement old winfo = do
             { sticky = if S.member old (sticky s)
                            then S.insert new (S.delete old (sticky s))
                            else sticky s
-            , nativeFloats = case M.lookup old (nativeFloats s) of
-                Just r  -> M.insert new r (M.delete old (nativeFloats s))
-                Nothing -> nativeFloats s
             , scratchpads = M.map (\w -> if w == old then new else w) (scratchpads s)
             , windowMetadata = M.insert new (metadataFromInfo winfo)
                                    (M.delete old (windowMetadata s))

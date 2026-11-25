@@ -6,7 +6,7 @@
 -- one frame for it: the one its layout gives it.
 module Main where
 
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.Aeson
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.List (nub)
@@ -53,6 +53,7 @@ replay brain = do
         create w p f canFullscreen = event brain "window-created"
             [ "windowId" .= w, "pid" .= p, "frame" .= frameOf f
             , "hasFullscreenButton" .= canFullscreen ]
+        destroy w = event brain "window-destroyed" ["windowId" .= (w :: Int)]
         -- Every frame sent up to the end of the next layout pass.
         pass :: String -> IO [(Int, Frame)]
         pass what = do
@@ -66,6 +67,10 @@ replay brain = do
             sent <- pass what
             unless (sent == wanted) $
                 fail (what ++ ": expected " ++ show wanted ++ ", the daemon was sent " ++ show sent)
+        -- Every frame sent up to the pass that first names the window.
+        framesUntil w = do
+            sent <- pass ("Waiting for window " ++ show w)
+            if any ((== w) . fst) sent then pure sent else (sent ++) <$> framesUntil w
         view tag = event brain "menu-view-workspace" ["tag" .= (tag :: Text)]
         whole = (0, 0, 1200, 800)
 
@@ -81,4 +86,14 @@ replay brain = do
     expect "Sinking a popup" [(21, whole)]
     view "r1" >> expect "Leaving a sunk popup" []
     view "1" >> expect "Returning to a sunk popup" [(21, whole)]
-    putStrLn "Native float replay passed: kept frame, sunk popup."
+    destroy 21 >> void (pass "Closing a sunk popup")
+
+    -- A popup that closes as its application opens a full window does not
+    -- hand the window its place.
+    create 31 301 popup False
+    expect "Opening another popup" [(31, popup)]
+    destroy 31 >> create 32 301 whole True
+    sent <- framesUntil 32
+    unless (sent == [(32, whole)]) $
+        fail ("A window that replaced a popup should be tiled. The daemon was sent " ++ show sent)
+    putStrLn "Native float replay passed: kept frame, sunk popup, popup replaced by a window."

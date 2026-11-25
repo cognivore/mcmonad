@@ -514,6 +514,12 @@ dispatchFresh debug cfg hotkeyIdMap evt = do
 -- 'evt' plus everything drained while looking for one (in original
 -- order) when nothing paired — including when 'evt' itself has no
 -- resolvable pid, in which case nothing is drained at all.
+--
+-- A native float is never replaced in place. Its frame was its
+-- application's choice for that window, and a popup that closes as its
+-- application opens a full window is the same burst as a window changing
+-- identity: the window would be given the popup's place and size. Closing
+-- a float reflows no tiles, so there is nothing to collapse either.
 tryCollapseBurst :: Event -> M [Event]
 tryCollapseBurst evt = do
     ws <- gets windowset
@@ -523,11 +529,12 @@ tryCollapseBurst evt = do
             batch <- withConnection $ \conn -> io $ do
                 threadDelay burstDrainDelayMicros
                 drainReadyEvents conn
+            natives <- gets nativeFloats
             case pairBurst ws pid (evt : batch) of
-                Just (oldRef, winfo, leftover) -> do
+                Just (oldRef, winfo, leftover) | Map.notMember oldRef natives -> do
                     userCodeDef () $ handleManagedReplacement oldRef winfo
                     return leftover
-                Nothing -> return (evt : batch)
+                _ -> return (evt : batch)
 
 -- | Pair up a same-pid burst. Given the pid and the trigger followed by
 -- everything drained behind it, returns the old window and the new

@@ -26,6 +26,7 @@ module MCMonad.Core
     , Timer(..)
       -- * Lazy restore
     , PendingWindow(..)
+    , Departed(..)
       -- * Persisted-state snapshot
     , StateSnapshot(..)
       -- * Layout system
@@ -223,6 +224,14 @@ data PendingWindow a = PendingWindow
       -- focus back when it returns.
     , pwFloat   :: !(Maybe (Rational, Rational, Rational, Rational))
       -- ^ Its floating rectangle (x, y, w, h), if it was floating.
+    } deriving (Eq, Show)
+
+-- | Where a window was when it left management, so that it can go back
+-- there if it turns out not to have died ('MState.reclaimOrigin').
+data Departed = Departed
+    { dpPlace  :: !(PendingWindow WindowRef)
+    , dpNative :: !(Maybe Rectangle)
+      -- ^ Its own frame, if it was one of 'MState.nativeFloats'.
     } deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -618,9 +627,9 @@ data MState = MState
       -- 'MCMonad.Operations.unmanagedOriginTTL'. Deliberately not
       -- persisted: pids don't survive the reboots that persistence
       -- exists for, and a Mod-q mid-fullscreen is a corner we accept.
-    , reclaimOrigin    :: !(Map.Map WindowRef (String, UTCTime))
-      -- ^ Exact window → (workspace tag, time) for /every/ window that
-      -- leaves management, not just a pid's last one.
+    , reclaimOrigin    :: !(Map.Map WindowRef (Departed, UTCTime))
+      -- ^ Exact window → (its place, time) for /every/ window that leaves
+      -- management, not just a pid's last one.
       --
       -- mcmonad-core's reconcile sweep re-offers any live, manageable
       -- window the brain isn't holding, which closes the hole where a
@@ -640,10 +649,16 @@ data MState = MState
       -- window bounds any chance of a recycled CGWindowID matching a
       -- stale entry. Consumed on first use. Not persisted, for the same
       -- reason as 'unmanagedOrigin'.
+      --
+      -- The window goes back to its own slot and floating state without
+      -- meeting the manage hook again
+      -- ('MCMonad.Operations.restorePlacement'). A window in native
+      -- fullscreen is the usual case, and what it reports about itself
+      -- there (no usable zoom button) is not what it is.
     , pendingRestore   :: !(Map.Map WindowRef (PendingWindow WindowRef))
       -- ^ Saved windows the daemon has not confirmed yet, keyed by the
       -- exact identity they will come back under. Consulted by
-      -- 'MCMonad.Operations.restorePending' before the manage hook on
+      -- 'MCMonad.Operations.restorePlacement' before the manage hook on
       -- every 'WindowCreated', so a late-enumerated window returns to
       -- its own workspace instead of landing on the current one.
       -- Persisted (merged into the saved stacks), so a restart in the

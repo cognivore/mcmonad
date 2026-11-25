@@ -66,6 +66,7 @@ module MCMonad.Persistence
     , serialToWindowSet
       -- * Lazy restore
     , partitionPending
+    , placementOf
     , placePending
     , mergePending
       -- * State kept beside the main file
@@ -301,20 +302,25 @@ partitionPending live ws0 = (foldr W.delete ws0 absent, Map.fromList entries)
   where
     absent  = filter (`Set.notMember` live) (W.allWindows ws0)
     entries = [ (w, pendingFor w) | w <- absent ]
-    pendingFor w =
-        case W.findTag w ws0 >>= \t -> find ((== t) . W.tag) (W.workspaces ws0) of
-            Just wsp ->
-                let order = W.integrate' (W.stack wsp)
-                in PendingWindow
-                    { pwTag     = W.tag wsp
-                    , pwBefore  = reverse (takeWhile (/= w) order)
-                    , pwFocused = fmap W.focus (W.stack wsp) == Just w
-                    , pwFloat   = rational <$> Map.lookup w (W.floating ws0)
-                    }
-            Nothing -> error
-                "MCMonad.Persistence.partitionPending: \
-                \window is in allWindows but on no workspace"
-    rational (W.RationalRect x y w h) = (x, y, w, h)
+    pendingFor w = case placementOf w ws0 of
+        Just pw -> pw
+        Nothing -> error
+            "MCMonad.Persistence.partitionPending: \
+            \window is in allWindows but on no workspace"
+
+-- | Where a window is: everything 'placePending' needs to put it back.
+-- 'Nothing' when it is on no workspace.
+placementOf :: Ord a => a -> W.StackSet String l a sid sd -> Maybe (PendingWindow a)
+placementOf w ws = do
+    tag <- W.findTag w ws
+    wsp <- find ((== tag) . W.tag) (W.workspaces ws)
+    return PendingWindow
+        { pwTag     = tag
+        , pwBefore  = reverse (takeWhile (/= w) (W.integrate' (W.stack wsp)))
+        , pwFocused = fmap W.focus (W.stack wsp) == Just w
+        , pwFloat   = rational <$> Map.lookup w (W.floating ws)
+        }
+  where rational (W.RationalRect x y rw rh) = (x, y, rw, rh)
 
 -- | Put a pending window back on its workspace.
 --

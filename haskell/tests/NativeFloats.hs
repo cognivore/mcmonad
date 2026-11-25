@@ -1,9 +1,11 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | A native float keeps the frame its application chose. This replays the
--- ways a window stops being one, and checks that the daemon is then told
--- one frame for it: the one its layout gives it.
+-- | A native float keeps the frame its application chose; every other
+-- window has the one its layout gives it. This replays what blurs the two
+-- (a float sunk, a float closed as a window opens, a tile that comes back
+-- from native fullscreen looking like a popup) and checks what the daemon
+-- is told.
 module Main where
 
 import Control.Monad (unless, void, when)
@@ -96,4 +98,29 @@ replay brain = do
     sent <- framesUntil 32
     unless (sent == [(32, whole)]) $
         fail ("A window that replaced a popup should be tiled. The daemon was sent " ++ show sent)
-    putStrLn "Native float replay passed: kept frame, sunk popup, popup replaced by a window."
+
+    -- Two tiles. Going into native fullscreen, the second one is reported
+    -- destroyed, and found again moments later looking like a window that
+    -- cannot be made full screen. It is the same window, in the same slot.
+    let master = (0, 0, 600, 800)
+        second = (600, 0, 600, 800)
+        takenAndGivenBack what canFullscreen = do
+            destroy 32
+            expect (what ++ ", taken away") [(33, whole)]
+            create 32 301 whole canFullscreen
+            expect (what ++ ", given back") [(33, master), (32, second)]
+    create 33 303 whole True
+    expect "Opening a second window" [(33, master), (32, second)]
+    takenAndGivenBack "Entering native fullscreen" False
+    view "r1" >> expect "Leaving the fullscreen window's workspace" []
+    view "1" >> expect "Returning to it" [(33, master), (32, second)]
+    takenAndGivenBack "Leaving native fullscreen" True
+
+    -- A popup taken away and given back is still a popup, where it was.
+    create 34 303 popup False
+    expect "Opening a popup over tiles" [(33, master), (32, second), (34, popup)]
+    destroy 34 >> expect "A popup taken away" [(33, master), (32, second)]
+    create 34 303 whole True
+    expect "A popup given back" [(33, master), (32, second), (34, popup)]
+
+    putStrLn "Native float replay passed: kept frame, sunk popup, popup replaced by a window, fullscreen round trip."

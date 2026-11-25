@@ -17,7 +17,7 @@ module MCMonad.Operations
       -- * Window lifecycle
     , manage
     , manageSilent
-    , restorePending
+    , restorePlacement
     , forgetPending
     , unmanage
     , replaceWindowIdentity
@@ -26,6 +26,7 @@ module MCMonad.Operations
     , reclaimOriginTTL
     , reclaimOriginCap
     , pruneReclaims
+    , freshReclaim
     , chooseOriginTag
     , placeManaged
     , windowsToPark
@@ -126,7 +127,7 @@ import MCMonad.IPC
 import MCMonad.ManageHook (ManageHook, runManageHook)
 import MCMonad.Persistence
     ( SerialState(..), persistenceVersion, windowSetToSerial
-    , mergePending, placePending
+    , mergePending, placementOf, placePending
     , StateExtras(..), noExtras, encodeExtras, decodeExtras, pruneExtras, snapshotLayouts
     )
 
@@ -827,39 +828,38 @@ reclaimOriginCap = 256
 -- 'Nothing' means "no opinion" — the caller leaves it on the current
 -- workspace, which is right for a genuinely new window.
 --
--- Precedence matters. An exact-window hit in @reclaims@ means this same
--- CGWindowID came back, which only happens when the window never really
--- died: mcmonad-core's reconcile sweep re-offering something a bogus
--- destroy took away. That is certain knowledge and beats the pid
--- heuristic in @origins@, which is an inference ("this app's last window
--- died recently, so this is probably its replacement") and deliberately
--- only fires for single-window apps.
+-- This is an inference ("this app's last window died recently, so this is
+-- probably its replacement") and deliberately only fires for
+-- single-window apps. The same CGWindowID coming back is certain knowledge
+-- and never gets this far: 'restorePlacement' answers for it first.
 --
--- Both sources are ignored once stale, and a tag that no longer exists
+-- An entry is ignored once stale, and a tag that no longer exists
 -- (the user renamed a workspace) is discarded rather than resurrected.
 chooseOriginTag
     :: UTCTime
     -> [String]
-    -> WindowRef
     -> Int32
-    -> M.Map WindowRef (String, UTCTime)
     -> M.Map Int32 (String, UTCTime)
     -> Maybe String
-chooseOriginTag now liveTags wr pid reclaims origins =
-    fresh reclaimOriginTTL (M.lookup wr reclaims)
-        <|> fresh unmanagedOriginTTL (M.lookup pid origins)
-  where
-    fresh ttl entry = case entry of
-        Just (tag, at)
-            | diffUTCTime now at <= ttl
-            , tag `elem` liveTags -> Just tag
-        _ -> Nothing
+chooseOriginTag now liveTags pid origins = do
+    (tag, at) <- M.lookup pid origins
+    guard (diffUTCTime now at <= unmanagedOriginTTL && tag `elem` liveTags)
+    return tag
+
+-- | What was recorded of this exact window when it left management, if
+-- that was recently enough to believe it is the same window back.
+freshReclaim :: Ord w => UTCTime -> w -> M.Map w (a, UTCTime) -> Maybe a
+freshReclaim now w reclaims = do
+    (a, at) <- M.lookup w reclaims
+    guard (diffUTCTime now at <= reclaimOriginTTL)
+    return a
 
 -- | Drop expired reclaim entries and enforce the size cap (newest kept).
 pruneReclaims
-    :: UTCTime
-    -> M.Map WindowRef (String, UTCTime)
-    -> M.Map WindowRef (String, UTCTime)
+    :: Ord w
+    => UTCTime
+    -> M.Map w (a, UTCTime)
+    -> M.Map w (a, UTCTime)
 pruneReclaims now m
     | M.size fresh <= reclaimOriginCap = fresh
     | otherwise = M.fromList
@@ -936,13 +936,11 @@ manage wi hook = do
     when (not (W.member wr ws)) $ do
         Endo transform <- userCodeDef (Endo id) (runManageHook hook wi)
         -- Destroy/recreate routing: if this pid's last window was
-        -- destroyed recently ('unmanagedOrigin'), or this exact window
-        -- was offered again ('reclaimOrigin'), it is not a genuinely
+        -- destroyed recently ('unmanagedOrigin'), it is not a genuinely
         -- new window — it's a window mcmonad has already seen,
         -- continuing under a new identity (Gecko destroys and
         -- recreates the NSWindow across a native-fullscreen
-        -- round-trip; mcmonad-core's reconcile sweep can re-offer a
-        -- window a bogus destroy took away). Route it back to the
+        -- round-trip). Route it back to the
         -- workspace it already belonged to. The route runs *after*
         -- the manage hook's transform and wins when both apply, so a
         -- pinning rule like @doShift@ in the user's config only
@@ -952,12 +950,10 @@ manage wi hook = do
         -- there is no origin, so a genuinely new window is unaffected.
         now <- io getCurrentTime
         origins <- gets unmanagedOrigin
-        reclaims <- gets reclaimOrigin
         let allTags = map W.tag (W.workspace (W.current ws)
                                  : map W.workspace (W.visible ws)
                                  ++ W.hidden ws)
-            originTag =
-                chooseOriginTag now allTags wr (wiPid wi) reclaims origins
+            originTag = chooseOriginTag now allTags (wiPid wi) origins
             -- Computed here, not read back via 'gets windowset' after
             -- 'windows' below runs: 'windows' pushes the OverlaySnapshot
             -- as its very last step, so recording the ignore *after* it
@@ -968,7 +964,6 @@ manage wi hook = do
         modify $ \s -> s
             { windowMetadata  = M.insert wr (metadataFromInfo wi) (windowMetadata s)
             , unmanagedOrigin = M.delete (wiPid wi) (unmanagedOrigin s)
-            , reclaimOrigin   = M.delete wr (pruneReclaims now (reclaimOrigin s))
             }
         recordIfIgnored wr finalWs
         windows (const finalWs)
@@ -1017,50 +1012,60 @@ manageSilent wi hook = do
             }
         recordIfIgnored wr finalWs
 
--- | If this window is one the restore is still waiting for, put it back
--- on the workspace it was saved on — at its saved position, with its
--- saved focus and floating state — and report 'True'. 'False' means
--- the window is not pending and the caller should manage it as new.
+-- | If this window's place is already known, put it back there — at its
+-- position on its workspace, with its focus and floating state — and
+-- report 'True'. 'False' means the caller should manage it as new.
 --
--- Runs before the manage hook on every 'WindowCreated'. This is how a
--- window the daemon only enumerates late (an empty or partial startup
--- enumeration, an app slow to answer AX, a window the app hid and
--- re-showed) returns to its own workspace instead of landing on
--- whatever workspace happens to be current.
-restorePending :: WindowInfo -> M Bool
-restorePending wi = do
+-- Runs before the manage hook on every 'WindowCreated', for two kinds of
+-- window:
+--
+-- * one a restore is still waiting for ('pendingRestore'). This is how a
+--   window the daemon only enumerates late (an empty or partial startup
+--   enumeration, an app slow to answer AX, a window the app hid and
+--   re-showed) returns to its own workspace instead of landing on
+--   whatever workspace happens to be current;
+-- * one that left management moments ago under this very CGWindowID
+--   ('reclaimOrigin'), so it never died. A window changing macOS Space
+--   for native fullscreen can be reported destroyed and then found again
+--   by mcmonad-core's reconcile sweep, going in and coming out.
+restorePlacement :: WindowInfo -> M Bool
+restorePlacement wi = do
     let wr = WindowRef (wiWindowId wi) (wiPid wi)
-    pend <- gets pendingRestore
-    case M.lookup wr pend of
-        Nothing -> return False
-        Just pw -> do
-            ws <- gets windowset
-            case placePending wr pw ws of
-                Nothing -> do
-                    -- Its workspace no longer exists. Tags can't change
-                    -- at runtime, so this is defensive: forget the entry
-                    -- and let the caller manage the window as new.
-                    modify $ \s -> s { pendingRestore = M.delete wr (pendingRestore s) }
-                    return False
-                Just _ -> do
-                    modify $ \s -> s
-                        { pendingRestore = M.delete wr (pendingRestore s)
-                        , windowMetadata = M.insert wr (metadataFromInfo wi)
-                                                       (windowMetadata s)
-                        }
-                    io $ logTS $
-                        "mcmonad: window " ++ show (wiWindowId wi)
-                        ++ " (pid " ++ show (wiPid wi)
-                        ++ ") enumerated late; restored to workspace "
-                        ++ pwTag pw
-                    windows (\cur -> fromMaybe cur (placePending wr pw cur))
-                    -- Back on a hidden workspace, the visible set didn't
-                    -- change, so 'windows' issued no hides and the window
-                    -- sits wherever its app left it. Park it explicitly
-                    -- (same reasoning as the routed case in 'manage').
-                    ws' <- gets windowset
-                    unless (wr `elem` allVisibleWindows ws') reassertHiddenWindows
-                    return True
+    now <- io getCurrentTime
+    pend <- gets (M.lookup wr . pendingRestore)
+    back <- gets (freshReclaim now wr . reclaimOrigin)
+    let known = fmap (\pw -> (pw, Nothing, "enumerated late; restored")) pend
+            <|> fmap (\d -> (dpPlace d, dpNative d, "was still there; returned")) back
+    ws <- gets windowset
+    modify $ \s -> s { pendingRestore = M.delete wr (pendingRestore s)
+                     , reclaimOrigin = M.delete wr (reclaimOrigin s) }
+    case known of
+        Just (pw, native, what)
+            | not (W.member wr ws)
+            -- Not when its workspace no longer exists. Tags can't change
+            -- at runtime, so this is defensive.
+            , isJust (placePending wr pw ws) -> do
+                modify $ \s -> s
+                    { windowMetadata = M.insert wr (metadataFromInfo wi)
+                                                   (windowMetadata s)
+                    , nativeFloats = maybe id (M.insert wr) native (nativeFloats s)
+                    -- If it was its process's last window, it is back and
+                    -- there is no replacement to route.
+                    , unmanagedOrigin = maybe id (const (M.delete (wiPid wi))) back (unmanagedOrigin s)
+                    }
+                io $ logTS $
+                    "mcmonad: window " ++ show (wiWindowId wi)
+                    ++ " (pid " ++ show (wiPid wi)
+                    ++ ") " ++ what ++ " to workspace " ++ pwTag pw
+                windows (\cur -> fromMaybe cur (placePending wr pw cur))
+                -- Back on a hidden workspace, the visible set didn't
+                -- change, so 'windows' issued no hides and the window
+                -- sits wherever its app left it. Park it explicitly
+                -- (same reasoning as the routed case in 'manage').
+                ws' <- gets windowset
+                unless (wr `elem` allVisibleWindows ws') reassertHiddenWindows
+                return True
+        _ -> return False
 
 -- | The daemon reported this window id destroyed: stop waiting for it.
 -- Persists when it changed anything — this mutation bypasses 'windows',
@@ -1102,22 +1107,21 @@ unmanage w = do
             modify $ \s -> s { suppressFrontAppUntil = Just (armKillChurnSuppression now) }
         let lastOfPid = not (any (\o -> o /= w && wrPid o == wrPid w)
                                  (W.allWindows ws))
-        case W.findTag w ws of
-            Just tag -> do
-                -- Exact-window origin, recorded unconditionally: if this
-                -- window comes back under the same CGWindowID it never
-                -- died, and it belongs exactly here.
-                modify $ \s -> s
-                    { reclaimOrigin =
-                        M.insert w (tag, now)
-                                 (pruneReclaims now (reclaimOrigin s))
-                    }
-                when lastOfPid $ modify $ \s -> s
-                    { unmanagedOrigin =
-                        M.insert (wrPid w) (tag, now)
-                                 (pruneOrigins now (unmanagedOrigin s))
-                    }
-            Nothing -> return ()
+        natives <- gets nativeFloats
+        whenJust (placementOf w ws) $ \place -> do
+            -- Exact-window origin, recorded unconditionally: if this
+            -- window comes back under the same CGWindowID it never
+            -- died, and it belongs exactly here.
+            let !departed = Departed place (M.lookup w natives)
+            modify $ \s -> s
+                { reclaimOrigin =
+                    M.insert w (departed, now) (pruneReclaims now (reclaimOrigin s))
+                }
+            when lastOfPid $ modify $ \s -> s
+                { unmanagedOrigin =
+                    M.insert (wrPid w) (pwTag place, now)
+                             (pruneOrigins now (unmanagedOrigin s))
+                }
         -- Clean from sticky, scratchpads and metadata before removing.
         -- (A native float leaves 'nativeFloats' when 'windows' sees that
         -- it no longer floats.)

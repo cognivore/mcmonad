@@ -255,7 +255,7 @@ data Restored = Restored
       -- ^ Saved windows the daemon did not enumerate but whose process
       -- is still running. Held out of the 'WindowSet' with their saved
       -- placement, and put back the moment the daemon reports them
-      -- ('MCMonad.Operations.restorePending').
+      -- ('MCMonad.Operations.restorePlacement').
     , rsExtras      :: StateExtras
       -- ^ State saved beside the main file, cut down to the workspaces and
       -- windows this restore produced (confirmed or pending).
@@ -574,10 +574,9 @@ handleEvent debug cfg hotkeyIdMap evt = do
             -- shown up; a 'FrontAppChanged' bounce no longer needs the
             -- extra scrutiny (see 'handleFrontAppChanged').
             modify $ \s -> s { emptyWorkspaceGuardUntil = Nothing }
-            -- A saved window the daemon is only reporting now goes back
-            -- to its own workspace; only genuinely new windows meet the
-            -- manage hook.
-            restored <- restorePending winfo
+            -- A window whose place is already known goes back to it; only
+            -- genuinely new windows meet the manage hook.
+            restored <- restorePlacement winfo
             unless restored $ do
                 manage winfo (manageHook cfg)
                 -- Register as named scratchpad if one is pending

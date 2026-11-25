@@ -28,7 +28,8 @@ import MCMonad.Persistence
     )
 import MCMonad.Operations
     ( frameIsParked, reassignScreens
-    , chooseOriginTag, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
+    , chooseOriginTag, unmanagedOriginTTL
+    , freshReclaim, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
     , placeManaged, windowsToPark, raiseOrder, stillNative
     , screenAt, rectOverlapArea, crossedScreenTag
     , RepairStep(..), repairStep, maxRepairAttempts
@@ -1160,8 +1161,9 @@ prop_reassignScreens_fixes_the_swap ss =
 --
 -- mcmonad-core's reconcile sweep re-offers any live, manageable window
 -- the brain isn't holding, so 'manage' now runs for windows that were
--- never really gone. 'chooseOriginTag' decides where such a window
--- lands. Getting it wrong is user-visible in both directions: too eager
+-- never really gone. 'freshReclaim' answers for the same CGWindowID
+-- coming back, 'chooseOriginTag' for a replacement under a new one.
+-- Getting it wrong is user-visible in both directions: too eager
 -- and an unrelated window teleports onto a stale tag, too lax and every
 -- reclaimed window piles onto whatever workspace is current.
 
@@ -1175,47 +1177,40 @@ aged tag age = (tag, addUTCTime (negate (fromIntegral age)) originBase)
 liveTags :: [String]
 liveTags = ["1", "2", "3", "web", "chat"]
 
--- An exact-window reclaim beats the pid heuristic: the same CGWindowID
--- coming back is proof the window never died, whereas the pid entry is
--- only ever an inference about a *replacement* window.
-prop_chooseOrigin_reclaim_beats_pid :: WindowRef -> Property
-prop_chooseOrigin_reclaim_beats_pid wr =
-    chooseOriginTag originBase liveTags wr (wrPid wr)
-        (Map.singleton wr (aged "web" 1))
-        (Map.singleton (wrPid wr) (aged "chat" 1))
-        === Just "web"
-
--- With no reclaim entry the pid heuristic still applies — this is the
--- Gecko destroy/recreate path, which must keep working.
-prop_chooseOrigin_pid_when_no_reclaim :: WindowRef -> Property
-prop_chooseOrigin_pid_when_no_reclaim wr =
-    chooseOriginTag originBase liveTags wr (wrPid wr)
-        Map.empty
-        (Map.singleton (wrPid wr) (aged "chat" 1))
+-- The pid heuristic: the Gecko destroy/recreate path.
+prop_chooseOrigin_pid :: Int32 -> Property
+prop_chooseOrigin_pid pid =
+    chooseOriginTag originBase liveTags pid (Map.singleton pid (aged "chat" 1))
         === Just "chat"
 
--- A reclaim older than its TTL is not merely deprioritised, it is gone:
--- fall through to the pid entry rather than honouring a stale tag.
-prop_chooseOrigin_expired_reclaim_falls_through :: WindowRef -> Property
-prop_chooseOrigin_expired_reclaim_falls_through wr =
-    chooseOriginTag originBase liveTags wr (wrPid wr)
-        (Map.singleton wr (aged "web" (round reclaimOriginTTL + 1)))
-        (Map.singleton (wrPid wr) (aged "chat" 1))
-        === Just "chat"
+-- An entry past its TTL is not a weaker answer, it is none.
+prop_chooseOrigin_expired :: Int32 -> Property
+prop_chooseOrigin_expired pid =
+    chooseOriginTag originBase liveTags pid
+        (Map.singleton pid (aged "chat" (round unmanagedOriginTTL + 1)))
+        === Nothing
 
 -- A tag the config no longer has must never be resurrected.
-prop_chooseOrigin_rejects_dead_tag :: WindowRef -> Property
-prop_chooseOrigin_rejects_dead_tag wr =
-    chooseOriginTag originBase liveTags wr (wrPid wr)
-        (Map.singleton wr (aged "renamed-away" 1))
-        Map.empty
+prop_chooseOrigin_rejects_dead_tag :: Int32 -> Property
+prop_chooseOrigin_rejects_dead_tag pid =
+    chooseOriginTag originBase liveTags pid
+        (Map.singleton pid (aged "renamed-away" 1))
         === Nothing
 
 -- No opinion for a genuinely new window.
-prop_chooseOrigin_empty_is_nothing :: WindowRef -> Property
-prop_chooseOrigin_empty_is_nothing wr =
-    chooseOriginTag originBase liveTags wr (wrPid wr) Map.empty Map.empty
-        === Nothing
+prop_chooseOrigin_empty_is_nothing :: Int32 -> Property
+prop_chooseOrigin_empty_is_nothing pid =
+    chooseOriginTag originBase liveTags pid Map.empty === Nothing
+
+-- The very window that left is recognised while its entry is fresh, and
+-- no other window is, not even another of its process.
+prop_freshReclaim_exact_and_fresh :: WindowRef -> WindowRef -> NonNegative Int -> Property
+prop_freshReclaim_exact_and_fresh wr other (NonNegative age) =
+    let entry = Map.singleton wr (aged "web" age)
+    in freshReclaim originBase wr entry
+            === (if age <= round reclaimOriginTTL then Just "web" else Nothing)
+       .&&. (other /= wr ==> freshReclaim originBase other entry === Nothing)
+       .&&. freshReclaim originBase wr { wrWindowId = wrWindowId wr + 1 } entry === Nothing
 
 mkReclaims :: [(WindowRef, Int)] -> Map.Map WindowRef (String, UTCTime)
 mkReclaims entries =
@@ -2139,9 +2134,9 @@ allProperties =
     , ("rescreen: focused monitor unplugged",         property prop_reassignScreens_drop_focused_screen)
     , ("rescreen: broken version swapped displays",   property prop_reassignScreens_fixes_the_swap)
     -- Re-manage routing after a reconcile-sweep reclaim
-    , ("origin: exact reclaim beats pid guess",       property prop_chooseOrigin_reclaim_beats_pid)
-    , ("origin: pid guess when no reclaim",           property prop_chooseOrigin_pid_when_no_reclaim)
-    , ("origin: expired reclaim falls through",       property prop_chooseOrigin_expired_reclaim_falls_through)
+    , ("origin: pid guess",                           property prop_chooseOrigin_pid)
+    , ("origin: expired pid guess is none",           property prop_chooseOrigin_expired)
+    , ("reclaim: exact window, while fresh",          property prop_freshReclaim_exact_and_fresh)
     , ("origin: dead tag is not resurrected",         property prop_chooseOrigin_rejects_dead_tag)
     , ("origin: nothing known means no opinion",      property prop_chooseOrigin_empty_is_nothing)
     , ("reclaim: prune respects cap",                 property prop_pruneReclaims_respects_cap)

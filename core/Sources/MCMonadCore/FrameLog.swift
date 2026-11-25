@@ -37,10 +37,15 @@ enum FrameLog {
         // Per-assignment AX element resolution failure (window not findable)
         case cmdAxResolveFail
 
+        // A set-frames assignment for a window in native fullscreen: not
+        // written, because macOS owns the frame of such a window.
+        case cmdFullscreenSkip
+
         // Per-window invocation of AXWindowService.setFrame from
         // executeHideWindows. Tags the move that parks a window off-screen
         // so we can correlate "wid X was hidden at seq=A" with "wid X
         // appears pinned at the hide position from seq=A onward".
+        // 'result' is what became of the write (AXWindowService.FrameWrite).
         case cmdHideMove
 
         // A show-windows raise that did not happen (window not found,

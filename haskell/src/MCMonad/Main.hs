@@ -172,6 +172,7 @@ launch cfg = do
                        , debugOverlays = False
                        , ignoredWindows = Set.empty
                        , frameRepairs = Map.empty
+                       , parkRetries = Map.empty
                        , nativeFloats = seNativeFloats (rsExtras restored)
                        , lastSaveAt = Nothing
                        , timers = rsTimers restored
@@ -630,7 +631,12 @@ handleEvent debug cfg hotkeyIdMap evt = do
             case findByWindowId wid (W.allWindows ws) of
                 Just wref | not (Set.member wref mappedSet)
                           , not (frameIsParked (map (screenRect . W.screenDetail) (W.screens ws)) rect)
-                    -> reassertHiddenWindows
+                    -> do
+                        now <- io getCurrentTime
+                        asked <- gets (Map.lookup wref . parkRetries)
+                        whenJust (parkRetry now asked) $ \retries -> do
+                            modify $ \s -> s { parkRetries = Map.insert wref retries (parkRetries s) }
+                            reassertHiddenWindows
                 Just wref | Set.member wref mappedSet
                           , Map.member wref natives
                     -> do

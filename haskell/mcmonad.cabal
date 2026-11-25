@@ -89,3 +89,13 @@ test-suite native-floats
   ghc-options: -Wall -threaded
   build-depends: base, mcmonad, aeson, bytestring, network, process, unix,
                  directory, filepath, text
+
+test-suite park-retry
+  type: exitcode-stdio-1.0
+  main-is: ParkRetry.hs
+  other-modules: Replay
+  hs-source-dirs: tests
+  default-language: GHC2021
+  ghc-options: -Wall -threaded
+  build-depends: base, mcmonad, aeson, bytestring, network, process, unix,
+                 directory, filepath, text

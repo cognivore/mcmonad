@@ -20,6 +20,11 @@ func _AXUIElementGetWindow(
 /// own kAX* attributes (matches FrameLog's global-state pattern).
 nonisolated(unsafe) private let kAXEnhancedUserInterface = "AXEnhancedUserInterface" as CFString
 
+/// Whether a window is in native fullscreen. Undocumented, but the attribute
+/// every application with fullscreen windows answers. `nonisolated(unsafe)`:
+/// an immutable CFString constant, as above.
+nonisolated(unsafe) private let kAXFullScreen = "AXFullScreen" as CFString
+
 // MARK: - AXWindowService
 
 /// AXUIElement wrapper for window metadata reads and frame writes.
@@ -169,9 +174,41 @@ enum AXWindowService {
         )
     }
 
+    // MARK: - Native fullscreen
+
+    /// Whether the window is in native fullscreen. macOS owns the frame of
+    /// such a window: a position write is refused, and a size write can
+    /// take hold inside the fullscreen Space. A window that does not
+    /// answer is not taken to be.
+    static func isFullscreen(_ axWindow: AXUIElement) -> Bool {
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  axWindow, kAXFullScreen, &valueRef
+              ) == .success,
+              let valueRef,
+              CFGetTypeID(valueRef) == CFBooleanGetTypeID()
+        else { return false }
+        return CFBooleanGetValue((valueRef as! CFBoolean))
+    }
+
     // MARK: - Set frame
 
-    /// Write position and size to a window via AX.
+    /// What became of a frame write.
+    enum FrameWrite: String {
+        case ok
+        /// The application refused the position or the size.
+        case err
+        /// Not written: the window is in native fullscreen.
+        case fullscreen
+        /// Not written: the application does not list the window now (it
+        /// is on another Space, or the application is not answering).
+        case unresolved
+        /// Not written: the frame is empty or not finite.
+        case invalid
+    }
+
+    /// Write position and size to a window via AX, unless it is in native
+    /// fullscreen.
     ///
     /// Write order follows OmniWM's heuristic:
     /// - If the window is **growing**, write position first then size
@@ -187,7 +224,7 @@ enum AXWindowService {
         windowId: UInt32,
         pid: pid_t,
         currentHint: CGRect? = nil
-    ) -> Bool {
+    ) -> FrameWrite {
         guard targetFrame.width > 0,
               targetFrame.height > 0,
               targetFrame.origin.x.isFinite,
@@ -198,13 +235,15 @@ enum AXWindowService {
             logger.warning(
                 "Invalid target frame for wid=\(windowId): \(String(describing: targetFrame))"
             )
-            return false
+            return .invalid
         }
 
         guard let axWindow = findAXWindow(windowId: windowId, pid: pid) else {
             logger.debug("AX window not found for setFrame: wid=\(windowId) pid=\(pid)")
-            return false
+            return .unresolved
         }
+
+        guard !isFullscreen(axWindow) else { return .fullscreen }
 
         var position = CGPoint(x: targetFrame.origin.x, y: targetFrame.origin.y)
         var size = CGSize(width: targetFrame.width, height: targetFrame.height)
@@ -213,7 +252,7 @@ enum AXWindowService {
               let sizeValue = AXValueCreate(.cgSize, &size)
         else {
             logger.error("AXValueCreate failed for wid=\(windowId)")
-            return false
+            return .err
         }
 
         // Disable AXEnhancedUserInterface on the app for the duration of the
@@ -258,7 +297,7 @@ enum AXWindowService {
             logger.debug("AX position write failed for wid=\(windowId): \(positionError.rawValue)")
         }
 
-        return sizeError == .success && positionError == .success
+        return sizeError == .success && positionError == .success ? .ok : .err
     }
 
     // MARK: - Close window

@@ -13,6 +13,8 @@ module MCMonad.Operations
     , repairStep
     , maxRepairAttempts
     , frameIsParked
+    , parkRetry
+    , maxParkRetries
     , attributeIgnoredWindows
       -- * Window lifecycle
     , manage
@@ -506,6 +508,26 @@ reassertHiddenWindows = do
     unless (null toHide) $ do
         conn <- asks connection
         io $ sendCommand conn (HideWindows (map wrWindowId toHide))
+
+-- | How many times in one second a hidden window is parked again for
+-- reporting itself on screen.
+maxParkRetries :: Int
+maxParkRetries = 5
+
+-- | Whether to park the hidden windows again for one that has just reported
+-- itself on screen, given how often that was done for it already: the new
+-- count, or 'Nothing' to leave it.
+--
+-- Parking a window that cannot be moved makes it report its frame, and a
+-- report is what a window is parked for. With a window in native
+-- fullscreen that went round a hundred times a second for as long as the
+-- fullscreen Space was showing. A window left alone here is parked again
+-- by the next front-app change, screen change or workspace switch.
+parkRetry :: UTCTime -> Maybe ParkRetries -> Maybe ParkRetries
+parkRetry now asked = case asked of
+    Just r | diffUTCTime now (prSince r) < 1 ->
+        if prAsked r < maxParkRetries then Just r { prAsked = prAsked r + 1 } else Nothing
+    _ -> Just (ParkRetries now 1)
 
 -- | Is this frame parked: on every screen, what shows of it is at most a
 -- two-point sliver in one dimension (or nothing)? This is the same rule
@@ -1129,6 +1151,7 @@ unmanage w = do
             { sticky           = S.delete w (sticky s)
             , scratchpads      = M.filter (/= w) (scratchpads s)
             , windowMetadata   = M.delete w (windowMetadata s)
+            , parkRetries      = M.delete w (parkRetries s)
             }
         -- W.delete, not W.delete': delete' deliberately leaves the
         -- floating entry behind (xmonad keeps it for temporary

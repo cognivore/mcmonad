@@ -10,7 +10,7 @@ import MCMonad.Core
     , isIntentTargetPid, isSettlingEcho, isSettlingPidEcho
     , withinSettleWindow
     , armKillChurnSuppression, armEmptyWorkspaceGuard, shouldSuppressFrontApp
-    , PendingWindow(..), Timer(..), Layout(..), LayoutClass(..)
+    , PendingWindow(..), ParkRetries(..), Timer(..), Layout(..), LayoutClass(..)
     )
 import MCMonad.IPC (WindowInfo(..), Command(..), Event(..), eventLogSummary, decodeEvent, OverlayScreenEntry(..), OverlayIgnoredWindow(..), parseIgnoredFact)
 import MCMonad.Main (onHiddenWorkspace, pairBurst, confirmedFocusTarget)
@@ -27,7 +27,7 @@ import MCMonad.Persistence
     , SavedLayouts(..), snapshotLayouts, restoreLayouts
     )
 import MCMonad.Operations
-    ( frameIsParked, reassignScreens
+    ( frameIsParked, parkRetry, maxParkRetries, reassignScreens
     , chooseOriginTag, unmanagedOriginTTL
     , freshReclaim, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
     , placeManaged, windowsToPark, raiseOrder, stillNative
@@ -1663,6 +1663,22 @@ prop_extras_prune =
         == StateExtras (Map.fromList [("a", S 0)]) (Map.fromList [(w1, r)])
                        (Just (SavedLayouts "Full" Map.empty))
 
+-- However a hidden window's reports are spaced, it is parked again at most
+-- 'maxParkRetries' times in any second that starts with a retry, and the
+-- first report after a quiet second is always answered.
+prop_parkRetry_bounded :: [NonNegative Int] -> Property
+prop_parkRetry_bounded gaps =
+    let times = scanl (\t (NonNegative ms) -> addUTCTime (fromIntegral (ms `mod` 1500) / 1000) t) originBase gaps
+        step (asked, answered) t = case parkRetry t asked of
+            Just r  -> (Just r, (t, r) : answered)
+            Nothing -> (asked, answered)
+        (_, retries) = foldl step (Nothing, []) times
+        perSecond = Map.fromListWith (+) [ (prSince r, 1 :: Int) | (_, r) <- retries ]
+        quiet = [ t | (s, t) <- zip times (drop 1 times), diffUTCTime t s >= 1 ]
+    in counterexample (show perSecond) (all (<= maxParkRetries) perSecond)
+       .&&. all (\(t, r) -> diffUTCTime t (prSince r) < 1) retries
+       .&&. all (`elem` map fst retries) quiet
+
 -- A native float stays one while it floats or waits to be restored, and no
 -- longer; the frame recorded for it is not touched.
 prop_stillNative :: [(NonNegative Int, Bool, Bool)] -> Property
@@ -2014,6 +2030,7 @@ allProperties =
     , ("affinity: confirmed focus beats a same-PID window", property prop_focusByRole_confirmed_window_beats_same_pid)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("state extras: JSON round trip", property prop_extras_round_trip)
+    , ("parking: retries are bounded, quiet ones answered", property prop_parkRetry_bounded)
     , ("native floats: only while floating or awaiting restore", property prop_stillNative)
     , ("workspace layouts survive restart independently", prop_workspace_layouts_survive_restart)
     , ("state extras: other version refused", property prop_extras_other_version_refused)

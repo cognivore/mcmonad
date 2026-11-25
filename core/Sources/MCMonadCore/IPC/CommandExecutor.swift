@@ -106,15 +106,21 @@ final class CommandExecutor {
         FrameLog.emit(source: .cmdSetFramesBegin, extra: "count=\(frames.count)")
         let skylight = SkyLight.shared
 
-        // Resolve AX elements once
+        // Resolve AX elements once. A window in native fullscreen keeps its
+        // place in the brain's layout but is not written to: the layout is
+        // what it comes back to.
         let resolved: [(FrameAssignment, AXUIElement)] = frames.compactMap { a in
-            if let ax = AXWindowService.findAXWindow(windowId: a.windowId, pid: a.pid) {
-                return (a, ax)
-            } else {
+            guard let ax = AXWindowService.findAXWindow(windowId: a.windowId, pid: a.pid) else {
                 FrameLog.emit(source: .cmdAxResolveFail,
                               windowId: a.windowId, pid: a.pid, rect: a.frame)
                 return nil
             }
+            guard !AXWindowService.isFullscreen(ax) else {
+                FrameLog.emit(source: .cmdFullscreenSkip,
+                              windowId: a.windowId, pid: a.pid, rect: a.frame)
+                return nil
+            }
+            return (a, ax)
         }
 
         // Pre-move snapshot. If a window already lives at the hide
@@ -506,21 +512,27 @@ final class CommandExecutor {
                 continue
             }
             let target = CGRect(origin: corner, size: snap.frame.size)
+            // A window in native fullscreen is not written to. macOS
+            // refuses the move but reports one, the brain sees a hidden
+            // window that is not parked and asks again: for as long as the
+            // fullscreen Space is showing, every hidden window was
+            // re-parked a hundred times a second.
+            let wrote = AXWindowService.setFrame(
+                target,
+                windowId: wid,
+                pid: snap.pid,
+                currentHint: snap.frame
+            )
             FrameLog.emit(source: .cmdHideMove,
                           windowId: wid, pid: snap.pid, rect: target,
                           tHash: TitleHash.hash(windowId: wid, pid: snap.pid),
+                          result: wrote.rawValue,
                           extra: "corner from=(\(fmtCoord(snap.frame.origin.x)),"
                                + "\(fmtCoord(snap.frame.origin.y))) "
                                + "screen=(\(fmtCoord(screen.frame.origin.x)),"
                                + "\(fmtCoord(screen.frame.origin.y)),"
                                + "\(fmtCoord(screen.frame.width)),"
                                + "\(fmtCoord(screen.frame.height)))")
-            AXWindowService.setFrame(
-                target,
-                windowId: wid,
-                pid: snap.pid,
-                currentHint: snap.frame
-            )
         }
         SkyLight.shared.reenableUpdate()
     }

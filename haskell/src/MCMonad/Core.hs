@@ -39,6 +39,7 @@ module MCMonad.Core
       -- * Geometry
     , Rectangle(..)
     , FrameRepair(..)
+    , ParkRetries(..)
       -- * IPC connection (opaque)
     , Connection(..)
       -- * Affinity
@@ -356,6 +357,14 @@ data FrameRepair = FrameRepair
     , frAttempts :: !Int
     } deriving (Show)
 
+-- | How often a hidden window has been parked again after reporting itself
+-- on screen, in the second that began when it first did. See
+-- 'MCMonad.Operations.parkRetry'.
+data ParkRetries = ParkRetries
+    { prSince :: !UTCTime
+    , prAsked :: !Int
+    } deriving (Eq, Show)
+
 instance FromJSON Rectangle where
     parseJSON = Aeson.withObject "Rectangle" $ \v ->
         Rectangle <$> v .: "x" <*> v .: "y" <*> v .: "w" <*> v .: "h"
@@ -529,6 +538,10 @@ data MState = MState
       -- window id. Filled by 'MCMonad.IPC.WindowFrameDefied' readbacks,
       -- re-checked on later frame changes, cleared on the next layout
       -- decision for the window and on destroy.
+    , parkRetries      :: !(Map.Map WindowRef ParkRetries)
+      -- ^ Hidden windows that reported themselves on screen and were parked
+      -- again for it. Bounds how often that is done
+      -- ('MCMonad.Operations.parkRetry').
     , ignoredWindows   :: !(Set WindowRef)
       -- ^ Windows the manage hook explicitly 'MCMonad.ManageHook.doIgnore'd:
       -- present in 'windowMetadata' but deliberately absent from

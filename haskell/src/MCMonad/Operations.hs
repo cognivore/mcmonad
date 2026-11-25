@@ -30,6 +30,7 @@ module MCMonad.Operations
     , placeManaged
     , windowsToPark
     , raiseOrder
+    , stillNative
       -- * Overlay snapshot
     , buildOverlaySnapshot
     , pushOverlaySnapshot
@@ -208,6 +209,12 @@ windows f = do
 
     -- Recompute visibility AFTER sticky adjustments
     currentAfterSticky <- gets windowset
+
+    -- 1c. A window that stopped floating has a layout's frame now, not
+    -- one of its own.
+    modify $ \s -> s { nativeFloats =
+        stillNative currentAfterSticky (pendingRestore s) (nativeFloats s) }
+    natives <- gets nativeFloats
     let oldVisible = allVisibleWindows old
         newVisible = allVisibleWindows currentAfterSticky
 
@@ -288,8 +295,7 @@ windows f = do
     --    are excluded: mcmonad never writes a frame for them, so there's
     --    nothing here to resolve on their behalf.
     currentWS <- gets windowset
-    natives <- gets nativeFloats
-    let floatRects = filter (\(w, _) -> not (S.member w natives)) (resolveFloating currentWS)
+    let floatRects = filter (\(w, _) -> not (M.member w natives)) (resolveFloating currentWS)
 
     -- 6. Send frame assignments, then show/hide. Placing (and raising)
     --    the incoming windows before parking the outgoing ones avoids a
@@ -300,9 +306,7 @@ windows f = do
     --    'floatRects' -- so without this, one would stay stuck at
     --    wherever 'HideWindows' parked it. Restore it to its own last
     --    known frame instead of a layout-computed one.
-    nativeFloatLastKnown <- gets nativeFloatRects
-    let restoredNatives = [ (w, r) | w <- toShow, S.member w natives
-                           , Just r <- [M.lookup w nativeFloatLastKnown] ]
+    let restoredNatives = [ (w, r) | w <- toShow, Just r <- [M.lookup w natives] ]
         allPositions = allRects ++ floatRects
         frames = map toFrameAssignment (allPositions ++ restoredNatives)
     io $ logTS $ "FRAMES: " ++ show [(wrWindowId w, rect_x r, rect_y r, rect_w r, rect_h r) | (w, r) <- allPositions]
@@ -905,6 +909,15 @@ raiseOrder floats shown visible
     | otherwise  = filter (not . isFloat) shown ++ filter isFloat visible
   where isFloat = (`S.member` floats)
 
+-- | The native floats that still are: those the window set floats, and
+-- those a restore still holds to float again. A window leaves the rest by
+-- any of several routes (sunk by a hotkey, destroyed, dropped by a hook),
+-- and one left behind here is sent its old frame on top of the layout's
+-- every time its workspace is shown.
+stillNative :: Ord a => W.StackSet i l a sid sd -> M.Map a pending -> M.Map a r -> M.Map a r
+stillNative ws pending = M.filterWithKey $ \w _ ->
+    M.member w (W.floating ws) || M.member w pending
+
 -- | Windows to park after a pass. Orphans (windows a layout left without a
 -- rect) are always parked; the windows leaving the visible set only when
 -- that set changed.
@@ -1105,13 +1118,12 @@ unmanage w = do
                                  (pruneOrigins now (unmanagedOrigin s))
                     }
             Nothing -> return ()
-        -- Clean from sticky, scratchpads, native floats, and metadata
-        -- before removing
+        -- Clean from sticky, scratchpads and metadata before removing.
+        -- (A native float leaves 'nativeFloats' when 'windows' sees that
+        -- it no longer floats.)
         modify $ \s -> s
             { sticky           = S.delete w (sticky s)
             , scratchpads      = M.filter (/= w) (scratchpads s)
-            , nativeFloats     = S.delete w (nativeFloats s)
-            , nativeFloatRects = M.delete w (nativeFloatRects s)
             , windowMetadata   = M.delete w (windowMetadata s)
             }
         -- W.delete, not W.delete': delete' deliberately leaves the
@@ -1165,12 +1177,9 @@ handleManagedReplacement old winfo = do
             { sticky = if S.member old (sticky s)
                            then S.insert new (S.delete old (sticky s))
                            else sticky s
-            , nativeFloats = if S.member old (nativeFloats s)
-                           then S.insert new (S.delete old (nativeFloats s))
-                           else nativeFloats s
-            , nativeFloatRects = case M.lookup old (nativeFloatRects s) of
-                Just r  -> M.insert new r (M.delete old (nativeFloatRects s))
-                Nothing -> nativeFloatRects s
+            , nativeFloats = case M.lookup old (nativeFloats s) of
+                Just r  -> M.insert new r (M.delete old (nativeFloats s))
+                Nothing -> nativeFloats s
             , scratchpads = M.map (\w -> if w == old then new else w) (scratchpads s)
             , windowMetadata = M.insert new (metadataFromInfo winfo)
                                    (M.delete old (windowMetadata s))
@@ -1445,7 +1454,7 @@ currentSnapshot = do
     nid  <- gets nextTimerId
     pend <- gets pendingRestore
     learned <- gets learnedAffinity
-    natives <- gets nativeFloatRects
+    natives <- gets nativeFloats
     return StateSnapshot
         { snWindowSet   = ws
         , snLayoutDefault = def

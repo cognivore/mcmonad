@@ -23,7 +23,6 @@ module MCMonad.ManageHook
 import Control.Monad.Reader
 import Data.Monoid (Endo(..))
 import qualified Data.Map.Strict as M
-import qualified Data.Set as S
 import Data.Text (Text)
 import qualified XMonad.StackSet as W
 
@@ -190,12 +189,10 @@ doFloatNative = Query $ do
     wi <- ask
     let wr = WindowRef (wiWindowId wi) (wiPid wi)
     lift $ modify $ \s -> s
-        { nativeFloats = S.insert wr (nativeFloats s)
         -- Seed with its frame at manage time, so a park/restore cycle
         -- before the first 'WindowFrameChanged' still has somewhere to
         -- restore it to.
-        , nativeFloatRects = M.insert wr (wiFrame wi) (nativeFloatRects s)
-        }
+        { nativeFloats = M.insert wr (wiFrame wi) (nativeFloats s) }
     return $ Endo $ W.float wr (W.RationalRect 0 0 1 1)
 
 -- ---------------------------------------------------------------------------

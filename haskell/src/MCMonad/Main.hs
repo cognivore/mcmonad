@@ -172,8 +172,7 @@ launch cfg = do
                        , debugOverlays = False
                        , ignoredWindows = Set.empty
                        , frameRepairs = Map.empty
-                       , nativeFloats = Map.keysSet (seNativeFloats (rsExtras restored))
-                       , nativeFloatRects = seNativeFloats (rsExtras restored)
+                       , nativeFloats = seNativeFloats (rsExtras restored)
                        , lastSaveAt = Nothing
                        , timers = rsTimers restored
                        , nextTimerId = rsNextTimerId restored
@@ -627,14 +626,14 @@ handleEvent debug cfg hotkeyIdMap evt = do
                           , not (frameIsParked (map (screenRect . W.screenDetail) (W.screens ws)) rect)
                     -> reassertHiddenWindows
                 Just wref | Set.member wref mappedSet
-                          , Set.member wref natives
+                          , Map.member wref natives
                     -> do
                         -- Native floats never get a SetFrames from us, so
                         -- this is the only record of where it actually is
                         -- -- used to restore it on the next show (see
-                        -- 'nativeFloatRects').
+                        -- 'nativeFloats').
                         modify $ \s -> s
-                            { nativeFloatRects = Map.insert wref rect (nativeFloatRects s) }
+                            { nativeFloats = Map.insert wref rect (nativeFloats s) }
                         -- A native float is a real native window: the user
                         -- drags it by its own title bar, no Option held, so
                         -- 'WindowDragCompleted' (Option-drag only) never

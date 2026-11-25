@@ -29,7 +29,7 @@ import MCMonad.Persistence
 import MCMonad.Operations
     ( frameIsParked, reassignScreens
     , chooseOriginTag, pruneReclaims, reclaimOriginTTL, reclaimOriginCap
-    , placeManaged, windowsToPark, raiseOrder
+    , placeManaged, windowsToPark, raiseOrder, stillNative
     , screenAt, rectOverlapArea, crossedScreenTag
     , RepairStep(..), repairStep, maxRepairAttempts
     , attributeIgnoredWindows
@@ -1668,6 +1668,20 @@ prop_extras_prune =
         == StateExtras (Map.fromList [("a", S 0)]) (Map.fromList [(w1, r)])
                        (Just (SavedLayouts "Full" Map.empty))
 
+-- A native float stays one while it floats or waits to be restored, and no
+-- longer; the frame recorded for it is not touched.
+prop_stillNative :: [(NonNegative Int, Bool, Bool)] -> Property
+prop_stillNative windows' =
+    let natives  = Map.fromList [ (w, show w) | (w, _, _) <- entries ]
+        pending  = Map.fromList [ (w, ()) | (w, _, True) <- entries ]
+        floats   = [ w | (w, True, _) <- entries ]
+        entries  = L.nubBy (\(a, _, _) (b, _, _) -> a == b)
+                       [ (w, floated, held) | (NonNegative w, floated, held) <- windows' ]
+        ws = foldr (\w -> W.float w (W.RationalRect 0 0 1 1) . W.insertUp w)
+                   (W.new () ["a", "b"] (map snd twoScreens)) floats
+    in stillNative ws pending natives
+        === Map.fromList [ (w, show w) | (w, floated, held) <- entries, floated || held ]
+
 prop_workspace_layouts_survive_restart :: Property
 prop_workspace_layouts_survive_restart = forAll (choose (1, 95 :: Int)) $ \percent ->
     let layout side fraction = Layout (Choose side Full (Mirror (Layout (Tall 1 0.03 fraction))))
@@ -2005,6 +2019,7 @@ allProperties =
     , ("affinity: confirmed focus beats a same-PID window", property prop_focusByRole_confirmed_window_beats_same_pid)
     , ("affinity: role names round trip", property prop_role_names_round_trip)
     , ("state extras: JSON round trip", property prop_extras_round_trip)
+    , ("native floats: only while floating or awaiting restore", property prop_stillNative)
     , ("workspace layouts survive restart independently", prop_workspace_layouts_survive_restart)
     , ("state extras: other version refused", property prop_extras_other_version_refused)
     , ("state extras: prune to the main state", property prop_extras_prune)

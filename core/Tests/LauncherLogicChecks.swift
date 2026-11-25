@@ -32,6 +32,7 @@ enum LauncherLogicChecks {
         checkWorkspaceWindowLookup()
         checkParkGeometry()
         checkParkedHome()
+        checkWindowReading()
         print("Launcher logic checks passed")
     }
 
@@ -905,6 +906,26 @@ enum LauncherLogicChecks {
         for s in stacked {
             precondition(parked(parkOrigin(for: s.frame, among: stacked, windowSize: size), stacked), "\(s.screenId)")
         }
+    }
+
+    // MARK: Windows that have just appeared
+
+    static func checkWindowReading() {
+        func window(subrole: String? = "AXStandardWindow", dialog: Bool = false,
+                    fixed: Bool = false, fullscreen: Bool = true) -> WindowInfo {
+            WindowInfo(windowId: 1, pid: 1, title: nil, appName: nil, bundleId: nil, subrole: subrole,
+                       isDialog: dialog, isFixedSize: fixed, hasCloseButton: true,
+                       hasFullscreenButton: fullscreen, frame: .zero)
+        }
+        // an ordinary window that can be tiled is reported at once
+        precondition(!shouldReadAgain(window(), reads: 1))
+        // one that says it cannot is doubted, a bounded number of times
+        precondition(shouldReadAgain(window(fixed: true), reads: 1))
+        precondition(shouldReadAgain(window(fullscreen: false), reads: maxWindowReads - 1))
+        precondition(!shouldReadAgain(window(fixed: true, fullscreen: false), reads: maxWindowReads))
+        // a dialog, or anything that is not an ordinary window, is not
+        precondition(!shouldReadAgain(window(subrole: "AXDialog", dialog: true, fixed: true, fullscreen: false), reads: 1))
+        precondition(!shouldReadAgain(window(subrole: nil, fixed: true), reads: 1))
     }
 
     // MARK: Parked window home

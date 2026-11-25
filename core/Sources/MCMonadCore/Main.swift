@@ -30,6 +30,9 @@ final class EventBridge: SkyLightEventDelegate {
     /// when the owning app is busy and a window that was genuinely
     /// unmanageable at one moment may not be at the next.
     private var rejectedWindowIds: [UInt32: Int] = [:]
+    /// Windows that have just appeared and are being read again before
+    /// they are reported (`shouldReadAgain`).
+    private var settlingWindowIds: Set<UInt32> = []
     /// Monotonic sweep counter, the clock for `rejectedWindowIds`.
     private var sweepTick = 0
     /// Managed window id -> number of consecutive reconcile sweeps it has
@@ -218,19 +221,27 @@ final class EventBridge: SkyLightEventDelegate {
         let ownPid = getpid()
         for snap in SkyLightQuery.queryAllVisibleWindows() {
             guard snap.pid != ownPid else { continue }
-            guard !managedWindowIds.contains(snap.windowId) else { continue }
+            guard !managedWindowIds.contains(snap.windowId),
+                  !settlingWindowIds.contains(snap.windowId) else { continue }
             if let rejectedAt = rejectedWindowIds[snap.windowId],
                sweepTick - rejectedAt < Self.rejectRetryTicks {
                 continue
             }
-            adoptWindow(snap, viaSweep: true)
+            adoptWindow(snap, found: .bySweep)
         }
+    }
+
+    /// How a window to adopt was found.
+    private enum Found {
+        /// It has just appeared; how many times it has been read already.
+        case appearing(readsBefore: Int)
+        case bySweep
     }
 
     /// Classify a SkyLight snapshot with AX and, if it is manageable,
     /// register it and tell the brain. Shared by the SkyLight `created`
     /// event and the orphan sweep so both apply exactly the same filter.
-    private func adoptWindow(_ snap: WindowSnapshot, viaSweep: Bool = false) {
+    private func adoptWindow(_ snap: WindowSnapshot, found: Found) {
         // Never manage our own panels and overlays.
         guard snap.pid != getpid() else { return }
 
@@ -258,17 +269,45 @@ final class EventBridge: SkyLightEventDelegate {
             return
         }
 
+        if case .appearing(let readsBefore) = found {
+            if shouldReadAgain(info, reads: readsBefore + 1) {
+                readAgain(snap.windowId, reads: readsBefore + 1)
+                return
+            }
+            // What the window's place was decided on, so that a window
+            // wrongly floated can be read off the log.
+            logStderr(
+                "ADOPT: wid=\(snap.windowId) pid=\(snap.pid) reads=\(readsBefore + 1) "
+                    + "standard=\(info.subrole == kAXStandardWindowSubrole as String) "
+                    + "dialog=\(info.isDialog) fixed=\(info.isFixedSize) "
+                    + "fullscreen=\(info.hasFullscreenButton)\n"
+            )
+        }
+
         rejectedWindowIds.removeValue(forKey: snap.windowId)
         _ = SkyLightEventObserver.shared.subscribeToWindows([snap.windowId])
         addManagedWindow(windowId: snap.windowId, pid: snap.pid)
         socketServer.send(.windowCreated(info))
-        if viaSweep {
+        if case .bySweep = found {
             // Should be rare. A run of these means windows are being lost
             // somewhere upstream and the sweep is papering over it.
             logStderr(
                 "RECONCILE: adopt wid=\(snap.windowId) pid=\(snap.pid) "
                     + "tHash=\(TitleHash.hash(windowId: snap.windowId, pid: snap.pid))\n"
             )
+        }
+    }
+
+    /// Read a window that has just appeared once more in a moment. A window
+    /// that goes away meanwhile was never reported, and is not.
+    private func readAgain(_ windowId: UInt32, reads: Int) {
+        settlingWindowIds.insert(windowId)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: windowRereadNanoseconds)
+            settlingWindowIds.remove(windowId)
+            guard !managedWindowIds.contains(windowId),
+                  let snap = SkyLightQuery.queryWindow(windowId) else { return }
+            adoptWindow(snap, found: .appearing(readsBefore: reads))
         }
     }
 
@@ -300,8 +339,9 @@ final class EventBridge: SkyLightEventDelegate {
                 logStderr("RECONCILE: ignore created wid=\(windowId) reason=already-managed\n")
                 break
             }
+            guard !settlingWindowIds.contains(windowId) else { break }
             if let snap = SkyLightQuery.queryWindow(windowId) {
-                adoptWindow(snap)
+                adoptWindow(snap, found: .appearing(readsBefore: 0))
             }
 
         case .destroyed(let windowId, _):

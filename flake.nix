@@ -66,6 +66,7 @@
                 Sources/MCMonadCore/IPC/WorkspaceWindowLookup.swift \
                 Sources/MCMonadCore/IPC/ParkGeometry.swift \
                 Sources/MCMonadCore/Display/ParkedHome.swift \
+                Sources/MCMonadCore/Accessibility/WindowReading.swift \
                 Sources/MCMonadCore/Display/ScreenRoleMap.swift \
                 Sources/MCMonadCore/Index/TextSearch.swift \
                 Sources/MCMonadCore/Launcher/RecentUse.swift \

@@ -57,6 +57,7 @@ enum AXWindowService {
             kAXPositionAttribute as CFString,
             kAXSizeAttribute as CFString,
             kAXZoomButtonAttribute as CFString,
+            kAXFullScreen,
         ]
 
         var valuesRef: CFArray?
@@ -69,7 +70,7 @@ enum AXWindowService {
 
         guard batchResult == .success,
               let values = valuesRef as? [Any?],
-              values.count >= 8
+              values.count >= 9
         else {
             logger.debug("Failed to batch-fetch AX attributes for wid=\(windowId)")
             return nil
@@ -90,6 +91,11 @@ enum AXWindowService {
         let subrole = attr(1) as? String
         let title = attr(2) as? String
 
+        // A window in native fullscreen can be made full screen and
+        // resized, whatever its buttons say while it is: its zoom button is
+        // not usable there.
+        let inFullscreen = attr(8) as? Bool ?? false
+
         let hasCloseButton = hasResolved(3)
         // Some windows that don't really support fullscreen (System
         // Settings, Calculator) report the attribute as "resolved" by this
@@ -97,7 +103,8 @@ enum AXWindowService {
         // rather than caught by the NSError filter above — so presence
         // alone isn't a reliable signal; the element itself has to check
         // out and be enabled too.
-        let hasFullscreenButton = hasResolved(4) && buttonState(attr(4)) != .unusable
+        let hasFullscreenButton = inFullscreen
+            || (hasResolved(4) && buttonState(attr(4)) != .unusable)
 
         // Read frame
         let frame: CGRect
@@ -137,7 +144,7 @@ enum AXWindowService {
         // actually discriminated anything: every window here (fixed or
         // not) reports "AXStandardWindow".
         let hasZoomButton = hasResolved(7) && buttonState(attr(7)) != .unusable
-        let isFixedSize = !hasZoomButton
+        let isFixedSize = !hasZoomButton && !inFullscreen
 
         // App name and bundle ID
         var appName: String?

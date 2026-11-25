@@ -190,14 +190,56 @@ final class EventBridge: SkyLightEventDelegate {
         }
     }
 
-    /// A destroy/close is only spurious if the window still exists AND its
+    /// What is known of a window that is reported destroyed.
+    private enum DestroyVerdict {
+        case gone
+        /// Its owning app still lists it.
+        case stillListed
+        /// It left one Space and is on another.
+        case movedSpace
+    }
+
+    /// Whether a window reported destroyed is. `left` is the Space it is
+    /// reported to have left, when the report says.
+    ///
+    /// The report means that the window left that Space, which a window
+    /// going into or out of native fullscreen does without dying. Its app
+    /// is no help there: it does not list a window that is not on the
+    /// active Space.
+    ///
+    /// Otherwise the window is alive only if it still exists AND its
     /// owning app still lists it via AX — `windowExists` alone can stay
     /// true for a window an app has already swapped out internally,
     /// leaving a dead id as a phantom layout slot for seconds otherwise.
-    private func isSpuriousDestroy(_ windowId: UInt32, stillExists: Bool) -> Bool {
-        guard stillExists else { return false }
-        guard let pid = windowIdToPid[windowId] else { return false }
-        return AXWindowService.findAXWindow(windowId: windowId, pid: pid) != nil
+    private func verdict(destroyed windowId: UInt32, left: UInt64?) -> DestroyVerdict {
+        guard SkyLightQuery.windowExists(windowId) else { return .gone }
+        let spaces = SkyLight.shared.spaces(of: windowId)
+        if let left, spaces.contains(where: { $0 != left }) { return .movedSpace }
+        guard let pid = windowIdToPid[windowId] else { return .gone }
+        if AXWindowService.findAXWindow(windowId: windowId, pid: pid) != nil { return .stillListed }
+        // Retracted on the app's word alone. If the reconcile sweep adopts
+        // it again, this is the line that says what it looked like.
+        logStderr("RECONCILE: destroyed wid=\(windowId) pid=\(pid) still exists, not listed "
+            + "left=\(left.map(String.init) ?? "-") spaces=\(spaces)\n")
+        return .gone
+    }
+
+    /// A window was reported destroyed: retract it from the brain unless
+    /// it is not. (Also one that is not managed here: the brain may be
+    /// holding its place from before a restart.)
+    private func handleDestroyed(_ windowId: UInt32, left: UInt64?, event: String) {
+        switch verdict(destroyed: windowId, left: left) {
+        case .stillListed:
+            logStderr("RECONCILE: ignore \(event) wid=\(windowId) reason=still-exists\n")
+        case .movedSpace:
+            logStderr("RECONCILE: ignore \(event) wid=\(windowId) reason=moved-space\n")
+        case .gone:
+            removeManagedWindow(windowId: windowId)
+            rejectedWindowIds.removeValue(forKey: windowId)
+            ineligibleStreak.removeValue(forKey: windowId)
+            TitleHash.invalidate(windowId: windowId)
+            socketServer.send(.windowDestroyed(windowId: windowId))
+        }
     }
 
     /// Retract a managed window from the brain and clear its bookkeeping.
@@ -344,38 +386,18 @@ final class EventBridge: SkyLightEventDelegate {
                 adoptWindow(snap, found: .appearing(readsBefore: 0))
             }
 
-        case .destroyed(let windowId, _):
-            let stillExists = SkyLightQuery.windowExists(windowId)
+        case .destroyed(let windowId, let spaceId):
             // A destroy notification can be spurious — SkyLight fires one
-            // for a window that's still alive, most commonly around a
-            // cross-screen AX move. Trusting it blindly means unmanaging a
-            // live window and telling the brain it's gone, which the
-            // reconcile sweep then "fixes" a couple seconds later by
-            // re-adopting it as brand new — sending it through the manage
-            // hook and a full layout pass again, which is what actually
-            // causes focus to jump. Verify liveness first, the same way
-            // `validateWindows` already does for its own check.
-            guard !isSpuriousDestroy(windowId, stillExists: stillExists) else {
-                logStderr("RECONCILE: ignore destroyed wid=\(windowId) reason=still-exists\n")
-                break
-            }
-            removeManagedWindow(windowId: windowId)
-            rejectedWindowIds.removeValue(forKey: windowId)
-            ineligibleStreak.removeValue(forKey: windowId)
-            TitleHash.invalidate(windowId: windowId)
-            socketServer.send(.windowDestroyed(windowId: windowId))
+            // for a window that's still alive, around a cross-screen AX
+            // move and whenever it changes Space. Trusting it blindly
+            // means unmanaging a live window and telling the brain it's
+            // gone, which the reconcile sweep then "fixes" a couple
+            // seconds later by re-adopting it — a layout pass each way,
+            // and focus sent elsewhere in between.
+            handleDestroyed(windowId, left: spaceId, event: "destroyed")
 
         case .closed(let windowId):
-            let stillExists = SkyLightQuery.windowExists(windowId)
-            guard !isSpuriousDestroy(windowId, stillExists: stillExists) else {
-                logStderr("RECONCILE: ignore closed wid=\(windowId) reason=still-exists\n")
-                break
-            }
-            removeManagedWindow(windowId: windowId)
-            rejectedWindowIds.removeValue(forKey: windowId)
-            ineligibleStreak.removeValue(forKey: windowId)
-            TitleHash.invalidate(windowId: windowId)
-            socketServer.send(.windowDestroyed(windowId: windowId))
+            handleDestroyed(windowId, left: nil, event: "closed")
 
         case .frameChanged(let windowId):
             if let bounds = SkyLight.shared.getWindowBounds(windowId) {

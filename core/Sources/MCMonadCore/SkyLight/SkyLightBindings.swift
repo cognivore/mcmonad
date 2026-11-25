@@ -69,6 +69,7 @@ final class SkyLight: @unchecked Sendable {
     private typealias ReenableUpdateFunc = @convention(c) (Int32) -> Void
     private typealias MoveWindowFunc = @convention(c) (Int32, UInt32, UnsafePointer<CGPoint>) -> CGError
     private typealias GetWindowBoundsFunc = @convention(c) (Int32, UInt32, UnsafeMutablePointer<CGRect>) -> CGError
+    private typealias CopySpacesForWindowsFunc = @convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFArray>?
 
     typealias ConnectionNotifyCallback = @convention(c) (
         UInt32,
@@ -143,6 +144,9 @@ final class SkyLight: @unchecked Sendable {
     private let _transactionMoveWindowWithGroup: TransactionMoveWindowWithGroupFunc
     private let _moveWindow: MoveWindowFunc
     private let _getWindowBounds: GetWindowBoundsFunc
+
+    // Spaces — required (can't tell a window that moved from one that died)
+    private let _copySpacesForWindows: CopySpacesForWindowsFunc
 
     // Notifications — required (can't observe events without them)
     private let _registerConnectionNotifyProc: RegisterConnectionNotifyProcFunc
@@ -229,6 +233,9 @@ final class SkyLight: @unchecked Sendable {
             ?? resolve("SLSRemoveNotifyProc", as: UnregisterNotifyProcFunc.self)
         if r25 == nil { missing.append("SLS{Unregister,Remove}NotifyProc") }
 
+        // Spaces — required
+        let r26 = required("SLSCopySpacesForWindows", as: CopySpacesForWindowsFunc.self)
+
         if !missing.isEmpty {
             fatalError("SkyLight missing required symbols: \(missing.joined(separator: ", "))")
         }
@@ -237,7 +244,7 @@ final class SkyLight: @unchecked Sendable {
               let r06, let r07, let r08, let r09, let r10,
               let r11, let r12, let r13, let r14, let r15, let r16, let r17,
               let r18, let r19, let r20,
-              let r21, let r22, let r23, let r24, let r25
+              let r21, let r22, let r23, let r24, let r25, let r26
         else { fatalError("SkyLight symbol resolution failed") }
 
         _mainConnectionID = r01;  _windowQueryWindows = r02
@@ -256,6 +263,7 @@ final class SkyLight: @unchecked Sendable {
         _unregisterConnectionNotifyProc = r22
         _requestNotificationsForWindows = r23
         _registerNotifyProc = r24;  _unregisterNotifyProc = r25
+        _copySpacesForWindows = r26
     }
 
     // MARK: - Public API
@@ -358,6 +366,19 @@ final class SkyLight: @unchecked Sendable {
         var rect = CGRect.zero
         guard _getWindowBounds(cid, wid, &rect) == .success else { return nil }
         return rect
+    }
+
+    // MARK: Spaces
+
+    /// The Spaces a window is on now. A window ordered out keeps the Space
+    /// it was last on; one never ordered in, or gone, is on none.
+    func spaces(of windowId: UInt32) -> [UInt64] {
+        let allSpaces: Int32 = 0x7
+        let windows = [NSNumber(value: windowId)] as CFArray
+        guard let spaces = _copySpacesForWindows(getMainConnectionID(), allSpaces, windows)?
+            .takeRetainedValue() as? [NSNumber]
+        else { return [] }
+        return spaces.map(\.uint64Value)
     }
 
     // MARK: Display updates

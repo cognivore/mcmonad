@@ -236,6 +236,18 @@ xmonad xmonad.
   `MCMonad.Operations`) state this rule identically and must change
   together. The core picks the corner (`parkOrigin`); it never resizes a
   window to park it, and only uses bottom corners.
+- **One frame each.** A `set-frames` names a window at most once. A
+  native float (`doFloatNative`) is one only while it floats
+  (`stillNative`); tiled, its frame is the layout's and nothing else's.
+  It is never replaced in place by another window of its application.
+- **Native fullscreen.** The core does not write to a window in native
+  fullscreen (`AXWindowService.isFullscreen`), and the brain keeps its
+  slot. A window that changes macOS Space has not been destroyed, and one
+  the daemon retracts and offers again within 30 seconds goes back to its
+  slot without meeting the manage hook (`restorePlacement`). The core
+  reports the screens when the active Space changes, and the brain answers
+  with every frame and every park. Parking again because a hidden window
+  reported a frame is bounded (`parkRetry`).
 - **Raising.** Only AXRaise brings another application's window forward
   (a SkyLight order transaction on one is accepted and does nothing). The
   brain's `show-windows` is the one place windows are raised, and it is

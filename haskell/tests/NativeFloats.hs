@@ -102,25 +102,26 @@ replay brain = do
     -- Two tiles. Going into native fullscreen, the second one is reported
     -- destroyed, and found again moments later looking like a window that
     -- cannot be made full screen. It is the same window, in the same slot.
-    let master = (0, 0, 600, 800)
-        second = (600, 0, 600, 800)
-        takenAndGivenBack what canFullscreen = do
+    -- (Which slots those are is the layout's business.)
+    create 33 303 whole True
+    tiles <- pass "Opening a second window"
+    unless (map fst tiles == [33, 32] && whole `notElem` map snd tiles) $
+        fail ("Two windows should be tiled. The daemon was sent " ++ show tiles)
+    let takenAndGivenBack what canFullscreen = do
             destroy 32
             expect (what ++ ", taken away") [(33, whole)]
             create 32 301 whole canFullscreen
-            expect (what ++ ", given back") [(33, master), (32, second)]
-    create 33 303 whole True
-    expect "Opening a second window" [(33, master), (32, second)]
+            expect (what ++ ", given back") tiles
     takenAndGivenBack "Entering native fullscreen" False
     view "r1" >> expect "Leaving the fullscreen window's workspace" []
-    view "1" >> expect "Returning to it" [(33, master), (32, second)]
+    view "1" >> expect "Returning to it" tiles
     takenAndGivenBack "Leaving native fullscreen" True
 
     -- A popup taken away and given back is still a popup, where it was.
     create 34 303 popup False
-    expect "Opening a popup over tiles" [(33, master), (32, second), (34, popup)]
-    destroy 34 >> expect "A popup taken away" [(33, master), (32, second)]
+    expect "Opening a popup over tiles" (tiles ++ [(34, popup)])
+    destroy 34 >> expect "A popup taken away" tiles
     create 34 303 whole True
-    expect "A popup given back" [(33, master), (32, second), (34, popup)]
+    expect "A popup given back" (tiles ++ [(34, popup)])
 
     putStrLn "Native float replay passed: kept frame, sunk popup, popup replaced by a window, fullscreen round trip."

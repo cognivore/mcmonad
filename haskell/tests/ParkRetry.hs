@@ -51,4 +51,9 @@ replay brain = do
     hides <- parked
     unless (any (41 `elem`) hides) $
         fail ("Switching workspace should park it again. The daemon was asked to hide " ++ show hides)
+    -- The same screens reported again is what an active Space change is.
+    event brain "screens-changed" ["screens" .= [screenInfo]]
+    again <- parked
+    unless (any (\ids -> all (`elem` ids) [41, 42]) again) $
+        fail ("A screens report should park every hidden window. The daemon was asked to hide " ++ show again)
     putStrLn "Park retry replay passed: a window that will not park is left until something changes."

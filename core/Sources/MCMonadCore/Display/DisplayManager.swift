@@ -7,7 +7,7 @@ private let logger = Logger(subsystem: "com.mcmonad.core", category: "DisplayMan
 final class DisplayManager {
     var onScreensChanged: (@MainActor ([ScreenInfo]) -> Void)?
 
-    private var observer: NSObjectProtocol?
+    private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
     private let roles = ScreenRoles()
 
     init() {}
@@ -79,27 +79,34 @@ final class DisplayManager {
         })
     }
 
+    /// Report the screens whenever they change, and whenever the active
+    /// Space does. Going into and out of native fullscreen, windows are out
+    /// of reach and frames and parks written to them are lost, and macOS
+    /// silently puts parked windows back on screen; the brain answers a
+    /// screens report with the whole layout and every park.
     func startObserving() {
-        observer = NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                let screens = self.currentScreens()
-                logger.info("Screen parameters changed: \(screens.count) screen(s)")
-                self.onScreensChanged?(screens)
-            }
-        }
+        report(NSApplication.didChangeScreenParametersNotification, from: .default,
+               as: "Screen parameters changed")
+        report(NSWorkspace.activeSpaceDidChangeNotification, from: NSWorkspace.shared.notificationCenter,
+               as: "Active Space changed")
         logger.info("Display observer started")
     }
 
-    func stopObserving() {
-        if let observer {
-            NotificationCenter.default.removeObserver(observer)
-            self.observer = nil
+    private func report(_ name: Notification.Name, from center: NotificationCenter, as what: String) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let screens = self.currentScreens()
+                logger.info("\(what, privacy: .public): \(screens.count) screen(s)")
+                self.onScreensChanged?(screens)
+            }
         }
+        observers.append((center, token))
+    }
+
+    func stopObserving() {
+        for observer in observers { observer.center.removeObserver(observer.token) }
+        observers = []
     }
 }
 

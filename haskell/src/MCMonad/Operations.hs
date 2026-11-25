@@ -1842,6 +1842,10 @@ rescreen newScreens = do
                 , learnedAffinity    = M.filter (`S.member` liveSids) (learnedAffinity s)
                 }
             windows id  -- trigger relayout
+            -- The visible set has usually not changed, so that parked
+            -- nothing, and the screens are also reported when the active
+            -- macOS Space changes, which un-parks windows silently.
+            reassertHiddenWindows
 
 -- | The pure half of 'rescreen': map the new @(ScreenId, ScreenDetail)@
 -- list onto the existing workspaces. 'Nothing' when there are no

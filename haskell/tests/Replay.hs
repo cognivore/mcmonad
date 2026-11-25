@@ -10,6 +10,7 @@ module Replay
     , sendMessage
     , through
     , screenFrame
+    , screenInfo
     , startEmpty
     ) where
 
@@ -83,14 +84,18 @@ through brain@(Brain h) wanted = do
 screenFrame :: Value
 screenFrame = object ["x" .= (0::Int), "y" .= (0::Int), "w" .= (1200::Int), "h" .= (800::Int)]
 
+-- | How the daemon reports it.
+screenInfo :: Value
+screenInfo = object
+    ["screenId" .= (0::Int), "role" .= ("primary"::Text), "frame" .= screenFrame]
+
 -- | Answer the brain's startup handshake with one display and no windows.
 -- Returns the commands it sent on the way, oldest first.
 startEmpty :: Brain -> IO [Object]
 startEmpty brain = do
     event brain "ready" []
     screens <- command "query-screens"
-    event brain "screens-changed" ["screens" .= [object
-        ["screenId" .= (0::Int), "role" .= ("primary"::Text), "frame" .= screenFrame]]]
+    event brain "screens-changed" ["screens" .= [screenInfo]]
     asked <- command "query-windows"
     sendMessage brain ["response" .= ("windows"::Text), "windows" .= ([]::[Value])]
     started <- command "set-debug-overlays"
